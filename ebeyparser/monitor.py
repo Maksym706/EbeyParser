@@ -228,15 +228,11 @@ class Monitor:
                 if not deals:
                     continue
                 if self.config.notifications.mode == "instant":
-                    summary.notified += await self._notify(
-                        deals, f"Выгодные находки: {search.name}", summary
-                    )
+                    summary.notified += await self._notify(deals, summary)
                 else:
                     digest.extend(deals)
             if digest:
-                summary.notified += await self._notify(
-                    digest, "Выгодные находки на Kleinanzeigen", summary
-                )
+                summary.notified += await self._notify(digest, summary)
         finally:
             summary.finished_at = utcnow()
             self.db.finish_run(summary)
@@ -464,7 +460,7 @@ class Monitor:
             return False
         return not self.db.was_notified(evaluation.ad_id)
 
-    async def _notify(self, deals: list[DealView], title: str, summary: RunSummary) -> int:
+    async def _notify(self, deals: list[DealView], summary: RunSummary) -> int:
         if not self._notifiers:
             return 0
         deals = sorted(
@@ -473,7 +469,7 @@ class Monitor:
         delivered: set[str] = set()
         for notifier in self._notifiers:
             try:
-                await notifier.send(deals, title=title)
+                await notifier.send(deals)  # notifiers build an informative subject themselves
             except Exception as exc:
                 log.warning("Notifier %s failed: %s", getattr(notifier, "name", notifier), exc)
                 summary.errors.append(f"Уведомление ({getattr(notifier, 'name', '?')}): {exc}")

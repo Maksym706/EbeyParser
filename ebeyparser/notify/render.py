@@ -126,7 +126,7 @@ def deals_count_phrase(n: int) -> str:
     return f"{n} " + plural_ru(n, "выгодное предложение", "выгодных предложения", "выгодных предложений")
 
 
-def _more_phrase(n: int) -> str:
+def more_deals_phrase(n: int) -> str:
     return f"…и ещё {n} " + plural_ru(n, "предложение", "предложения", "предложений")
 
 
@@ -590,7 +590,7 @@ def render_text(deals: list[DealView], *, title: str | None = None, web_base_url
         lines += _text_block(i, _collect(deal, web_base_url))
         lines.append("")
     if len(deals) > len(shown):
-        lines += [_more_phrase(len(deals) - len(shown)) + " — смотрите в EbeyParser.", ""]
+        lines += [more_deals_phrase(len(deals) - len(shown)) + " — смотрите в EbeyParser.", ""]
     lines += ["—" * 20, FOOTER_TEXT]
     return "\n".join(lines) + "\n"
 
@@ -728,7 +728,7 @@ def _email_card(info: _DealInfo) -> str:
         if info.profit_extra:
             text += f" · {info.profit_extra}"
         badges.append(
-            f'<span style="display:inline-block;margin:0 6px 6px 0;padding:6px 14px;border-radius:999px;'
+            f'<span style="display:inline-block;margin:0 6px 6px 0;padding:6px 14px;border-radius:16px;'
             f"background:{bg};color:{fg};font-family:{_FONT};font-size:15px;font-weight:bold;"
             f'line-height:20px;">{_eh(text)}</span>'
         )
@@ -823,7 +823,7 @@ def render_email_html(deals: list[DealView], *, title: str | None = None, web_ba
         f'<tr><td style="padding:0 0 16px 0;">{_email_card(_collect(d, web_base_url))}</td></tr>' for d in shown
     )
     if len(deals) > len(shown):
-        more = _e(_more_phrase(len(deals) - len(shown)) + " — смотрите в EbeyParser.")
+        more = _e(more_deals_phrase(len(deals) - len(shown)) + " — смотрите в EbeyParser.")
         cards += (
             f'<tr><td align="center" style="padding:0 0 16px 0;font-family:{_FONT};font-size:14px;'
             f'color:#475569;">{more}</td></tr>'
