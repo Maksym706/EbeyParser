@@ -257,6 +257,7 @@ class Database:
         q: str | None,
         since: datetime | None,
         include_ignored: bool,
+        source: str | None = None,
     ) -> tuple[str, list[Any]]:
         where: list[str] = []
         params: list[Any] = []
@@ -285,6 +286,9 @@ class Database:
         if since is not None:
             where.append("l.first_seen >= ?")
             params.append(_ts(since))
+        if source:
+            where.append("COALESCE(json_extract(l.data, '$.source'), 'kleinanzeigen') = ?")
+            params.append(source)
         return (" WHERE " + " AND ".join(where)) if where else "", params
 
     def list_deals(
@@ -297,6 +301,7 @@ class Database:
         q: str | None = None,
         since: datetime | None = None,
         include_ignored: bool = False,
+        source: str | None = None,
         sort: str = "score",
         limit: int = 100,
         offset: int = 0,
@@ -304,7 +309,7 @@ class Database:
         """Listings joined with evaluation + user status. Ignored ones are hidden
         unless `include_ignored` or an explicit `status` filter is given."""
         where, params = self._deal_filters(
-            verdict, min_score, search_name, status, purpose, q, since, include_ignored
+            verdict, min_score, search_name, status, purpose, q, since, include_ignored, source
         )
         order = _SORTS.get(sort, _SORTS["score"])
         rows = self._query(
@@ -323,6 +328,7 @@ class Database:
             filters.get("q"),
             filters.get("since"),
             filters.get("include_ignored", False),
+            filters.get("source"),
         )
         rows = self._query(
             "SELECT COUNT(*) AS c FROM listings l"
@@ -346,6 +352,7 @@ class Database:
             (_ts(summary.started_at), summary.model_dump_json()),
         )
         summary.id = cur.lastrowid
+        self._execute("UPDATE runs SET data = ? WHERE id = ?", (summary.model_dump_json(), summary.id))
         return summary
 
     def finish_run(self, summary: RunSummary) -> None:

@@ -498,8 +498,8 @@ textarea.input { height: auto; min-height: 92px; padding: 10px 12px; resize: ver
 .ai-second .ai-head .ai-icon { background: var(--violet-bg); color: var(--violet); }
 .ai-head .grow { flex: 1; min-width: 0; }
 .ai-title { font-weight: 700; }
-.ai-model { font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ai-model.mono { font-family: var(--mono); font-size: 12px; }
+.ai-model { font-size: 12.5px; color: var(--muted); }
+.ai-model.mono { font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .kv { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.4fr); gap: 7px 12px; margin: 0; font-size: 13.5px; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
@@ -690,6 +690,8 @@ legend { padding: 0 6px; font-weight: 700; font-size: 13.5px; color: var(--text-
   .tabs { display: flex; width: 100%; align-self: stretch; }
   .tab { flex: 1 0 auto; justify-content: center; gap: 5px; padding: 0 8px; font-size: 13.5px; }
   .tab .count { padding: 1px 6px; font-size: 11.5px; }
+  .tab:not(.active) .count { display: none; }
+  .ai-block { padding: 14px; }
   .searchbox { flex-basis: 160px; }
   .filters-toggle {
     display: inline-flex; align-items: center; gap: 8px; height: 40px; padding: 0 14px; border-radius: 11px;
@@ -723,3 +725,6 @@ legend { padding: 0 6px; font-weight: 700; font-size: 13.5px; color: var(--text-
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* keep anchored sections clear of the sticky header */
+[id] { scroll-margin-top: calc(var(--topbar-h) + 16px); }

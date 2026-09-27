@@ -29,7 +29,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from .. import __version__
 from ..config import AppConfig, SearchConfig, save_searches
 from ..db import Database
-from ..models import DEAL_STATUSES, AIVerdict, DealView, Listing, RunSummary, utcnow
+from ..models import DEAL_STATUSES, AIVerdict, DealView, RunSummary, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -431,10 +431,7 @@ class DealFilters:
 def query_deals(db: Database, filters: DealFilters, limit: int, offset: int) -> tuple[list[DealView], int]:
     kwargs = filters.db_kwargs()
     if filters.source:
-        # The DB has no source column yet: filter in Python (fine for a personal database).
-        everything = db.list_deals(**kwargs, sort=filters.sort, limit=1_000_000, offset=0)
-        matched = [d for d in everything if getattr(d.listing, "source", "kleinanzeigen") == filters.source]
-        return matched[offset : offset + limit], len(matched)
+        kwargs["source"] = filters.source
     items = db.list_deals(**kwargs, sort=filters.sort, limit=limit, offset=offset) if limit > 0 else []
     return items, db.count_deals(**kwargs)
 
