@@ -1,0 +1,297 @@
+"""Command line entry point: `python -m ebeyparser <command>` (or `ebeyparser <command>`)."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import shutil
+import signal
+import sys
+from pathlib import Path
+
+from .config import DEFAULT_CONFIG_PATH, AppConfig, load_config
+from .db import Database
+from .models import DealView
+
+ROOT = Path(__file__).resolve().parent.parent
+EXAMPLE_CONFIG = ROOT / "config.example.yaml"
+EXAMPLE_ENV = ROOT / ".env.example"
+
+
+def _setup_logging(verbose: bool) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    for noisy in ("httpx", "httpcore", "uvicorn.access"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+def _open(config_path: Path) -> tuple[AppConfig, Database]:
+    config = load_config(config_path)
+    if not config_path.is_file():
+        print(f"⚠  {config_path} не найден — работаю с настройками по умолчанию. "
+              "Создай конфиг командой: python -m ebeyparser init")
+    return config, Database(config.db_path)
+
+
+def _web_base_url(config: AppConfig) -> str:
+    host = "localhost" if config.web.host in ("0.0.0.0", "127.0.0.1", "::") else config.web.host
+    return f"http://{host}:{config.web.port}"
+
+
+def _money(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:,.0f} €".replace(",", ".")
+
+
+def _print_deals(deals: list[DealView]) -> None:
+    if not deals:
+        print("Пока ничего выгодного не найдено.")
+        return
+    for deal in deals:
+        ev, listing = deal.evaluation, deal.listing
+        if ev is None:
+            continue
+        icon = {"buy": "🟢", "maybe": "🟡", "skip": "⚪"}[ev.verdict]
+        profit_label = "экономия" if ev.purpose == "personal" else "прибыль"
+        print(f"{icon} [{ev.score:5.1f}] {listing.title[:70]}")
+        print(f"     цена {_money(ev.buy_price)} · рынок ~{_money(ev.estimate.market_price)}"
+              f" · {profit_label} {_money(ev.expected_profit)} · {listing.location}")
+        for reason in ev.reasons[:3]:
+            print(f"     • {reason}")
+        if ev.ai and ev.ai.reasoning:
+            print(f"     🤖 {ev.ai.reasoning[:220]}")
+        print(f"     {listing.url}")
+
+
+# ------------------------------------------------------------------ commands
+def cmd_init(args: argparse.Namespace) -> int:
+    target = Path(args.config)
+    if target.exists():
+        print(f"{target} уже существует — не трогаю.")
+    else:
+        shutil.copyfile(EXAMPLE_CONFIG, target)
+        print(f"✔ Создан {target}. Открой его и настрой поиски (регион, категории, цены).")
+    env = target.parent / ".env"
+    if not env.exists() and EXAMPLE_ENV.exists():
+        shutil.copyfile(EXAMPLE_ENV, env)
+        print(f"✔ Создан {env} — впиши туда пароль от почты / токен Telegram.")
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Web UI + background monitoring (main mode)."""
+    import uvicorn
+
+    from .monitor import Monitor
+    from .notify.base import build_notifiers
+    from .web.app import create_app
+
+    config_path = Path(args.config)
+    config, db = _open(config_path)
+    host = args.host or config.web.host
+    port = args.port or config.web.port
+    base_url = _web_base_url(config)
+    monitor = Monitor(config, db, web_base_url=base_url)
+    app = create_app(
+        config, db,
+        config_path=config_path,
+        monitor=monitor,
+        notifiers_factory=lambda: build_notifiers(app.state.config.notifications, web_base_url=base_url),
+        start_monitor=config.web.run_monitor and not args.no_monitor,
+    )
+    print(f"🚀 EbeyParser: открой http://{'localhost' if host in ('0.0.0.0', '127.0.0.1') else host}:{port}")
+    uvicorn.run(app, host=host, port=port, log_level="info" if args.verbose else "warning")
+    return 0
+
+
+async def _monitor_loop(config: AppConfig, db: Database) -> None:
+    from .monitor import Monitor
+
+    monitor = Monitor(config, db, web_base_url=_web_base_url(config))
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:  # Windows
+            pass
+    try:
+        await monitor.run_forever(stop)
+    finally:
+        await monitor.aclose()
+
+
+def cmd_monitor(args: argparse.Namespace) -> int:
+    """Monitoring loop without the web UI."""
+    config, db = _open(Path(args.config))
+    print(f"🔎 Мониторинг: {len([s for s in config.searches if s.enabled])} поисков, "
+          f"каждые {config.general.interval_minutes:g} мин. Ctrl+C — остановить.")
+    try:
+        asyncio.run(_monitor_loop(config, db))
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def cmd_once(args: argparse.Namespace) -> int:
+    from .monitor import Monitor
+
+    config, db = _open(Path(args.config))
+
+    async def go():
+        monitor = Monitor(config, db, web_base_url=_web_base_url(config))
+        try:
+            return await monitor.run_once()
+        finally:
+            await monitor.aclose()
+
+    summary = asyncio.run(go())
+    print(f"\nПоисков: {summary.searches} · объявлений: {summary.listings_seen} · новых: "
+          f"{summary.new_listings} · оценено: {summary.evaluated} · выгодных: {summary.deals_found}"
+          f" · уведомлений: {summary.notified}")
+    for err in summary.errors:
+        print(f"⚠  {err}")
+    print()
+    _print_deals(db.list_deals(verdict=["buy", "maybe"], limit=args.top))
+    return 1 if summary.errors and not summary.evaluated else 0
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    from .monitor import Monitor
+
+    config, db = _open(Path(args.config))
+
+    async def go():
+        monitor = Monitor(config, db)
+        try:
+            return await monitor.evaluate_url(args.url, purpose=args.purpose, target_price=args.target)
+        finally:
+            await monitor.aclose()
+
+    try:
+        deal = asyncio.run(go())
+    except ValueError as exc:
+        print(f"✖ {exc}")
+        return 2
+    _print_deals([deal])
+    ev = deal.evaluation
+    if ev and ev.ai:
+        print(f"\n🤖 {ev.ai.model}: товар «{ev.ai.product}», состояние {ev.ai.condition}, "
+              f"фото совпадает: {ev.ai.photo_matches_description}")
+        for flag in ev.red_flags:
+            print(f"   ⚠ {flag}")
+    return 0
+
+
+def cmd_demo(args: argparse.Namespace) -> int:
+    from .demo import seed_demo
+
+    config, db = _open(Path(args.config))
+    count = seed_demo(db)
+    print(f"✔ Добавлено демо-объявлений: {count} (база {config.db_path}). "
+          "Запусти `python -m ebeyparser run --no-monitor` и открой браузер.")
+    return 0
+
+
+def cmd_test_notify(args: argparse.Namespace) -> int:
+    from .notify.base import build_notifiers, missing_settings
+    from .notify.render import sample_deals
+
+    config = load_config(Path(args.config))
+    for channel, missing in missing_settings(config.notifications).items():
+        if missing:
+            print(f"⚠  {channel}: не заполнено {', '.join(missing)}")
+    notifiers = build_notifiers(config.notifications, web_base_url=_web_base_url(config))
+    if not notifiers:
+        print("✖ Ни один канал уведомлений не включён (notifications.email / notifications.telegram).")
+        return 2
+
+    async def go() -> int:
+        failed = 0
+        for notifier in notifiers:
+            try:
+                await notifier.send(sample_deals(), title="Тестовое уведомление EbeyParser")
+                print(f"✔ {notifier.name}: отправлено")
+            except Exception as exc:
+                failed += 1
+                print(f"✖ {notifier.name}: {exc}")
+        return failed
+
+    return 1 if asyncio.run(go()) else 0
+
+
+def cmd_ai_check(args: argparse.Namespace) -> int:
+    from .monitor import Monitor
+
+    config = load_config(Path(args.config))
+    config.ai.enabled = True  # check even if not switched on yet
+    monitor = Monitor(config, Database())
+    health = asyncio.run(monitor.ai_health())
+    if health.get("ok") and health.get("model_available"):
+        print(f"✔ {health['provider']} на {health['base_url']} работает, модель {health['model']} найдена.")
+        return 0
+    if health.get("ok"):
+        print(f"⚠  Сервер {health['base_url']} отвечает, но модели {health['model']} нет.")
+        if health.get("models"):
+            print(f"   Установленные модели: {', '.join(health['models'])}")
+        if config.ai.provider == "ollama":
+            print(f"   Скачай её: ollama pull {health['model']}")
+        return 1
+    print(f"✖ Модель недоступна: {health.get('error')}")
+    return 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ebeyparser",
+        description="Охотник за выгодными объявлениями на Kleinanzeigen.",
+    )
+    parser.add_argument("-c", "--config", default=str(DEFAULT_CONFIG_PATH), help="путь к config.yaml")
+    parser.add_argument("-v", "--verbose", action="store_true", help="подробный лог")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("init", help="создать config.yaml и .env из примеров").set_defaults(func=cmd_init)
+
+    p = sub.add_parser("run", help="веб-интерфейс + мониторинг в фоне (основной режим)")
+    p.add_argument("--host")
+    p.add_argument("--port", type=int)
+    p.add_argument("--no-monitor", action="store_true", help="только веб-интерфейс, без проверок")
+    p.set_defaults(func=cmd_run)
+
+    sub.add_parser("monitor", help="мониторинг без веб-интерфейса").set_defaults(func=cmd_monitor)
+
+    p = sub.add_parser("once", help="одна проверка всех поисков и вывод лучших находок")
+    p.add_argument("--top", type=int, default=10)
+    p.set_defaults(func=cmd_once)
+
+    p = sub.add_parser("check", help="оценить одно объявление по ссылке")
+    p.add_argument("url")
+    p.add_argument("--purpose", choices=["resale", "personal"], default="resale")
+    p.add_argument("--target", type=float, help="для себя: сколько готов заплатить")
+    p.set_defaults(func=cmd_check)
+
+    sub.add_parser("demo", help="заполнить базу демо-данными для просмотра интерфейса").set_defaults(func=cmd_demo)
+    sub.add_parser("test-notify", help="отправить тестовое уведомление").set_defaults(func=cmd_test_notify)
+    sub.add_parser("ai-check", help="проверить, доступна ли локальная модель").set_defaults(func=cmd_ai_check)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command is None:
+        args = parser.parse_args([*(argv or sys.argv[1:]), "run"])
+    for name, default in (("host", None), ("port", None), ("no_monitor", False)):
+        if not hasattr(args, name):
+            setattr(args, name, default)
+    _setup_logging(args.verbose)
+    return args.func(args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

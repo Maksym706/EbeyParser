@@ -1,0 +1,158 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  EbeyParser — настройки. Скопируй в config.yaml:  python -m ebeyparser init
+#  Секреты (пароли, токены, ключи) держи в .env и ссылайся на них как ${ИМЯ}.
+# ─────────────────────────────────────────────────────────────────────────────
+
+general:
+  interval_minutes: 15          # как часто проверять (не ставь меньше 5 — Kleinanzeigen может забанить)
+  max_pages: 1                  # сколько страниц выдачи смотреть за раз (новые всё равно сверху)
+  fetch_details: true           # открывать каждое новое объявление: полный текст + все фото
+  request_delay_seconds: [3, 7] # пауза между запросами к сайту (случайная, в секундах)
+  max_new_per_search: 25        # максимум новых объявлений на поиск за одну проверку
+  data_dir: data                # где лежит база SQLite
+
+# ─── Что мониторить ──────────────────────────────────────────────────────────
+# source: kleinanzeigen | ebay
+# purpose: resale (перепродажа — считаем чистую прибыль) | personal (для себя — считаем экономию)
+#
+# Kleinanzeigen, способ 1 (надёжный): настрой поиск на kleinanzeigen.de — регион, радиус,
+#   категория, цена, «Angebote», — скопируй адрес страницы в url.
+# Kleinanzeigen, способ 2: query + location (город/индекс) + radius_km (+ category_id).
+#   category_id — число из адреса категории, например .../c225 → 225.
+# eBay: работает через официальный API (нужны ключи в разделе ebay ниже).
+searches:
+  - name: "Видеокарты рядом (перепродажа)"
+    source: kleinanzeigen
+    query: "rtx 3080"
+    location: "Berlin"
+    radius_km: 30
+    min_price: 150
+    max_price: 600
+    purpose: resale
+    exclude_keywords: [defekt, bastler, tausch, suche, mining]
+    # reference_price: 450        # если точно знаешь, за сколько уйдёт — оценка станет точнее
+    # min_profit: 60              # переопределяет pricing.min_profit для этого поиска
+
+  - name: "Apple техника по ссылке"
+    source: kleinanzeigen
+    enabled: false
+    url: "https://www.kleinanzeigen.de/s-berlin/macbook/k0l3331r20"   # вставь свою ссылку
+    purpose: resale
+    exclude_keywords: [icloud, gesperrt, defekt, displayschaden]
+
+  - name: "AI-сервер: RTX 3090 (для себя)"
+    source: kleinanzeigen
+    query: "rtx 3090"
+    location: "Berlin"
+    radius_km: 50
+    max_price: 700
+    purpose: personal
+    target_price: 550             # сколько готов заплатить — ниже этого придёт уведомление
+    exclude_keywords: [defekt, bastler, tausch, suche]
+
+  - name: "AI-сервер: DDR4 ECC 64GB (для себя)"
+    source: kleinanzeigen
+    query: "ddr4 ecc 64gb"
+    purpose: personal
+    target_price: 90
+    enabled: false
+
+  - name: "eBay: аукционы видеокарт, заканчиваются скоро"
+    source: ebay
+    enabled: false                # включи, когда добавишь ключи eBay
+    query: "rtx 3080"
+    ebay_category_ids: ["27386"]  # Grafikkarten (номер из адреса категории на ebay.de)
+    buying_options: [AUCTION]
+    ending_within_hours: 3        # классика: аукционы, которые никто не заметил
+    max_price: 400
+    purpose: resale
+
+  - name: "eBay: самовывоз рядом"
+    source: ebay
+    enabled: false
+    query: "thinkpad t480"
+    buying_options: [FIXED_PRICE, BEST_OFFER]
+    local_pickup_only: true       # только с самовывозом...
+    location: "10115"             # ...в радиусе от этого индекса
+    radius_km: 40
+    max_price: 250
+    purpose: resale
+
+# ─── Как считать выгоду ──────────────────────────────────────────────────────
+pricing:
+  min_profit: 40                # € чистой прибыли, чтобы сказать «покупать»
+  min_roi: 0.25                 # и минимум 25% на вложенные деньги
+  selling_fee_percent: 0        # частные продавцы на eBay.de и Kleinanzeigen комиссию не платят
+  payment_fee_percent: 0        # например 2.49, если продаёшь через PayPal «Waren und Dienstleistungen»
+  default_shipping_cost: 0      # сколько потратишь на отправку при перепродаже
+  safety_margin_percent: 10     # запас: торг, риск, твоё время
+  asking_price_discount: 0.85   # цены в объявлениях выше реальных продаж — берём 85%
+  use_kleinanzeigen_comps: true # искать похожие объявления на Kleinanzeigen
+  use_ebay_sold_comps: true     # смотреть реально проданные на eBay.de (лучшая оценка)
+  comps_limit: 30
+  reference_prices:             # твой справочник цен (самое точное, если знаешь рынок)
+    - keywords: ["rtx", "3090"]
+      price: 650
+    - keywords: ["rtx", "3080"]
+      exclude: ["ti", "laptop"]
+      price: 380
+    - keywords: ["mac", "mini", "m1"]
+      price: 380
+
+# ─── Локальная ИИ-модель (смотрит фото и описание) ───────────────────────────
+# Вся оценка идёт локально на твоём компьютере. Поставь Ollama (https://ollama.com), затем:
+#   ollama pull qwen2.5vl:7b        (~6 ГБ видеопамяти; на слабом ПК: qwen2.5vl:3b или gemma3:4b)
+# Проверка: python -m ebeyparser ai-check
+ai:
+  enabled: true
+  provider: ollama              # ollama | openai (= LM Studio, llama.cpp, vLLM — любой OpenAI-совместимый)
+  base_url: ${OLLAMA_URL:-http://localhost:11434}   # LM Studio: http://localhost:1234/v1
+  model: qwen2.5vl:7b
+  max_images: 3                 # сколько фото показывать модели
+  timeout_seconds: 240
+  run_for: promising            # promising — только перспективные (быстрее), all — все подряд
+
+  # Необязательно: «второе мнение» от Claude (облако, платно) — только для лучших находок.
+  # Нужен ключ ANTHROPIC_API_KEY в .env и пакет:  pip install anthropic
+  second_opinion:
+    enabled: false
+    provider: anthropic
+    model: claude-opus-5
+    api_key: ${ANTHROPIC_API_KEY}
+    min_score: 70               # проверять только то, что локальная модель уже оценила высоко
+    max_per_run: 5              # не больше N платных запросов за одну проверку
+
+# ─── eBay (официальный API) ──────────────────────────────────────────────────
+# developer.ebay.com → Application Keys → Production: App ID (Client ID) и Cert ID (Client Secret).
+# С ними токен создаётся и обновляется сам. Разовый токен (EBAY_OAUTH_TOKEN) живёт ~2 часа.
+ebay:
+  client_id: ${EBAY_CLIENT_ID}
+  client_secret: ${EBAY_CLIENT_SECRET}
+  oauth_token: ${EBAY_OAUTH_TOKEN}
+  marketplace_id: EBAY_DE
+  item_location_country: DE
+
+# ─── Уведомления ─────────────────────────────────────────────────────────────
+notifications:
+  min_score: 70                 # присылать только сделки с оценкой от 70/100
+  verdicts: [buy]               # [buy] — только «покупать»; [buy, maybe] — и «подумать»
+  mode: instant                 # instant — сразу после каждого поиска; digest — одним письмом за проверку
+  email:
+    enabled: false
+    smtp_host: smtp.gmail.com
+    smtp_port: 587
+    use_ssl: false
+    username: ${SMTP_USER}
+    password: ${SMTP_PASSWORD}  # для Gmail — «пароль приложения», не обычный пароль
+    from_addr: ${SMTP_USER}
+    to_addrs: ${NOTIFY_EMAIL}
+  telegram:
+    enabled: false
+    bot_token: ${TELEGRAM_BOT_TOKEN}
+    chat_id: ${TELEGRAM_CHAT_ID}
+
+# ─── Веб-интерфейс ───────────────────────────────────────────────────────────
+web:
+  host: 127.0.0.1               # 0.0.0.0 — чтобы открыть с телефона в домашней сети
+  port: 8000
+  run_monitor: true             # мониторинг работает в фоне вместе с сайтом
