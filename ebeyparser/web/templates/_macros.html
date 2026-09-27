@@ -9,8 +9,8 @@
 {%- endif %}
 {%- endmacro %}
 
-{% macro img(src, alt='', cls='', lazy=true) -%}
-<img src="{{ src }}" alt="{{ alt }}"{% if cls %} class="{{ cls }}"{% endif %}{% if lazy %} loading="lazy"{% endif %} decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='{{ PLACEHOLDER_IMG }}'">
+{% macro img(src, alt='', cls='', lazy=true, main=false) -%}
+<img src="{{ src }}" alt="{{ alt }}"{% if cls %} class="{{ cls }}"{% endif %}{% if lazy %} loading="lazy"{% endif %}{% if main %} data-gallery-main{% endif %} decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='{{ PLACEHOLDER_IMG }}'">
 {%- endmacro %}
 
 {% macro profit_badge(p) -%}

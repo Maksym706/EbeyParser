@@ -1,0 +1,236 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% set l = deal.listing %}
+{% block title %}{{ l.title }}{% endblock %}
+{% block content %}
+<a class="back" href="/">{{ icon('arrow-left') }}Все сделки</a>
+
+<div class="detail" data-deal-detail="{{ card.id }}" data-status="{{ card.status }}">
+  <div class="col">
+    {# ---------------------------------------------------------- gallery #}
+    <section class="card gallery o-gallery" data-gallery>
+      <div class="gallery-main">
+        {{ m.img(card.image, l.title, lazy=false, main=true) }}
+        {% if card.images | length > 1 %}<span class="media-chip gallery-count" data-gallery-count>1 / {{ card.images | length }}</span>{% endif %}
+      </div>
+      {% if card.images | length > 1 %}
+      <div class="thumbs">
+        {% for src in card.images %}
+        <a class="thumb {{ 'active' if loop.first }}" href="{{ src }}" data-thumb="{{ src }}" aria-label="Фото {{ loop.index }}">{{ m.img(src) }}</a>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </section>
+
+    {# ------------------------------------------------------ description #}
+    <section class="card section o-desc">
+      <h2>{{ icon('inbox') }}Описание</h2>
+      {% if l.description %}
+      <div class="description">{{ l.description }}</div>
+      {% else %}
+      <p class="muted">Продавец не оставил описания (или оно ещё не загружено).</p>
+      {% endif %}
+    </section>
+
+    {# ------------------------------------------------------------ facts #}
+    <section class="card section o-facts">
+      <h2>{{ icon('info') }}Детали объявления</h2>
+      <dl class="facts-grid">
+        {% if card.condition %}<div><dt>Состояние</dt><dd>{{ card.condition }}</dd></div>{% endif %}
+        <div><dt>Продавец</dt><dd>{{ l.seller_name or '—' }} <span class="muted small">· {{ SELLER_TYPE_LABELS.get(l.seller_type, l.seller_type) }}</span></dd></div>
+        {% if card.seller_rating %}<div><dt>Рейтинг продавца</dt><dd>{{ card.seller_rating }}</dd></div>{% endif %}
+        <div><dt>Доставка</dt><dd>
+          {% if l.shipping_cost %}{{ l.shipping_cost | money }}
+          {% elif l.shipping_cost == 0 and l.source == 'ebay' %}бесплатно
+          {% elif l.shipping_possible %}возможна
+          {% elif l.shipping_possible == false %}только самовывоз
+          {% else %}не указано{% endif %}
+        </dd></div>
+        {% if l.location %}<div><dt>Где</dt><dd>{{ l.location }}{% if l.distance_km is not none %} · {{ l.distance_km | num }} км{% endif %}</dd></div>{% endif %}
+        {% if card.buying_options %}<div><dt>Формат</dt><dd>{% for b in card.buying_options %}{{ BUYING_OPTION_LABELS.get(b, b) }}{% if not loop.last %}, {% endif %}{% endfor %}</dd></div>{% endif %}
+        {% if l.posted_at_text %}<div><dt>Размещено</dt><dd>{{ l.posted_at_text }}</dd></div>{% endif %}
+        <div><dt>Найдено</dt><dd>{{ l.first_seen | dt }}</dd></div>
+        {% if l.search_name %}<div><dt>Поиск</dt><dd><a class="link" href="/?search={{ l.search_name | urlencode }}&verdict=all">{{ l.search_name }}</a></dd></div>{% endif %}
+        <div><dt>ID объявления</dt><dd class="num">{{ l.ad_id }}</dd></div>
+        {% for key, value in l.attributes.items() %}<div><dt>{{ key }}</dt><dd>{{ value }}</dd></div>{% endfor %}
+      </dl>
+      {% if l.tags %}<div class="tags">{% for t in l.tags %}<span class="chip">{{ t }}</span>{% endfor %}</div>{% endif %}
+    </section>
+
+    {# ------------------------------------------------------ comparables #}
+    <section class="card section o-comps">
+      <div class="section-head">
+        <h2>{{ icon('trending') }}Похожие предложения</h2>
+        {% if ev and ev.estimate.query %}<span class="muted small">запрос: «{{ ev.estimate.query }}»</span>{% endif %}
+      </div>
+      {% if comparables %}
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr><th>Объявление</th><th class="right">Цена</th><th>Источник</th><th class="hide-sm">Когда</th></tr></thead>
+          <tbody>
+          {% for c in comparables %}
+            <tr>
+              <td>{% if c.url %}<a class="comp-title" href="{{ c.url }}" target="_blank" rel="noopener noreferrer">{{ c.title }}</a>{% else %}<span class="comp-title">{{ c.title }}</span>{% endif %}</td>
+              <td class="right price-cell">{{ c.price | money }}</td>
+              <td><span class="src-badge {{ c.source }}">{{ COMP_SOURCE_LABELS.get(c.source, c.source) }}</span></td>
+              <td class="hide-sm muted nowrap">{{ c.date_text or '—' }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="muted">Сравнимых предложений не нашлось — оценка рынка по справочной цене или по мнению ИИ.</p>
+      {% endif %}
+    </section>
+  </div>
+
+  <aside class="col">
+    {# ---------------------------------------------------------- summary #}
+    <section class="card summary-card o-summary">
+      <div class="chip-row">
+        <span class="chip chip-{{ card.verdict }}">{{ card.verdict_label }}</span>
+        <span class="chip"><span class="src src-{{ card.source }}">{{ card.source_label }}</span></span>
+        <span class="chip {{ 'chip-blue' if card.purpose == 'personal' }}">{{ icon('user' if card.purpose == 'personal' else 'trending') }}{{ card.purpose_label }}</span>
+        <span class="chip chip-outline" data-status-label>{{ card.status_label }}</span>
+      </div>
+      <h1>{{ l.title }}</h1>
+
+      <div class="price-block">
+        <div>
+          {% if card.price_prefix %}<div class="price-prefix">{{ 'Текущая ставка' if card.is_auction else card.price_prefix }}</div>{% endif %}
+          <div class="price-big {{ 'free' if card.is_free }}">{{ card.price_text }}{% if card.negotiable %} <span class="tag-vb">VB</span>{% endif %}</div>
+          <div class="price-sub">
+            {% if card.market_text %}<span>{{ card.market_text }}</span>{% endif %}
+            {% if card.shipping_text %}<span>{{ card.shipping_text }}</span>{% endif %}
+          </div>
+        </div>
+        {{ m.score_ring(card.score, card.verdict, 'lg') }}
+      </div>
+
+      {% if ev %}
+      <div class="metrics">
+        <div class="metric {{ 'pos' if card.profit and card.profit.positive else ('neg' if card.profit else '') }}">
+          <span>{{ 'Экономия' if card.purpose == 'personal' else 'Прибыль' }}</span>
+          <b>{{ ev.expected_profit | money(sign=card.purpose != 'personal') }}</b>
+        </div>
+        <div class="metric"><span>ROI</span><b>{{ ev.roi | pct }}</b></div>
+        <div class="metric"><span>Рынок</span><b>{{ (ev.estimate.market_price or (ev.ai.estimated_market_price if ev.ai else none)) | money }}</b></div>
+      </div>
+      {% endif %}
+
+      {% if card.max_buy_text %}
+      <div class="highlight {{ 'over' if card.max_buy_ok == false }}">
+        {{ icon('target') }}
+        <div>
+          <div>{{ 'Максимальная ставка' if card.is_auction else 'Выгодно до' }} <b>{{ card.max_buy_text }}</b></div>
+          <div class="muted">
+            {% if card.max_buy_ok == false %}Сейчас дороже порога — торгуйся или пропусти
+            {% elif card.is_auction %}Не ставь выше — иначе прибыль ниже твоих целей
+            {% else %}До этой цены сделка выполняет твои цели по прибыли{% endif %}
+          </div>
+        </div>
+      </div>
+      {% endif %}
+
+      {% if card.is_auction %}
+      <div class="auction-box {{ 'urgent' if card.ends_soon }}">
+        {{ icon('gavel') }}
+        <div>
+          <b>{{ card.bids_text or 'Аукцион' }}</b>
+          {% if card.ends_iso %} · <span data-ends-at="{{ card.ends_iso }}">{{ 'заканчивается ' ~ card.ends_text if card.ends_text != 'завершён' else 'аукцион завершён' }}</span>{% endif %}
+          {% if l.ends_at %}<div class="muted small">Окончание: {{ l.ends_at | dt }}</div>{% endif %}
+        </div>
+      </div>
+      {% endif %}
+
+      <div class="deal-meta">
+        {% if card.location %}<span>{{ icon('pin') }}{{ card.location }}</span>{% endif %}
+        <span>{{ icon('clock') }}найдено {{ card.ago }}</span>
+      </div>
+
+      <a class="btn btn-primary btn-lg btn-block" href="{{ l.url }}" target="_blank" rel="noopener noreferrer">
+        {{ icon('external') }}Открыть на {{ card.source_label }}
+      </a>
+
+      <div class="note-row">
+        <span class="label">Мой статус</span>
+        <div class="status-buttons" role="group" aria-label="Статус">
+          {% set status_icons = {'new': 'inbox', 'starred': 'star', 'contacted': 'message', 'bought': 'check', 'ignored': 'x'} %}
+          {% for key, label in statuses %}
+          <button type="button" class="status-btn {{ 'active' if card.status == key }}" data-set-status="{{ key }}" data-status="{{ key }}" aria-pressed="{{ 'true' if card.status == key else 'false' }}">{{ icon(status_icons[key]) }}{{ label }}</button>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="note-row">
+        <label class="label" for="note">Заметка</label>
+        <textarea class="input" id="note" data-note rows="3" placeholder="Например: написал продавцу, предложил 420 €, встреча в субботу">{{ deal.note }}</textarea>
+        <div class="row-end">
+          <span class="muted small" data-note-state></span>
+          <button type="button" class="btn btn-sm" data-save-note>{{ icon('check') }}Сохранить заметку</button>
+        </div>
+      </div>
+    </section>
+
+    {# ----------------------------------------------------------- profit #}
+    <section class="card section o-profit">
+      <h2>{{ icon('wallet') }}{{ 'Сколько сэкономлю' if card.purpose == 'personal' else 'Расчёт прибыли' }}</h2>
+      {% if breakdown is none %}
+      <p class="muted">Объявление ещё не оценено.</p>
+      {% elif breakdown.missing %}
+      <p class="muted">Недостаточно данных: не удалось определить рыночную цену или цену покупки.</p>
+      {% else %}
+      <table class="breakdown">
+        <tbody>
+        {% for row in breakdown.rows %}
+          <tr class="{{ row.kind }}">
+            <td>{{ row.label }}{% if row.note %}<span class="note">{{ row.note }}</span>{% endif %}</td>
+            <td>{% if row.kind == 'base' %}{{ row.value | money }}{% else %}{{ row.value | money(sign=True) }}{% endif %}</td>
+          </tr>
+        {% endfor %}
+          <tr class="total {{ 'pos' if breakdown.total > 0 else 'neg' }}">
+            <td>{{ breakdown.total_label }}</td>
+            <td>{{ breakdown.total | money(sign=breakdown.purpose != 'personal') }}</td>
+          </tr>
+          {% if breakdown.roi is not none %}
+          <tr class="roi"><td>{{ 'Выгода к цене покупки' if breakdown.purpose == 'personal' else 'ROI (прибыль / цена покупки)' }}</td><td>{{ breakdown.roi | pct }}</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+      <p class="breakdown-foot">
+        Источник оценки: {{ breakdown.source }}{% if breakdown.notes %} · {{ breakdown.notes }}{% endif %}
+        {%- if search and search.target_price and card.purpose == 'personal' %} · твой лимит цены {{ search.target_price | money }}{% endif %}
+      </p>
+      {% endif %}
+    </section>
+
+    {# --------------------------------------------------------------- AI #}
+    <section class="card section o-ai">
+      <h2>{{ icon('sparkles') }}Мнение нейросети</h2>
+      {% if ai_local or ai_second %}
+      <div class="ai-grid">
+        {% if ai_local %}{{ m.ai_block(ai_local, 'local') }}{% endif %}
+        {% if ai_second %}{{ m.ai_block(ai_second, 'second') }}{% endif %}
+      </div>
+      {% elif ai_enabled %}
+      <p class="muted">ИИ не проверял это объявление — обычно так бывает, если по цене оно сразу неинтересно.</p>
+      {% else %}
+      <p class="muted">ИИ выключен в конфиге (<code>ai.enabled: false</code>). Включи локальную модель, чтобы проверять фото и описание.</p>
+      {% endif %}
+    </section>
+
+    {# ---------------------------------------------------------- reasons #}
+    {% if ev and (ev.reasons or ev.red_flags) %}
+    <section class="card section o-reasons">
+      <h2>{{ icon('info') }}Почему такая оценка</h2>
+      {% if ev.reasons %}
+      <ul class="reasons">{% for r in ev.reasons %}<li>{{ icon('check') }}<span>{{ r }}</span></li>{% endfor %}</ul>
+      {% endif %}
+      {% if ev.red_flags %}
+      <ul class="flag-list">{% for f in ev.red_flags %}<li>{{ icon('alert') }}<span>{{ f }}</span></li>{% endfor %}</ul>
+      {% endif %}
+    </section>
+    {% endif %}
+  </aside>
+</div>
+{% endblock %}

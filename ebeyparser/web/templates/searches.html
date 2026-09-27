@@ -1,0 +1,267 @@
+{% extends "base.html" %}
+{% block title %}Поиски{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>Поиски</h1>
+    <p>Что отслеживать: регион, категории, цены и ключевые слова</p>
+  </div>
+  {% if editable %}
+  <div class="head-actions">
+    <a class="btn btn-primary" href="/searches?new=1#form">{{ icon('plus') }}Добавить поиск</a>
+  </div>
+  {% endif %}
+</section>
+
+<div class="stack" style="margin-bottom: 20px">
+  {% if notice %}
+  <div class="notice success">{{ icon('check') }}<div>{{ notice }}{% if editable %} — записано в <code>{{ config_path.name }}</code>, монитор подхватит изменения при следующей проверке.{% endif %}</div></div>
+  {% endif %}
+  {% if not editable %}
+  <div class="notice warn">{{ icon('alert') }}<div><b>Только просмотр.</b> Приложение запущено без файла конфигурации, поэтому поиски здесь нельзя изменить. Создай конфиг командой <code>python -m ebeyparser init</code> и запусти <code>python -m ebeyparser run</code>.</div></div>
+  {% endif %}
+</div>
+
+<section class="card help">
+  <div class="help-icon">{{ icon('info') }}</div>
+  <div>
+    <p><b>Самый надёжный способ — настроить поиск на kleinanzeigen.de (регион, радиус, категория, цена), скопировать адрес страницы и вставить в поле URL.</b></p>
+    <p>Для eBay выбери источник «eBay»: укажи запрос, диапазон цен и формат (аукцион / купить сейчас). Хитрость: аукционы, которые заканчиваются в ближайшие часы, часто уходят дешевле рынка.</p>
+    <p>«Для себя» — если покупаешь в личное пользование (например, детали для AI-сервера): тогда считается экономия относительно рынка, а не прибыль от перепродажи.</p>
+  </div>
+</section>
+
+{% if cards %}
+<section class="search-grid">
+  {% for c in cards %}
+  {% set s = c.s %}
+  <article class="card search-card {{ 'disabled' if not s.enabled }}">
+    <div class="search-card-head">
+      <div>
+        <h3>{{ s.name }}</h3>
+        <div class="chip-row">
+          <span class="chip"><span class="src src-{{ c.source }}">{{ c.source_label }}</span></span>
+          <span class="chip {{ 'chip-blue' if s.purpose == 'personal' else 'chip-buy' }}">{{ c.purpose_label }}</span>
+          {% if not s.enabled %}<span class="chip">выключен</span>{% endif %}
+        </div>
+      </div>
+      {% if editable %}
+      <form method="post" action="/searches/toggle">
+        <input type="hidden" name="name" value="{{ s.name }}">
+        <button class="switch" type="submit" role="switch" aria-checked="{{ 'true' if s.enabled else 'false' }}" title="{{ 'Выключить' if s.enabled else 'Включить' }} поиск" aria-label="Включён"></button>
+      </form>
+      {% else %}
+      <span class="switch" role="switch" aria-checked="{{ 'true' if s.enabled else 'false' }}" aria-disabled="true"></span>
+      {% endif %}
+    </div>
+    <div class="search-card-body">
+      <dl class="kv">
+        {% if s.url %}<dt>URL</dt><dd><a class="url-text" href="{{ s.url }}" target="_blank" rel="noopener noreferrer">{{ s.url | truncate(90, true, '…') }}</a></dd>{% endif %}
+        {% if s.query %}<dt>Запрос</dt><dd><b>{{ s.query }}</b></dd>{% endif %}
+        {% if c.where %}<dt>Где</dt><dd>{{ c.where }}</dd>{% endif %}
+        {% if s.category_id %}<dt>Категория</dt><dd class="num">{{ s.category_id }}</dd>{% endif %}
+        {% if s.ebay_category_ids %}<dt>Категории eBay</dt><dd class="num">{{ s.ebay_category_ids | join(', ') }}</dd>{% endif %}
+        {% if c.price %}<dt>Цена</dt><dd class="num">{{ c.price }}</dd>{% endif %}
+        {% if c.buying %}<dt>Формат</dt><dd>{{ c.buying | join(', ') }}</dd>{% endif %}
+        {% if c.conditions %}<dt>Состояние</dt><dd>{{ c.conditions | join(', ') }}</dd>{% endif %}
+        {% if s.ending_within_hours %}<dt>Аукционы</dt><dd>заканчиваются в течение {{ s.ending_within_hours | num }} ч</dd>{% endif %}
+        {% if s.local_pickup_only %}<dt>Получение</dt><dd>только самовывоз</dd>{% endif %}
+        {% if s.reference_price %}<dt>Рыночная цена</dt><dd class="num">{{ s.reference_price | money }}</dd>{% endif %}
+        {% if s.target_price %}<dt>Мой лимит</dt><dd class="num">{{ s.target_price | money }}</dd>{% endif %}
+        {% if s.min_profit is not none %}<dt>Мин. прибыль</dt><dd class="num">{{ s.min_profit | money }}</dd>{% endif %}
+        {% if c.min_roi %}<dt>Мин. ROI</dt><dd class="num">{{ c.min_roi }}</dd>{% endif %}
+        {% if s.max_pages %}<dt>Страниц</dt><dd class="num">{{ s.max_pages }}</dd>{% endif %}
+      </dl>
+      {% if s.include_keywords %}<div class="kw" title="Хотя бы одно слово должно быть в объявлении">{% for k in s.include_keywords %}<span>{{ k }}</span>{% endfor %}</div>{% endif %}
+      {% if s.exclude_keywords %}<div class="kw exclude" title="Объявления с этими словами пропускаются">{% for k in s.exclude_keywords %}<span>{{ k }}</span>{% endfor %}</div>{% endif %}
+    </div>
+    <div class="search-card-foot">
+      <a class="link small" href="{{ c.href }}">{{ c.deals }} {{ plural(c.deals, 'объявление', 'объявления', 'объявлений') }}{% if c.buy %} · {{ c.buy }} «покупать»{% endif %}</a>
+      {% if editable %}
+      <div class="actions">
+        <a class="btn btn-ghost btn-sm" href="/searches?edit={{ s.name | urlencode }}#form">{{ icon('pencil') }}Изменить</a>
+        <form method="post" action="/searches/delete" data-confirm="Удалить поиск «{{ s.name }}»? Найденные объявления останутся в базе.">
+          <input type="hidden" name="name" value="{{ s.name }}">
+          <button class="btn btn-ghost btn-sm btn-danger" type="submit">{{ icon('trash') }}Удалить</button>
+        </form>
+      </div>
+      {% endif %}
+    </div>
+  </article>
+  {% endfor %}
+</section>
+{% else %}
+<section class="card empty" style="margin-bottom: 20px">
+  <div class="empty-icon">{{ icon('search') }}</div>
+  <h2>Поисков пока нет</h2>
+  <p>Добавь первый поиск — например «Видеокарты Берлин»: вставь ссылку с kleinanzeigen.de или укажи запрос, город и радиус.</p>
+</section>
+{% endif %}
+
+{% if editable %}
+<details class="card form-card" id="form" {% if form_open %}open{% endif %}>
+  <summary>
+    <span class="title">{{ icon('pencil' if editing else 'plus') }}{% if editing %}Изменить поиск «{{ editing }}»{% else %}Новый поиск{% endif %}</span>
+    {{ icon('chevron-down') }}
+  </summary>
+  <form class="form-body" method="post" action="/searches/save" novalidate>
+    {% if editing %}<input type="hidden" name="original_name" value="{{ editing }}">{% endif %}
+    {% if errors %}
+    <div class="notice error">{{ icon('alert') }}<div><b>Проверь поля:</b><ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul></div></div>
+    {% endif %}
+
+    <fieldset>
+      <legend>Основное</legend>
+      <div class="form-grid">
+        <label class="field span-2">
+          <span>{{ labels.name }} *</span>
+          <input class="input" name="name" value="{{ form.name }}" required maxlength="80" placeholder="Например: Видеокарты Берлин">
+        </label>
+        <label class="field">
+          <span>{{ labels.source }}</span>
+          <select class="select" name="source" data-source-select>
+            <option value="kleinanzeigen" {{ 'selected' if form.source == 'kleinanzeigen' }}>Kleinanzeigen</option>
+            <option value="ebay" {{ 'selected' if form.source == 'ebay' }}>eBay (официальный API)</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>{{ labels.purpose }}</span>
+          <select class="select" name="purpose">
+            <option value="resale" {{ 'selected' if form.purpose == 'resale' }}>Перепродажа — считать прибыль</option>
+            <option value="personal" {{ 'selected' if form.purpose == 'personal' }}>Для себя — считать экономию</option>
+          </select>
+        </label>
+        <label class="check span-2"><input type="checkbox" name="enabled" value="1" {{ 'checked' if form.enabled }}> Поиск включён</label>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Где и что искать</legend>
+      <div class="form-grid">
+        <label class="field span-2" data-source-only="kleinanzeigen">
+          <span>{{ labels.url }}</span>
+          <input class="input" name="url" type="url" value="{{ form.url }}" placeholder="https://www.kleinanzeigen.de/s-pc-zubehoer-software/berlin/rtx-3090/k0c225l3331r20">
+          <small>Если указан URL, запрос/регион/категория ниже не нужны — берётся всё из ссылки.</small>
+        </label>
+        <label class="field span-2">
+          <span>{{ labels.query }}</span>
+          <input class="input" name="query" value="{{ form.query }}" placeholder="rtx 3090">
+        </label>
+        <label class="field">
+          <span>{{ labels.location }}</span>
+          <input class="input" name="location" value="{{ form.location }}" placeholder="Berlin или 10115">
+          <small data-source-only="ebay">Для eBay — почтовый индекс (нужен для самовывоза).</small>
+        </label>
+        <label class="field">
+          <span>{{ labels.radius_km }}</span>
+          <input class="input" name="radius_km" inputmode="numeric" value="{{ form.radius_km }}" placeholder="20">
+        </label>
+        <label class="field" data-source-only="kleinanzeigen">
+          <span>{{ labels.category_id }}</span>
+          <input class="input" name="category_id" inputmode="numeric" value="{{ form.category_id }}" placeholder="225">
+          <small>Число из URL: …/k0<b>c225</b> → 225 (PC-Zubehör)</small>
+        </label>
+        <label class="field" data-source-only="kleinanzeigen">
+          <span>{{ labels.location_id }}</span>
+          <input class="input" name="location_id" inputmode="numeric" value="{{ form.location_id }}" placeholder="3331">
+          <small>Необязательно: число из URL после «l», 3331 = Berlin</small>
+        </label>
+        <label class="field span-2" data-source-only="ebay">
+          <span>{{ labels.ebay_category_ids }}</span>
+          <input class="input" name="ebay_category_ids" value="{{ form.ebay_category_ids }}" placeholder="27386">
+          <small>Через запятую. 27386 = Grafikkarten, 177 = Notebooks</small>
+        </label>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Цена и фильтры</legend>
+      <div class="form-grid">
+        <label class="field">
+          <span>{{ labels.min_price }}, €</span>
+          <input class="input" name="min_price" inputmode="decimal" value="{{ form.min_price }}" placeholder="50">
+        </label>
+        <label class="field">
+          <span>{{ labels.max_price }}, €</span>
+          <input class="input" name="max_price" inputmode="decimal" value="{{ form.max_price }}" placeholder="600">
+        </label>
+        <label class="field">
+          <span>{{ labels.include_keywords }}</span>
+          <input class="input" name="include_keywords" value="{{ form.include_keywords }}" placeholder="3090, 24gb">
+          <small>Через запятую; достаточно одного совпадения</small>
+        </label>
+        <label class="field">
+          <span>{{ labels.exclude_keywords }}</span>
+          <input class="input" name="exclude_keywords" value="{{ form.exclude_keywords }}" placeholder="defekt, suche, tausch">
+          <small>Через запятую; такие объявления пропускаются</small>
+        </label>
+      </div>
+    </fieldset>
+
+    <fieldset data-source-only="ebay">
+      <legend>eBay</legend>
+      <div class="form-grid">
+        <div class="field span-2">
+          <span>{{ labels.buying_options }}</span>
+          <div class="check-row">
+            {% for key, label in BUYING_OPTION_LABELS.items() %}
+            <label class="check"><input type="checkbox" name="buying_options" value="{{ key }}" {{ 'checked' if key in form.buying_options }}> {{ label }}</label>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="field span-2">
+          <span>{{ labels.ebay_conditions }}</span>
+          <div class="check-row">
+            {% for key, label in EBAY_CONDITION_LABELS.items() %}
+            <label class="check"><input type="checkbox" name="ebay_conditions" value="{{ key }}" {{ 'checked' if key in form.ebay_conditions }}> {{ label }}</label>
+            {% endfor %}
+          </div>
+        </div>
+        <label class="field">
+          <span>{{ labels.ending_within_hours }}</span>
+          <input class="input" name="ending_within_hours" inputmode="decimal" value="{{ form.ending_within_hours }}" placeholder="12">
+          <small>Только аукционы, которые скоро закончатся</small>
+        </label>
+        <div class="field">
+          <span>&nbsp;</span>
+          <label class="check"><input type="checkbox" name="local_pickup_only" value="1" {{ 'checked' if form.local_pickup_only }}> Только самовывоз в радиусе</label>
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Оценка выгоды (необязательно)</legend>
+      <div class="form-grid cols-3">
+        <label class="field">
+          <span>{{ labels.reference_price }}, €</span>
+          <input class="input" name="reference_price" inputmode="decimal" value="{{ form.reference_price }}" placeholder="750">
+          <small>Если знаешь, почём это обычно продаётся</small>
+        </label>
+        <label class="field">
+          <span>{{ labels.target_price }}, €</span>
+          <input class="input" name="target_price" inputmode="decimal" value="{{ form.target_price }}" placeholder="90">
+          <small>Для себя: сколько готов заплатить</small>
+        </label>
+        <label class="field">
+          <span>{{ labels.max_pages }}</span>
+          <input class="input" name="max_pages" inputmode="numeric" value="{{ form.max_pages }}" placeholder="{{ config.general.max_pages }}">
+        </label>
+        <label class="field">
+          <span>{{ labels.min_profit }}, €</span>
+          <input class="input" name="min_profit" inputmode="decimal" value="{{ form.min_profit }}" placeholder="{{ config.pricing.min_profit | num }}">
+        </label>
+        <label class="field">
+          <span>{{ labels.min_roi }}, %</span>
+          <input class="input" name="min_roi" inputmode="decimal" value="{{ form.min_roi }}" placeholder="{{ (config.pricing.min_roi * 100) | round | int }}">
+        </label>
+      </div>
+    </fieldset>
+
+    <div class="form-actions">
+      <button class="btn btn-primary" type="submit">{{ icon('check') }}{{ 'Сохранить изменения' if editing else 'Добавить поиск' }}</button>
+      <a class="btn btn-ghost" href="/searches">Отмена</a>
+    </div>
+  </form>
+</details>
+{% endif %}
+{% endblock %}

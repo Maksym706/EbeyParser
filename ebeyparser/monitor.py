@@ -16,6 +16,8 @@ import time
 from datetime import timedelta
 from typing import Any
 
+import httpx
+
 from .ai.claude import make_llm
 from .ai.evaluator import AIEvaluator
 from .config import AppConfig, SearchConfig
@@ -220,6 +222,10 @@ class Monitor:
                     break
                 except EbayAPIError as exc:
                     summary.errors.append(f"{search.name}: {exc}")
+                    continue
+                except httpx.HTTPError as exc:
+                    log.warning("Search %r: network error %s", search.name, exc)
+                    summary.errors.append(f"{search.name}: ошибка сети — {exc}")
                     continue
                 except Exception as exc:
                     log.exception("Search %r failed", search.name)
