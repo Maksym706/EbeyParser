@@ -1,0 +1,275 @@
+"""Client for a LOCAL vision LLM: Ollama (native API) or any OpenAI-compatible server
+(LM Studio, llama.cpp server, vLLM, Ollama's /v1 endpoint, ...)."""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+from typing import Any, Protocol
+
+import httpx
+
+from ..config import LLMSettings
+
+log = logging.getLogger(__name__)
+
+# Photos are expensive in tokens: 3 images at ~1000 tokens each overflow Ollama's
+# default 2k/4k context, so ask for a bigger window.
+OLLAMA_NUM_CTX = 8192
+
+
+class LLMError(Exception):
+    """Any failure talking to the model; the message is user-facing (Russian)."""
+
+
+class ChatModel(Protocol):
+    """What AIEvaluator needs from a model client (VisionLLM, ClaudeVision, ...)."""
+
+    async def chat_json(
+        self, system: str, user: str, images: list[bytes] | None = None, schema: dict | None = None
+    ) -> str: ...
+
+    async def health(self) -> dict: ...
+
+    async def aclose(self) -> None: ...
+
+
+def image_mime(data: bytes) -> str:
+    """Mime type from magic bytes (jpeg/png/webp/gif); jpeg if unknown."""
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return "image/jpeg"
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def _model_names_match(wanted: str, available: str) -> bool:
+    w, a = wanted.strip().lower(), available.strip().lower()
+    if not w or not a:
+        return False
+    if w == a or w.removesuffix(":latest") == a.removesuffix(":latest"):
+        return True
+    # llama.cpp / LM Studio report file paths or "publisher/model" ids
+    tail = a.rsplit("/", 1)[-1]
+    return w in (tail, tail.removesuffix(".gguf"))
+
+
+class VisionLLM:
+    """chat_json / health / aclose for Ollama and OpenAI-compatible servers."""
+
+    def __init__(self, cfg: LLMSettings, transport: httpx.AsyncBaseTransport | None = None):
+        if cfg.provider not in ("ollama", "openai"):
+            raise LLMError(
+                f"VisionLLM поддерживает только ollama и openai-совместимые серверы, а не «{cfg.provider}»"
+            )
+        self.cfg = cfg
+        self.provider = cfg.provider
+        base = (cfg.base_url or "").strip().rstrip("/")
+        if not base:
+            base = "http://localhost:11434" if cfg.provider == "ollama" else "http://localhost:1234"
+        if cfg.provider == "ollama":
+            # people paste the OpenAI-style URL for Ollama too
+            for suffix in ("/v1", "/api"):
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+        self.base_url = base
+        headers = {"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else {}
+        timeout = httpx.Timeout(cfg.timeout_seconds, connect=min(10.0, cfg.timeout_seconds))
+        self._client = httpx.AsyncClient(timeout=timeout, headers=headers, transport=transport)
+
+    # -- urls -----------------------------------------------------------------------
+
+    def _openai_url(self, path: str) -> str:
+        base = self.base_url
+        return f"{base}{path}" if base.endswith("/v1") else f"{base}/v1{path}"
+
+    def _chat_url(self) -> str:
+        if self.provider == "ollama":
+            return f"{self.base_url}/api/chat"
+        return self._openai_url("/chat/completions")
+
+    def _models_url(self) -> str:
+        if self.provider == "ollama":
+            return f"{self.base_url}/api/tags"
+        return self._openai_url("/models")
+
+    # -- http -----------------------------------------------------------------------
+
+    def _unreachable(self) -> str:
+        if self.provider == "ollama":
+            return (
+                f"Локальная модель недоступна по адресу {self.base_url} — запущена ли Ollama? "
+                "(команда: ollama serve)"
+            )
+        return (
+            f"Локальная модель недоступна по адресу {self.base_url} — запущен ли сервер "
+            "(LM Studio / llama.cpp / vLLM)?"
+        )
+
+    async def _request(self, method: str, url: str, payload: dict | None = None) -> httpx.Response:
+        try:
+            return await self._client.request(method, url, json=payload)
+        except httpx.TimeoutException as exc:
+            raise LLMError(
+                f"Модель не ответила за {self.cfg.timeout_seconds:g} с — возьми модель поменьше "
+                "или увеличь ai.timeout_seconds"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise LLMError(f"{self._unreachable()} ({type(exc).__name__})") from exc
+
+    def _http_error(self, resp: httpx.Response) -> LLMError:
+        detail = resp.text.strip()
+        try:
+            body = resp.json()
+            if isinstance(body, dict):
+                err = body.get("error")
+                if isinstance(err, dict):
+                    err = err.get("message")
+                detail = str(err or detail)
+        except ValueError:
+            pass
+        detail = detail[:300]
+        if resp.status_code == 404 and "model" in detail.lower():
+            hint = f" — выполни: ollama pull {self.cfg.model}" if self.provider == "ollama" else ""
+            return LLMError(f"Модель «{self.cfg.model}» не найдена{hint} ({detail})")
+        if resp.status_code in (401, 403):
+            return LLMError(f"Сервер модели отказал в доступе (HTTP {resp.status_code}) — проверь api_key")
+        return LLMError(f"Ошибка сервера модели (HTTP {resp.status_code}): {detail}")
+
+    @staticmethod
+    def _json(resp: httpx.Response) -> Any:
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise LLMError(f"Сервер модели вернул не JSON: {resp.text[:200]}") from exc
+
+    # -- public API -----------------------------------------------------------------
+
+    async def chat_json(
+        self, system: str, user: str, images: list[bytes] | None = None, schema: dict | None = None
+    ) -> str:
+        """Ask for a JSON answer; returns the raw text content of the reply."""
+        images = [img for img in (images or []) if img]
+        if self.provider == "ollama":
+            return await self._chat_ollama(system, user, images, schema)
+        return await self._chat_openai(system, user, images)
+
+    async def _chat_ollama(
+        self, system: str, user: str, images: list[bytes], schema: dict | None
+    ) -> str:
+        user_msg: dict[str, Any] = {"role": "user", "content": user}
+        if images:
+            user_msg["images"] = [_b64(img) for img in images]
+        payload: dict[str, Any] = {
+            "model": self.cfg.model,
+            "messages": [{"role": "system", "content": system}, user_msg],
+            "stream": False,
+            "format": schema or "json",
+            "options": {"temperature": self.cfg.temperature, "num_ctx": OLLAMA_NUM_CTX},
+        }
+        resp = await self._request("POST", self._chat_url(), payload)
+        if resp.status_code == 400 and schema and "format" in resp.text.lower():
+            # old Ollama without structured outputs: plain JSON mode
+            log.info("Ollama rejected the JSON schema, retrying with format=json")
+            payload["format"] = "json"
+            resp = await self._request("POST", self._chat_url(), payload)
+        if resp.status_code >= 400:
+            raise self._http_error(resp)
+        data = self._json(resp)
+        try:
+            content = data["message"]["content"]
+        except (KeyError, TypeError) as exc:
+            raise LLMError(f"Неожиданный ответ Ollama: {json.dumps(data)[:200]}") from exc
+        return content if isinstance(content, str) else json.dumps(content)
+
+    async def _chat_openai(self, system: str, user: str, images: list[bytes]) -> str:
+        if images:
+            content: Any = [{"type": "text", "text": user}] + [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{image_mime(img)};base64,{_b64(img)}"},
+                }
+                for img in images
+            ]
+        else:
+            content = user  # plain string: some servers reject list content without images
+        payload: dict[str, Any] = {
+            "model": self.cfg.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": content},
+            ],
+            "temperature": self.cfg.temperature,
+            "stream": False,
+            "response_format": {"type": "json_object"},
+        }
+        url = self._chat_url()
+        resp = await self._request("POST", url, payload)
+        if resp.status_code in (400, 422) and "response_format" in resp.text.lower():
+            # e.g. LM Studio only accepts json_schema; the prompt demands JSON anyway
+            log.info("Server rejected response_format, retrying without it")
+            payload.pop("response_format")
+            resp = await self._request("POST", url, payload)
+        if resp.status_code >= 400:
+            raise self._http_error(resp)
+        data = self._json(resp)
+        try:
+            message = data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMError(f"Неожиданный ответ сервера: {json.dumps(data)[:200]}") from exc
+        content_out = message.get("content")
+        if isinstance(content_out, list):  # some servers return content parts
+            content_out = "".join(
+                p.get("text", "") for p in content_out if isinstance(p, dict)
+            )
+        return content_out or ""
+
+    async def health(self) -> dict:
+        """Is the server up and is the configured model installed/loaded?"""
+        info: dict[str, Any] = {
+            "ok": False,
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "model": self.cfg.model,
+            "model_available": False,
+            "models": [],
+            "error": None,
+        }
+        try:
+            resp = await self._request("GET", self._models_url())
+            if resp.status_code >= 400:
+                raise self._http_error(resp)
+            data = self._json(resp)
+        except LLMError as exc:
+            info["error"] = str(exc)
+            return info
+        key, field = ("models", "name") if self.provider == "ollama" else ("data", "id")
+        items = data.get(key, []) if isinstance(data, dict) else []
+        names = [str(m.get(field) or m.get("model") or "") for m in items if isinstance(m, dict)]
+        info["models"] = [n for n in names if n]
+        info["model_available"] = any(_model_names_match(self.cfg.model, n) for n in info["models"])
+        info["ok"] = info["model_available"]
+        if not info["model_available"]:
+            if self.provider == "ollama":
+                info["error"] = f"Модель «{self.cfg.model}» не установлена — выполни: ollama pull {self.cfg.model}"
+            else:
+                info["error"] = f"Модель «{self.cfg.model}» не загружена на сервере"
+        return info
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def __aenter__(self) -> VisionLLM:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()

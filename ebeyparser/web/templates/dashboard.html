@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Сделки{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>Что купить прямо сейчас</h1>
+    <p>Находки с Kleinanzeigen и eBay с оценкой рынка, прибыли и проверкой фото нейросетью</p>
+  </div>
+  <div class="head-actions" data-monitor data-next-run="{{ monitor.next_run_at or '' }}" data-running="{{ '1' if monitor.running else '0' }}">
+    <span class="pill pill-{{ pill_kind }}" data-monitor-pill><span class="dot"></span><span data-pill-text>{{ pill_text }}</span></span>
+    <form method="post" action="/api/run" data-run-form>
+      <button class="btn btn-primary" type="submit" {% if not monitor.available %}disabled title="Монитор не подключён: запусти «ebeyparser run»"{% endif %}>
+        {{ icon('refresh') }}Проверить сейчас
+      </button>
+    </form>
+  </div>
+</section>
+{% if last_run %}
+<p class="last-run muted">
+  Последняя проверка {{ last_run.started_at | ago }} · новых {{ last_run.new_listings }} · выгодных {{ last_run.deals_found }}
+  {%- if last_run.errors %} · <a class="link" href="/status">{{ last_run.errors | length }} {{ plural(last_run.errors | length, 'ошибка', 'ошибки', 'ошибок') }}</a>{% endif %}
+</p>
+{% endif %}
+
+<section class="stats" aria-label="Сводка">
+  <div class="card stat stat-blue">
+    <div class="stat-label">Новых за 24 ч</div>
+    <div class="stat-value">{{ stats.listings_24h }}</div>
+    <div class="stat-sub">всего в базе {{ stats.listings_total }}</div>
+    <span class="stat-icon">{{ icon('inbox') }}</span>
+  </div>
+  <div class="card stat stat-green">
+    <div class="stat-label">«Покупать»</div>
+    <div class="stat-value">{{ stats.buy_total }}</div>
+    <div class="stat-sub">+{{ stats.buy_24h }} за 24 ч · «подумать» {{ stats.maybe_total }}</div>
+    <span class="stat-icon">{{ icon('check') }}</span>
+  </div>
+  <div class="card stat stat-green">
+    <div class="stat-label">Потенциальная прибыль</div>
+    <div class="stat-value">{{ stats.potential_profit | round | money(sign=True) }}</div>
+    <div class="stat-sub">если перепродать всё из «покупать»</div>
+    <span class="stat-icon">{{ icon('trending') }}</span>
+  </div>
+  <div class="card stat stat-amber">
+    <div class="stat-label">Куплено</div>
+    <div class="stat-value">{{ stats.bought_total }}</div>
+    <div class="stat-sub">уведомлений отправлено: {{ stats.notified_total }}</div>
+    <span class="stat-icon">{{ icon('wallet') }}</span>
+  </div>
+</section>
+
+<section class="toolbar">
+  <nav class="tabs" aria-label="Вердикт">
+    {% for key, label in tabs %}
+    <a class="tab tab-{{ key }} {{ 'active' if filters.verdict == key }}" href="{{ filters.url(verdict=key) }}"{% if filters.verdict == key %} aria-current="page"{% endif %}>
+      {{ label }}<span class="count">{{ tab_counts[key] }}</span>
+    </a>
+    {% endfor %}
+  </nav>
+
+  <form class="filters" method="get" action="/" data-filters>
+    {% if filters.verdict != 'good' %}<input type="hidden" name="verdict" value="{{ filters.verdict }}">{% endif %}
+    <input type="checkbox" id="filters-toggle" class="filters-toggle-input" {% if filters.panel_active %}checked{% endif %}>
+    <div class="toolbar-row">
+      <label class="searchbox">
+        <span class="sr-only">Поиск по названию</span>
+        {{ icon('search') }}
+        <input class="input" type="search" name="q" value="{{ filters.q }}" placeholder="Найти: 3090, ThinkPad…" autocomplete="off">
+      </label>
+      <label class="filters-toggle" for="filters-toggle">
+        {{ icon('sliders') }}Фильтры{% if filters.panel_active %} <span class="badge-count">{{ filters.panel_active }}</span>{% endif %}
+      </label>
+    </div>
+    <div class="filter-panel">
+      <label class="field-inline">
+        <span>Цель</span>
+        <select class="select" name="purpose">
+          <option value="">Любая</option>
+          <option value="resale" {{ 'selected' if filters.purpose == 'resale' }}>Перепродажа</option>
+          <option value="personal" {{ 'selected' if filters.purpose == 'personal' }}>Для себя</option>
+        </select>
+      </label>
+      <label class="field-inline">
+        <span>Площадка</span>
+        <select class="select" name="source">
+          <option value="">Все</option>
+          <option value="kleinanzeigen" {{ 'selected' if filters.source == 'kleinanzeigen' }}>Kleinanzeigen</option>
+          <option value="ebay" {{ 'selected' if filters.source == 'ebay' }}>eBay</option>
+        </select>
+      </label>
+      <label class="field-inline">
+        <span>Поиск</span>
+        <select class="select" name="search">
+          <option value="">Все поиски</option>
+          {% for name in search_names %}<option value="{{ name }}" {{ 'selected' if filters.search == name }}>{{ name }}</option>{% endfor %}
+        </select>
+      </label>
+      <label class="field-inline">
+        <span>Статус</span>
+        <select class="select" name="status">
+          {% for key, label in status_filters %}<option value="{{ key }}" {{ 'selected' if filters.status == key }}>{{ label }}</option>{% endfor %}
+        </select>
+      </label>
+      <label class="field-inline">
+        <span>Сортировка</span>
+        <select class="select" name="sort">
+          {% for key, label in sorts %}<option value="{{ key }}" {{ 'selected' if filters.sort == key }}>{{ label }}</option>{% endfor %}
+        </select>
+      </label>
+      <label class="field-inline narrow">
+        <span>Балл от</span>
+        <input class="input" type="number" name="min_score" min="0" max="100" step="5" inputmode="numeric" value="{{ filters.min_score | int if filters.min_score is not none else '' }}" placeholder="0">
+      </label>
+      <div class="filter-actions">
+        <button class="btn btn-primary" type="submit">Применить</button>
+        <a class="btn btn-ghost" href="/">Сбросить</a>
+      </div>
+    </div>
+  </form>
+</section>
+
+<div class="results-head">
+  <span><b>{{ total }}</b> {{ plural(total, 'объявление', 'объявления', 'объявлений') }}{% if pages > 1 %} · страница {{ page }} из {{ pages }}{% endif %}</span>
+  <span class="hide-sm">{% for key, label in sorts %}{% if key == filters.sort %}{{ label }}{% endif %}{% endfor %}</span>
+</div>
+
+{% if cards %}
+<section class="deal-grid">
+  {% for c in cards %}{{ m.deal_card(c) }}{% endfor %}
+</section>
+
+{% if pages > 1 %}
+<nav class="pager" aria-label="Страницы">
+  {% if page > 1 %}<a href="{{ filters.url(page=page - 1) }}" aria-label="Назад">{{ icon('chevron-left') }}</a>{% else %}<span class="disabled">{{ icon('chevron-left') }}</span>{% endif %}
+  {% for p in page_links %}
+    {% if p is none %}<span class="gap">…</span>
+    {% elif p == page %}<span class="current" aria-current="page">{{ p }}</span>
+    {% else %}<a href="{{ filters.url(page=p) }}">{{ p }}</a>{% endif %}
+  {% endfor %}
+  {% if page < pages %}<a href="{{ filters.url(page=page + 1) }}" aria-label="Вперёд">{{ icon('chevron-right') }}</a>{% else %}<span class="disabled">{{ icon('chevron-right') }}</span>{% endif %}
+</nav>
+{% endif %}
+
+{% elif stats.listings_total == 0 %}
+<section class="card empty">
+  <div class="empty-icon">{{ icon('search') }}</div>
+  <h2>Пока нет ни одного объявления</h2>
+  {% if has_searches %}
+  <p>Поиски настроены — нажми «Проверить сейчас» или подожди автоматической проверки. Новые находки появятся здесь.</p>
+  {% else %}
+  <p>Сначала добавь, что искать: например «RTX 3090 в Берлине до 500 €». Самый простой способ — настроить поиск на kleinanzeigen.de и вставить ссылку на странице «Поиски».</p>
+  {% endif %}
+  <div class="head-actions">
+    <a class="btn btn-primary" href="/searches?new=1#form">{{ icon('plus') }}Добавить поиск</a>
+    <a class="btn" href="/status">{{ icon('activity') }}Статус системы</a>
+  </div>
+  <p class="small">Хочешь просто посмотреть интерфейс? Запусти <code>python -m ebeyparser demo</code> — появятся демо-сделки.</p>
+</section>
+{% else %}
+<section class="card empty">
+  <div class="empty-icon">{{ icon('sliders') }}</div>
+  <h2>Ничего не найдено</h2>
+  <p>По этим фильтрам нет объявлений. Попробуй вкладку «Все» или сбрось фильтры.</p>
+  <div class="head-actions">
+    <a class="btn btn-primary" href="/">Сбросить фильтры</a>
+    <a class="btn" href="{{ filters.url(verdict='all') }}">Показать все</a>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

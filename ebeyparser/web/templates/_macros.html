@@ -1,0 +1,112 @@
+{# Reusable UI pieces. `icon()` and label dicts are Jinja globals from app.py. #}
+
+{% macro score_ring(score, verdict, size='md') -%}
+{% if score is not none -%}
+<span class="ring ring-{{ verdict }} ring-{{ size }}" title="Балл {{ score }} из 100" aria-label="Балл {{ score }} из 100">
+  <svg viewBox="0 0 36 36" aria-hidden="true"><circle class="ring-bg" cx="18" cy="18" r="15.5"/><circle class="ring-fg" cx="18" cy="18" r="15.5" pathLength="100" stroke-dasharray="{{ [score, 1] | max }} 100"/></svg>
+  <b>{{ score }}</b>
+</span>
+{%- endif %}
+{%- endmacro %}
+
+{% macro img(src, alt='', cls='', lazy=true, main=false) -%}
+<img src="{{ src }}" alt="{{ alt }}"{% if cls %} class="{{ cls }}"{% endif %}{% if lazy %} loading="lazy"{% endif %}{% if main %} data-gallery-main{% endif %} decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='{{ PLACEHOLDER_IMG }}'">
+{%- endmacro %}
+
+{% macro profit_badge(p) -%}
+{% if p -%}
+<span class="profit {{ 'pos' if p.positive else 'neg' }}" title="{{ 'Экономия относительно рыночной цены' if p.kind == 'savings' else 'Чистая прибыль после перепродажи' }}">
+  {{ p.text }}{% if p.extra %}<span class="sep">·</span><span class="extra">{{ p.extra }}</span>{% endif %}
+</span>
+{%- endif %}
+{%- endmacro %}
+
+{% macro max_buy(c) -%}
+{% if c.max_buy_text -%}
+<span class="maxbuy {{ 'over' if c.max_buy_ok == false }}" title="{{ 'Цена выше выгодного порога — торгуйся' if c.max_buy_ok == false else 'До этой цены сделка выполняет твои цели по прибыли' }}">
+  {{ icon('target') }}{{ c.max_buy_label }} {{ c.max_buy_text }}
+</span>
+{%- endif %}
+{%- endmacro %}
+
+{% macro deal_card(c) -%}
+<article class="card deal verdict-{{ c.verdict }} status-{{ c.status }}" data-deal="{{ c.id }}" data-status="{{ c.status }}">
+  <a class="deal-media" href="{{ c.href }}" tabindex="-1" aria-hidden="true">
+    {{ img(c.image) }}
+    <span class="media-tl">
+      <span class="media-chip {{ c.verdict }}">{{ c.verdict_label }}</span>
+      <span class="media-chip status" data-status-ribbon {% if c.status not in ('starred', 'bought', 'contacted') %}hidden{% endif %}>{{ c.status_label if c.status in ('starred', 'bought', 'contacted') }}</span>
+    </span>
+    <span class="media-bl">
+      {% if c.is_auction %}<span class="media-chip {{ 'urgent' if c.ends_soon }}">{{ icon('gavel') }}{% if c.ends_iso %}<span data-ends-at="{{ c.ends_iso }}">{{ 'заканчивается ' ~ c.ends_text if c.ends_text != 'завершён' else 'аукцион завершён' }}</span>{% else %}Аукцион{% endif %}</span>{% endif %}
+      {% if c.purpose == 'personal' %}<span class="media-chip">{{ icon('user') }}Для себя</span>{% endif %}
+      <span class="media-chip media-src"><span class="src src-{{ c.source }}">{{ c.source_label }}</span></span>
+    </span>
+  </a>
+  <div class="deal-body">
+    <div class="deal-head">
+      <a class="deal-title" href="{{ c.href }}">{{ c.title }}</a>
+      {{ score_ring(c.score, c.verdict) }}
+    </div>
+    <div class="price-row">
+      {% if c.price_prefix %}<span class="price-prefix">{{ c.price_prefix }}</span>{% endif %}
+      <span class="price {{ 'free' if c.is_free }}">{{ c.price_text }}</span>
+      {% if c.negotiable %}<span class="tag-vb" title="Verhandlungsbasis — торг уместен">VB</span>{% endif %}
+      {% if c.market_text %}<span class="market">{{ c.market_text }}</span>{% endif %}
+    </div>
+    {% if c.profit or c.max_buy_text %}
+    <div class="badges">{{ profit_badge(c.profit) }}{{ max_buy(c) }}</div>
+    {% endif %}
+    {% if c.bids_text or c.shipping_text or c.condition or c.seller_rating %}
+    <div class="facts">
+      {% if c.bids_text %}<span>{{ icon('gavel') }}{{ c.bids_text }}</span>{% endif %}
+      {% if c.shipping_text %}<span>{{ icon('truck') }}{{ c.shipping_text }}</span>{% endif %}
+      {% if c.condition %}<span>{{ icon('package') }}{{ c.condition }}</span>{% endif %}
+      {% if c.seller_rating %}<span>{{ icon('star') }}{{ c.seller_rating }}</span>{% endif %}
+    </div>
+    {% endif %}
+    {% if c.summary %}<p class="summary" title="{{ c.summary }}">{{ icon('sparkles') }}{{ c.summary }}</p>{% endif %}
+    {% if c.flags %}
+    <div class="flags">
+      {% for f in c.flags[:2] %}<span class="flag" title="{{ f }}">{{ icon('alert') }}<span>{{ f }}</span></span>{% endfor %}
+      {% if c.flags | length > 2 %}<span class="flag" title="{{ c.flags[2:] | join(' · ') }}">+{{ c.flags | length - 2 }}</span>{% endif %}
+    </div>
+    {% endif %}
+    <div class="deal-meta">
+      {% if c.location %}<span>{{ icon('pin') }}{{ c.location }}</span>{% endif %}
+      <span title="Найдено {{ c.deal.listing.first_seen | dt }}">{{ icon('clock') }}{{ c.ago }}</span>
+    </div>
+  </div>
+  <div class="deal-actions">
+    <button type="button" class="act act-star" data-action="starred" aria-pressed="{{ 'true' if c.status == 'starred' else 'false' }}" title="В избранное">{{ icon('star') }}<span>Избранное</span></button>
+    <button type="button" class="act act-bought" data-action="bought" aria-pressed="{{ 'true' if c.status == 'bought' else 'false' }}" title="Отметить как купленное">{{ icon('check') }}<span>Купил</span></button>
+    <button type="button" class="act act-hide" data-action="ignored" aria-pressed="{{ 'true' if c.status == 'ignored' else 'false' }}" title="Скрыть объявление">{{ icon('x') }}<span>Скрыть</span></button>
+  </div>
+</article>
+{%- endmacro %}
+
+{% macro ai_block(p, kind) -%}
+<div class="ai-block ai-{{ kind }}">
+  <div class="ai-head">
+    <span class="ai-icon">{{ icon('cpu' if kind == 'local' else 'sparkles') }}</span>
+    <div class="grow">
+      <div class="ai-title">{{ p.title }}{% if kind == 'second' and p.v.model %}: {{ p.v.model }}{% endif %}</div>
+      {% if kind == 'second' %}<div class="ai-model">перепроверка сильной моделью</div>{% else %}<div class="ai-model mono">{{ p.v.model or 'модель не указана' }}</div>{% endif %}
+    </div>
+    <span class="chip chip-{{ p.v.verdict }}">{{ p.verdict_label }}</span>
+  </div>
+  <dl class="kv">
+    <dt>Товар</dt><dd>{{ p.v.product or '—' }}</dd>
+    <dt>Состояние</dt><dd>{{ p.condition }}</dd>
+    <dt>Фото совпадают с описанием</dt>
+    <dd class="match-{{ p.match }}">{% if p.match == 'yes' %}✓ Да{% elif p.match == 'no' %}✗ Нет{% else %}Неясно{% endif %}</dd>
+    {% if p.market %}<dt>Оценка рынка</dt><dd class="num">{{ p.market }}</dd>{% endif %}
+    <dt>Уверенность</dt>
+    <dd><span class="bar"><span style="width: {{ p.confidence }}%"></span></span><span class="num">{{ p.confidence }}&nbsp;%</span></dd>
+  </dl>
+  {% if p.v.reasoning %}<p class="ai-reasoning">{{ p.v.reasoning }}</p>{% endif %}
+  {% if p.v.red_flags %}
+  <ul class="flag-list">{% for f in p.v.red_flags %}<li>{{ icon('alert') }}<span>{{ f }}</span></li>{% endfor %}</ul>
+  {% endif %}
+</div>
+{%- endmacro %}

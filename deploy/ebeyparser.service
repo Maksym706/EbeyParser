@@ -1,0 +1,21 @@
+# systemd-сервис для Linux (сервер, старый ноутбук, мини-ПК).
+# Установка:
+#   sudo cp deploy/ebeyparser.service /etc/systemd/system/
+#   sudo sed -i "s#/home/USER#$HOME#g; s#User=USER#User=$USER#" /etc/systemd/system/ebeyparser.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ebeyparser
+#   journalctl -u ebeyparser -f      # смотреть лог
+[Unit]
+Description=EbeyParser — мониторинг Kleinanzeigen и eBay
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=USER
+WorkingDirectory=/home/USER/EbeyParser
+ExecStart=/home/USER/EbeyParser/.venv/bin/python -m ebeyparser run
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

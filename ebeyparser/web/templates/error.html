@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<section class="card empty error-page">
+  <div class="error-code">{{ code }}</div>
+  <h2>{{ title }}</h2>
+  <p>{{ message or ('Такой страницы нет. Возможно, ссылка устарела.' if code == 404 else 'Это действие сейчас недоступно.') }}</p>
+  <div class="head-actions">
+    <a class="btn btn-primary" href="/">{{ icon('tag') }}К сделкам</a>
+    <a class="btn" href="/status">{{ icon('activity') }}Статус</a>
+  </div>
+</section>
+{% endblock %}

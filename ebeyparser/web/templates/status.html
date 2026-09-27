@@ -1,0 +1,179 @@
+{% extends "base.html" %}
+{% block title %}Статус{% endblock %}
+{% block content %}
+{% set last = runs[0] if runs else none %}
+<section class="page-head">
+  <div>
+    <h1>Статус</h1>
+    <p>Монитор, нейросеть, уведомления и история проверок</p>
+  </div>
+  <div class="head-actions" data-monitor data-next-run="{{ monitor.next_run_at or '' }}" data-running="{{ '1' if monitor.running else '0' }}">
+    <span class="pill pill-{{ pill_kind }}" data-monitor-pill><span class="dot"></span><span data-pill-text>{{ pill_text }}</span></span>
+    <form method="post" action="/api/run" data-run-form>
+      <button class="btn btn-primary" type="submit" {% if not monitor.available %}disabled{% endif %}>{{ icon('refresh') }}Проверить сейчас</button>
+    </form>
+  </div>
+</section>
+
+<section class="status-grid">
+  {# ------------------------------------------------------------ monitor #}
+  {% set m_state = 'ok' if monitor.available and (monitor.loop or monitor.running) else ('warn' if monitor.available else 'off') %}
+  <article class="card status-card state-{{ m_state }}">
+    <div class="status-card-head">
+      <span class="status-icon">{{ icon('activity') }}</span>
+      <div class="grow"><h2>Монитор</h2><div class="state-line">{{ pill_text }}</div></div>
+    </div>
+    <dl class="kv">
+      <dt>Интервал</dt><dd>каждые {{ config.general.interval_minutes | num }} мин</dd>
+      <dt>Поиски</dt><dd>{{ searches_enabled }} активных из {{ config.searches | length }}</dd>
+      <dt>Последняя проверка</dt><dd>{% if last %}{{ last.started_at | ago }}{% else %}ещё не было{% endif %}</dd>
+      {% if last %}<dt>Итог</dt><dd>новых {{ last.new_listings }} · выгодных {{ last.deals_found }}{% if last.errors %} · <span class="neg">ошибок {{ last.errors | length }}</span>{% endif %}</dd>{% endif %}
+    </dl>
+    {% if not monitor.available %}<p class="muted small">Монитор не подключён: веб-интерфейс запущен без фоновых проверок.</p>{% endif %}
+  </article>
+
+  {# ----------------------------------------------------------------- AI #}
+  {% if not ai.enabled %}{% set a_state = 'off' %}{% elif ai.ok and ai.model_available != false %}{% set a_state = 'ok' %}{% elif ai.ok %}{% set a_state = 'warn' %}{% else %}{% set a_state = 'bad' %}{% endif %}
+  <article class="card status-card state-{{ a_state }}">
+    <div class="status-card-head">
+      <span class="status-icon">{{ icon('cpu') }}</span>
+      <div class="grow">
+        <h2>Локальная нейросеть</h2>
+        <div class="state-line">
+          {% if not ai.enabled %}ИИ выключен в конфиге
+          {% elif a_state == 'ok' %}Работает, модель на месте
+          {% elif a_state == 'warn' %}Сервер отвечает, но модели нет
+          {% else %}Недоступна{% endif %}
+        </div>
+      </div>
+    </div>
+    <dl class="kv">
+      <dt>Провайдер</dt><dd>{{ ai.provider }}</dd>
+      <dt>Адрес</dt><dd class="num">{{ ai.base_url or '—' }}</dd>
+      <dt>Модель</dt><dd><code>{{ ai.model }}</code></dd>
+      {% if ai.enabled and ai.model_available is not none %}<dt>Модель скачана</dt><dd class="{{ 'match-yes' if ai.model_available else 'match-no' }}">{{ '✓ да' if ai.model_available else '✗ нет' }}</dd>{% endif %}
+    </dl>
+    {% if not ai.enabled %}
+    <p class="muted small">Включи <code>ai.enabled: true</code> в config.yaml, чтобы нейросеть проверяла фото и описание.</p>
+    {% elif ai.error %}
+    <p class="neg small">{{ ai.error }}</p>
+    {% if ai.provider == 'ollama' and ai.ok %}<p class="muted small">Скачай модель: <code>ollama pull {{ ai.model }}</code></p>{% endif %}
+    {% endif %}
+  </article>
+
+  {# ------------------------------------------------------ second opinion #}
+  {% set s_on = second is not none and second.enabled %}
+  <article class="card status-card state-{{ 'ok' if s_on else 'off' }}">
+    <div class="status-card-head">
+      <span class="status-icon">{{ icon('sparkles') }}</span>
+      <div class="grow"><h2>Второе мнение</h2><div class="state-line">{{ 'Включено' if s_on else 'Выключено' }}</div></div>
+    </div>
+    {% if second is not none %}
+    <dl class="kv">
+      <dt>Модель</dt><dd><code>{{ second.model }}</code></dd>
+      <dt>Провайдер</dt><dd>{{ second.provider }}{% if second.provider == 'anthropic' %} (облако, платно){% endif %}</dd>
+      <dt>Для каких сделок</dt><dd>балл от {{ second.min_score | num }}, вердикт {{ second.verdicts | map('replace', 'buy', 'покупать') | map('replace', 'maybe', 'подумать') | map('replace', 'skip', 'пропустить') | join(', ') }}</dd>
+      <dt>Лимит</dt><dd>до {{ second.max_per_run }} запросов за проверку</dd>
+      {% if second.provider == 'anthropic' %}<dt>API-ключ</dt><dd>{{ 'задан' if second.api_key else 'не задан' }}</dd>{% endif %}
+    </dl>
+    {% endif %}
+    <p class="muted small">Сильная облачная модель перепроверяет только лучшие находки — чтобы не платить за каждую.</p>
+  </article>
+
+  {# ---------------------------------------------------------------- eBay #}
+  <article class="card status-card state-{{ 'ok' if ebay.configured else 'off' }}">
+    <div class="status-card-head">
+      <span class="status-icon">{{ icon('shield') }}</span>
+      <div class="grow"><h2>eBay API</h2><div class="state-line">{{ 'Подключён' if ebay.configured else 'Не настроен' }}</div></div>
+    </div>
+    {% if ebay.available %}
+    <dl class="kv">
+      <dt>Ключи</dt><dd class="num">{{ ebay.credentials }}</dd>
+      <dt>Площадка</dt><dd>{{ ebay.marketplace or '—' }}{% if ebay.sandbox %} (sandbox){% endif %}</dd>
+    </dl>
+    {% endif %}
+    {% if not ebay.configured %}<p class="muted small">Получи App ID и Cert ID на developer.ebay.com → Application Keys и впиши их в раздел <code>ebay</code> конфига.</p>{% endif %}
+  </article>
+</section>
+
+<section class="two-col">
+  {# -------------------------------------------------------- notifications #}
+  <article class="card section">
+    <h2>{{ icon('bell') }}Уведомления</h2>
+    <div class="channels">
+      {% for ch in channels %}
+      <div class="channel">
+        <div class="channel-head">{{ icon(ch.icon) }}{{ ch.name }}<span class="chip {{ 'chip-buy' if ch.enabled else '' }}">{{ 'включён' if ch.enabled else 'выключен' }}</span></div>
+        <dl class="kv">{% for k, v in ch.details %}<dt>{{ k }}</dt><dd>{{ v }}</dd>{% endfor %}</dl>
+        {% if ch.missing %}<p class="neg small">Не заполнено: {{ ch.missing | join(', ') }}</p>{% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    <p class="muted small" style="margin-bottom: 12px">Присылать: вердикт {{ config.notifications.verdicts | map('replace', 'buy', 'покупать') | map('replace', 'maybe', 'подумать') | map('replace', 'skip', 'пропустить') | join(', ') }}, балл от {{ config.notifications.min_score | num }}, {{ 'сразу' if config.notifications.mode == 'instant' else 'одной сводкой за проверку' }}.</p>
+    <button class="btn" type="button" data-notify-test>{{ icon('send') }}Отправить тестовое уведомление</button>
+    <div class="results" data-notify-results></div>
+  </article>
+
+  {# ------------------------------------------------------------- settings #}
+  <article class="card section">
+    <h2>{{ icon('settings') }}Главные настройки</h2>
+    <dl class="settings-list">
+      <div><dt>Проверка каждые</dt><dd>{{ config.general.interval_minutes | num }} мин</dd></div>
+      <div><dt>Страниц на поиск</dt><dd>{{ config.general.max_pages }}</dd></div>
+      <div><dt>Открывать объявления</dt><dd>{{ 'да' if config.general.fetch_details else 'нет' }}</dd></div>
+      <div><dt>Пауза между запросами</dt><dd>{{ config.general.request_delay_seconds[0] | num }}–{{ config.general.request_delay_seconds[1] | num }} с</dd></div>
+      <div><dt>Мин. прибыль</dt><dd>{{ config.pricing.min_profit | money }}</dd></div>
+      <div><dt>Мин. ROI</dt><dd>{{ config.pricing.min_roi | pct }}</dd></div>
+      <div><dt>Запас на торг и риск</dt><dd>{{ config.pricing.safety_margin_percent | num }} %</dd></div>
+      <div><dt>Комиссии при продаже</dt><dd>{{ (config.pricing.selling_fee_percent + config.pricing.payment_fee_percent) | num(2) }} %</dd></div>
+      <div><dt>ИИ-модель</dt><dd><code>{{ config.ai.model }}</code>{% if not config.ai.enabled %} <span class="muted">(выкл.)</span>{% endif %}</dd></div>
+      <div><dt>Порог уведомлений</dt><dd>балл {{ config.notifications.min_score | num }}</dd></div>
+      <div><dt>Объявлений в базе</dt><dd>{{ stats.listings_total }}</dd></div>
+      <div><dt>База данных</dt><dd class="num small">{{ db_path }}</dd></div>
+    </dl>
+  </article>
+</section>
+
+{# ---------------------------------------------------------------- runs #}
+<section class="card section">
+  <div class="section-head">
+    <h2>{{ icon('clock') }}Последние проверки</h2>
+    <span class="muted small">время — Берлин</span>
+  </div>
+  {% if runs %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Начало</th><th class="right">Длительность</th><th class="right hide-sm">Поисков</th><th class="right hide-sm">Просмотрено</th>
+          <th class="right">Новых</th><th class="right">Оценено</th><th class="right">Выгодных</th><th class="right hide-sm">Уведомлений</th><th>Ошибки</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in runs %}
+        <tr>
+          <td class="nowrap">{{ r.started_at | dt }}</td>
+          <td class="right nowrap">{% if r.finished_at %}{{ (r.finished_at - r.started_at).total_seconds() | duration }}{% else %}<span class="pos">идёт…</span>{% endif %}</td>
+          <td class="right hide-sm num">{{ r.searches }}</td>
+          <td class="right hide-sm num">{{ r.listings_seen }}</td>
+          <td class="right num {{ 'zero' if not r.new_listings }}">{{ r.new_listings }}</td>
+          <td class="right num {{ 'zero' if not r.evaluated }}">{{ r.evaluated }}</td>
+          <td class="right num {{ 'pos' if r.deals_found else 'zero' }}"><b>{{ r.deals_found }}</b></td>
+          <td class="right hide-sm num {{ 'zero' if not r.notified }}">{{ r.notified }}</td>
+          <td>
+            {% if r.errors %}
+            <details class="run-errors"><summary>{{ r.errors | length }} {{ plural(r.errors | length, 'ошибка', 'ошибки', 'ошибок') }}</summary>
+              <ul>{% for e in r.errors %}<li>{{ e }}</li>{% endfor %}</ul>
+            </details>
+            {% else %}<span class="ok-text">✓ нет</span>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="muted">Проверок ещё не было. Нажми «Проверить сейчас», когда добавишь поиски.</p>
+  {% endif %}
+</section>
+{% endblock %}
