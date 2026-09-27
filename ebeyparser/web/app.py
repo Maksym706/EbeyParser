@@ -102,7 +102,7 @@ SORTS: list[tuple[str, str]] = [
     ("price", "Сначала дешёвые"),
 ]
 STATUS_FILTERS: list[tuple[str, str]] = [
-    ("", "Все, кроме скрытых"),
+    ("", "Без скрытых"),
     ("new", "Новые"),
     ("starred", "Избранное"),
     ("contacted", "Написал продавцу"),
@@ -178,6 +178,8 @@ def fmt_datetime(dt: datetime | None) -> str:
         return f"сегодня, {local:%H:%M}"
     if local.date() == today - timedelta(days=1):
         return f"вчера, {local:%H:%M}"
+    if local.date() == today + timedelta(days=1):
+        return f"завтра, {local:%H:%M}"
     return local.strftime("%d.%m.%Y, %H:%M")
 
 
@@ -543,7 +545,7 @@ def present_deal(deal: DealView) -> DealCard:
         shipping_text = ""
 
     market = _market_price(deal)
-    market_text = f"рынок ~{fmt_money(market)}" if market else ""
+    market_text = f"рынок ~{fmt_money(round(market))}" if market else ""
 
     profit: ProfitInfo | None = None
     max_buy_label = max_buy_text = ""
@@ -552,7 +554,7 @@ def present_deal(deal: DealView) -> DealCard:
         p = ev.expected_profit
         if ev.purpose == "personal":
             extra = fmt_percent(-p / market) + " от рынка" if market and p > 0 else ""
-            text = f"экономия {fmt_money(p)}" if p >= 0 else f"дороже рынка на {fmt_money(-p)}"
+            text = f"экономия {fmt_money(round(p))}" if p >= 0 else f"дороже рынка на {fmt_money(round(-p))}"
             profit = ProfitInfo("savings", p, text, extra, p > 0)
         else:
             if ev.roi is not None:
@@ -561,9 +563,9 @@ def present_deal(deal: DealView) -> DealCard:
                 extra = "даром"
             else:
                 extra = ""
-            profit = ProfitInfo("profit", p, fmt_money(p, sign=True), extra, p > 0)
+            profit = ProfitInfo("profit", p, fmt_money(round(p), sign=True), extra, p > 0)
     max_buy = getattr(ev, "max_buy_price", None) if ev else None
-    if max_buy is not None and max_buy > 0:
+    if max_buy is not None and max_buy > 0 and not listing.is_free:
         max_buy_label = "Макс. ставка" if is_auction else "Выгодно до"
         max_buy_text = fmt_money(max_buy)
         if listing.price is not None:
@@ -676,11 +678,11 @@ def profit_breakdown(deal: DealView, config: AppConfig) -> dict[str, Any] | None
         margin_pct = config.pricing.safety_margin_percent
         margin = market * margin_pct / 100
         fee_pct = config.pricing.selling_fee_percent + config.pricing.payment_fee_percent
-        rows.append({"label": f"Запас на торг и риск ({fmt_number(margin_pct)} %)", "value": -margin, "note": "", "kind": "minus"})
+        rows.append({"label": f"Запас на торг и риск ({fmt_number(margin_pct)}\u00a0%)", "value": -margin, "note": "", "kind": "minus"})
         rows.append({
             "label": "Комиссии при продаже",
             "value": -ev.fees,
-            "note": f"{fmt_number(fee_pct, 2)} %" if fee_pct else "частным продавцам 0 %",
+            "note": f"{fmt_number(fee_pct, 2)}\u00a0%" if fee_pct else "частным продавцам 0\u00a0%",
             "kind": "minus",
         })
         rows.append({"label": "Твоя доставка покупателю", "value": -ev.shipping_cost, "note": "", "kind": "minus"})

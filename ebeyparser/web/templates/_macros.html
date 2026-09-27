@@ -37,13 +37,11 @@
       <span class="media-chip {{ c.verdict }}">{{ c.verdict_label }}</span>
       <span class="media-chip status" data-status-ribbon {% if c.status not in ('starred', 'bought', 'contacted') %}hidden{% endif %}>{{ c.status_label if c.status in ('starred', 'bought', 'contacted') }}</span>
     </span>
-    <span class="media-tr"><span class="media-chip"><span class="src src-{{ c.source }}">{{ c.source_label }}</span></span></span>
-    {% if c.is_auction or c.purpose == 'personal' %}
     <span class="media-bl">
       {% if c.is_auction %}<span class="media-chip {{ 'urgent' if c.ends_soon }}">{{ icon('gavel') }}{% if c.ends_iso %}<span data-ends-at="{{ c.ends_iso }}">{{ 'заканчивается ' ~ c.ends_text if c.ends_text != 'завершён' else 'аукцион завершён' }}</span>{% else %}Аукцион{% endif %}</span>{% endif %}
       {% if c.purpose == 'personal' %}<span class="media-chip">{{ icon('user') }}Для себя</span>{% endif %}
+      <span class="media-chip media-src"><span class="src src-{{ c.source }}">{{ c.source_label }}</span></span>
     </span>
-    {% endif %}
   </a>
   <div class="deal-body">
     <div class="deal-head">
@@ -93,7 +91,7 @@
     <span class="ai-icon">{{ icon('cpu' if kind == 'local' else 'sparkles') }}</span>
     <div class="grow">
       <div class="ai-title">{{ p.title }}{% if kind == 'second' and p.v.model %}: {{ p.v.model }}{% endif %}</div>
-      <div class="ai-model">{{ p.v.model or 'модель не указана' }}</div>
+      {% if kind == 'second' %}<div class="ai-model">перепроверка сильной моделью</div>{% else %}<div class="ai-model mono">{{ p.v.model or 'модель не указана' }}</div>{% endif %}
     </div>
     <span class="chip chip-{{ p.v.verdict }}">{{ p.verdict_label }}</span>
   </div>

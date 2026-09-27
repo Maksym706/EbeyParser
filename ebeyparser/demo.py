@@ -44,12 +44,12 @@ _PALETTES: list[tuple[str, str]] = [
 ]
 
 
-def _svg_image(emoji: str, label: str, sub: str, colors: tuple[str, str], index: int, total: int) -> str:
+def _svg_image(emoji: str, label: str, sub: str, colors: tuple[str, str], index: int) -> str:
     """A 4:3 product "photo" as an SVG data URI (gradient, emoji, name)."""
     c1, c2 = colors
     # vary the composition a little between gallery images
     angle = (index * 55) % 360
-    cx, cy, size = [(400, 262, 190), (300, 250, 150), (520, 250, 170)][index % 3]
+    cx, cy, size = [(400, 215, 170), (300, 210, 140), (520, 210, 150)][index % 3]
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 600" width="800" height="600">
 <defs>
 <linearGradient id="g" gradientTransform="rotate({angle} .5 .5)"><stop offset="0" stop-color="{c1}"/><stop offset="1" stop-color="{c2}"/></linearGradient>
@@ -61,17 +61,15 @@ def _svg_image(emoji: str, label: str, sub: str, colors: tuple[str, str], index:
 <circle cx="{120 + index * 60}" cy="520" r="210" fill="#000" fill-opacity=".12"/>
 <ellipse cx="{cx}" cy="{cy + size * 0.62:.0f}" rx="{size * 0.75:.0f}" ry="{size * 0.12:.0f}" fill="#000" fill-opacity=".25"/>
 <text x="{cx}" y="{cy}" font-size="{size}" text-anchor="middle" dominant-baseline="central" font-family="Noto Color Emoji, Apple Color Emoji, Segoe UI Emoji, sans-serif">{emoji}</text>
-<text x="40" y="520" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="44" font-weight="700" fill="#fff">{escape(label)}</text>
-<text x="40" y="562" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="26" fill="#fff" fill-opacity=".75">{escape(sub)}</text>
-<rect x="662" y="28" width="110" height="40" rx="20" fill="#000" fill-opacity=".35"/>
-<text x="717" y="55" font-family="system-ui, sans-serif" font-size="22" text-anchor="middle" fill="#fff">{index + 1} / {total}</text>
+<text x="40" y="440" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="44" font-weight="700" fill="#fff">{escape(label)}</text>
+<text x="40" y="480" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="26" fill="#fff" fill-opacity=".75">{escape(sub)}</text>
 </svg>"""
     return "data:image/svg+xml;charset=utf-8," + quote(svg, safe="")
 
 
 def _images(emoji: str, label: str, subs: list[str], palette: int) -> list[str]:
     colors = _PALETTES[palette % len(_PALETTES)]
-    return [_svg_image(emoji, label, sub, colors, i, len(subs)) for i, sub in enumerate(subs)]
+    return [_svg_image(emoji, label, sub, colors, i) for i, sub in enumerate(subs)]
 
 
 def _ka_url(slug: str, ad_id: str, cat: int) -> str:
@@ -427,7 +425,7 @@ def demo_deals() -> list[tuple[Listing, Evaluation]]:
             "Прибыль ниже порога 40 € — стоит торговаться",
             "Упомянут шумный вентилятор",
         ],
-        "red_flags": ["Шумит вентилятор"],
+        "red_flags": ["Шумит вентилятор при старте"],
     })
 
     # 5. ThinkPad T480 — bought
@@ -844,7 +842,7 @@ def demo_deals() -> list[tuple[Listing, Evaluation]]:
             "Торг возможен (VB)",
             "Один геймпад с дрифтом",
         ],
-        "red_flags": ["Дрифт геймпада"],
+        "red_flags": ["Дрифт стика у второго геймпада"],
     })
 
     # 12. Canyon road bike — overpriced, skip

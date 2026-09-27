@@ -38,7 +38,7 @@
   </div>
   <div class="card stat stat-green">
     <div class="stat-label">Потенциальная прибыль</div>
-    <div class="stat-value">{{ stats.potential_profit | money(sign=True) }}</div>
+    <div class="stat-value">{{ stats.potential_profit | round | money(sign=True) }}</div>
     <div class="stat-sub">если перепродать всё из «покупать»</div>
     <span class="stat-icon">{{ icon('trending') }}</span>
   </div>
@@ -66,7 +66,7 @@
       <label class="searchbox">
         <span class="sr-only">Поиск по названию</span>
         {{ icon('search') }}
-        <input class="input" type="search" name="q" value="{{ filters.q }}" placeholder="Поиск по названию: 3090, ThinkPad, Dyson…" autocomplete="off">
+        <input class="input" type="search" name="q" value="{{ filters.q }}" placeholder="Найти: 3090, ThinkPad…" autocomplete="off">
       </label>
       <label class="filters-toggle" for="filters-toggle">
         {{ icon('sliders') }}Фильтры{% if filters.panel_active %} <span class="badge-count">{{ filters.panel_active }}</span>{% endif %}

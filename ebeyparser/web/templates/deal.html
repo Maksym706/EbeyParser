@@ -112,10 +112,11 @@
       <div class="metrics">
         <div class="metric {{ 'pos' if card.profit and card.profit.positive else ('neg' if card.profit else '') }}">
           <span>{{ 'Экономия' if card.purpose == 'personal' else 'Прибыль' }}</span>
-          <b>{{ ev.expected_profit | money(sign=card.purpose != 'personal') }}</b>
+          <b>{{ (ev.expected_profit | round if ev.expected_profit is not none else none) | money(sign=card.purpose != 'personal') }}</b>
         </div>
         <div class="metric"><span>ROI</span><b>{{ ev.roi | pct }}</b></div>
-        <div class="metric"><span>Рынок</span><b>{{ (ev.estimate.market_price or (ev.ai.estimated_market_price if ev.ai else none)) | money }}</b></div>
+        {% set market = ev.estimate.market_price or (ev.ai.estimated_market_price if ev.ai else none) %}
+        <div class="metric"><span>Рынок</span><b>{{ (market | round if market else none) | money }}</b></div>
       </div>
       {% endif %}
 
