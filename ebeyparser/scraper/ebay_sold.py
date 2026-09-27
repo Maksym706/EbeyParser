@@ -218,7 +218,10 @@ def _parse_item(item: Tag) -> Comparable | None:
 
 def parse_sold_results(html: str) -> list[Comparable]:
     """Sold items from an eBay.de search page (classic `s-item` or new `s-card` layout)."""
-    soup = BeautifulSoup(html or "", "lxml")
+    return _comparables_from_soup(BeautifulSoup(html or "", "lxml"))
+
+
+def _comparables_from_soup(soup: BeautifulSoup) -> list[Comparable]:
     out: list[Comparable] = []
     seen: set[str] = set()
     for item in _result_items(soup):
@@ -236,8 +239,7 @@ def parse_sold_results(html: str) -> list[Comparable]:
     return out
 
 
-def _has_next_page(html: str) -> bool:
-    soup = BeautifulSoup(html or "", "lxml")
+def _has_next_page(soup: BeautifulSoup) -> bool:
     nxt = soup.select_one("a.pagination__next, .pagination__next[href]")
     return nxt is not None and nxt.get("aria-disabled") != "true" and bool(nxt.get("href"))
 
@@ -255,16 +257,16 @@ class EbaySoldScraper:
         pages = min(MAX_PAGES, max(1, -(-limit // RESULTS_PER_PAGE)))
         for page in range(1, pages + 1):
             url = build_sold_url(query, page)
-            html = await self.client.get_text(url, referer=referer)
+            soup = BeautifulSoup(await self.client.get_text(url, referer=referer), "lxml")
             fresh = 0
-            for comp in parse_sold_results(html):
+            for comp in _comparables_from_soup(soup):
                 key = comp.url or f"{comp.title}|{comp.price}"
                 if key in seen:
                     continue
                 seen.add(key)
                 out.append(comp)
                 fresh += 1
-            if len(out) >= limit or fresh == 0 or not _has_next_page(html):
+            if len(out) >= limit or fresh == 0 or not _has_next_page(soup):
                 break
             referer = url
         return out[:limit]

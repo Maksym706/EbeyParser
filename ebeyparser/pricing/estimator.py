@@ -220,9 +220,7 @@ def combine_estimates(*estimates: PriceEstimate | None) -> PriceEstimate:
             notes="Нет данных о рыночной цене",
         )
     best = min(candidates, key=lambda e: (_SOURCE_PRIORITY[e.source], -e.sample_size))
-    return best.model_copy(
-        update={"comparables": merged[: max(COMPS_CAP, len(best.comparables))], "query": best.query or query}
-    )
+    return best.model_copy(update={"comparables": merged, "query": best.query or query})
 
 
 # ---------------------------------------------------------------------------

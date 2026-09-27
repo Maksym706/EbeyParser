@@ -421,7 +421,7 @@ class DealFilters:
         """How many filters inside the collapsible panel are set (for the mobile badge)."""
         return sum(
             bool(v)
-            for v in (self.purpose, self.source, self.search, self.status, self.q, self.sort != "score",
+            for v in (self.purpose, self.source, self.search, self.status, self.sort != "score",
                       self.min_score is not None)
         )
 

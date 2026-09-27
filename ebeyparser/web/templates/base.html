@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#0a0e13">
+  <title>{% block title %}Сделки{% endblock %} · EbeyParser</title>
+  <link rel="icon" href="/static/favicon.svg?v={{ static_v }}" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css?v={{ static_v }}">
+  <script>
+    try { var t = localStorage.getItem("ebp-theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}
+  </script>
+</head>
+<body class="page-{{ nav | default('') }}">
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="/" aria-label="EbeyParser — на главную">
+        <img src="/static/logo.svg?v={{ static_v }}" alt="" width="30" height="30">
+        <span>Ebey<b>Parser</b></span>
+      </a>
+      <nav class="nav" aria-label="Разделы">
+        <a href="/" class="{{ 'active' if nav == 'deals' }}">{{ icon('tag') }}<span>Сделки</span></a>
+        <a href="/searches" class="{{ 'active' if nav == 'searches' }}">{{ icon('search') }}<span>Поиски</span></a>
+        <a href="/status" class="{{ 'active' if nav == 'status' }}">{{ icon('activity') }}<span>Статус</span></a>
+      </nav>
+      <button class="icon-btn theme-toggle" type="button" data-theme-toggle title="Светлая / тёмная тема" aria-label="Переключить тему">
+        {{ icon('sun') }}{{ icon('moon') }}
+      </button>
+    </div>
+  </header>
+
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="footer">EbeyParser {{ app_version }} · данные хранятся только у тебя на компьютере</footer>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <script src="/static/app.js?v={{ static_v }}" defer></script>
+</body>
+</html>
