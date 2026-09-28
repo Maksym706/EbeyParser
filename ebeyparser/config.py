@@ -47,6 +47,7 @@ class SearchConfig(BaseModel):
     location_id: int | None = None  # Kleinanzeigen internal id (optional)
     radius_km: int | None = None
     category_id: int | None = None  # e.g. 225 = "PC-Zubehör & Software"
+    category_name: str = ""  # display only
     min_price: float | None = None
     max_price: float | None = None
     purpose: Purpose = "resale"
@@ -82,6 +83,12 @@ class GeneralConfig(BaseModel):
     user_agent: str | None = None
     data_dir: str = "data"
     max_new_per_search: int = 25  # cap work per search per run
+    # Funnel budgets per monitoring pass (category scans see many ads; only candidates get the
+    # expensive steps). Comparables lookups and ad pages hit the site; AI calls cost time.
+    max_comps_lookups_per_run: int = 40
+    max_details_per_run: int = 40
+    max_ai_per_run: int = 30
+    min_listing_price: float = 10.0  # ignore cheaper paid ads (junk); free ads are still considered
 
     @field_validator("request_delay_seconds", mode="before")
     @classmethod
@@ -102,6 +109,9 @@ class PricingConfig(BaseModel):
     use_kleinanzeigen_comps: bool = True
     use_ebay_sold_comps: bool = True
     comps_limit: int = 30
+    use_price_history: bool = True  # learn prices from every ad seen; estimate without extra requests
+    history_days: int = 60
+    history_min_points: int = 6
     reference_prices: list[ReferencePrice] = Field(default_factory=list)
 
 

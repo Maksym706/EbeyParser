@@ -75,7 +75,8 @@ class PriceEstimate(BaseModel):
     low: float | None = None
     high: float | None = None
     sample_size: int = 0
-    source: Literal["reference", "kleinanzeigen", "ebay_sold", "mixed", "ai", "none"] = "none"
+    # history = our own database of prices seen for this product (no extra requests)
+    source: Literal["reference", "history", "kleinanzeigen", "ebay_sold", "mixed", "ai", "none"] = "none"
     query: str = ""  # query used to find comparables
     comparables: list[Comparable] = Field(default_factory=list)
     notes: str = ""
