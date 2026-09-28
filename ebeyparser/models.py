@@ -80,6 +80,8 @@ class PriceEstimate(BaseModel):
     query: str = ""  # query used to find comparables
     comparables: list[Comparable] = Field(default_factory=list)
     notes: str = ""
+    history_days: int | None = None  # source "history": the look-back window
+    age_days: float | None = None  # source "history": weighted mean age of the prices used
 
 
 class AIVerdict(BaseModel):
@@ -119,6 +121,10 @@ class Evaluation(BaseModel):
     action: Literal["buy", "haggle", "bid", "watch", "skip", ""] = ""
     offer_price: float | None = None  # suggested offer for VB / Preisvorschlag
     ai_checked: bool | None = None  # False = AI enabled but unavailable -> photos NOT checked
+    no_alert: bool = False  # never notify (reserved, market known only from the AI)
+    # how far the funnel went: "prefilter" (free checks), "market" (no deal by market data,
+    # no ad page / AI; re-checked when seen again), "full"; "" = evaluated by an older version
+    stage: Literal["", "prefilter", "market", "full"] = ""
     fees: float = 0.0  # selling fees when reselling
     shipping_cost: float = 0.0
     expected_profit: float | None = None  # resale: net profit; personal: savings vs market

@@ -404,10 +404,13 @@ def test_evaluate_no_market_data():
 
 
 def test_evaluate_ai_market_price_fallback():
+    # v0.2: a market price only guessed by the AI is never a "buy" and never alerts
     ai = AI_BUY.model_copy(update={"estimated_market_price": 600.0})
     ev = evaluate(make_listing(price=250), PriceEstimate(), ai, RESALE, PRICING)
     assert ev.estimate.source == "ai" and ev.estimate.market_price == 600
-    assert ev.verdict == "buy"  # AI is sure (0.8)
+    assert ev.verdict == "maybe" and ev.no_alert and ev.score <= 55
+    assert ev.expected_profit == pytest.approx(290.0)  # profit still shown
+    assert "⚠ Рынок оценён только ИИ — проверь цены сам" in ev.reasons
     unsure = ai.model_copy(update={"confidence": 0.5})
     assert evaluate(make_listing(price=250), PriceEstimate(), unsure, RESALE, PRICING).verdict == "maybe"
 
@@ -424,10 +427,11 @@ def test_evaluate_search_overrides_and_fees():
     search = SearchConfig(name="s", min_profit=300, min_roi=0.1)
     pricing = PricingConfig(selling_fee_percent=10, payment_fee_percent=0, default_shipping_cost=10)
     ev = evaluate(make_listing(price=250), sold_estimate(600), None, search, pricing)
-    # resale 540, fees 54, shipping 10 -> profit 226 < min_profit 300 -> maybe
-    assert ev.fees == pytest.approx(54.0)
+    # v0.2: fees on the resale price itself: 600 - 60 margin - 60 fees - 10 shipping - 250
+    # = 220 < min_profit 300 -> maybe
+    assert ev.fees == pytest.approx(60.0)
     assert ev.shipping_cost == 10
-    assert ev.expected_profit == pytest.approx(226.0)
+    assert ev.expected_profit == pytest.approx(220.0)
     assert ev.verdict == "maybe"
 
 
@@ -462,12 +466,12 @@ def test_evaluate_ai_skip_overrides():
     assert evaluate(make_listing(price=250), sold_estimate(600), weak, RESALE, PRICING).verdict == "buy"
 
 
-def test_evaluate_ai_upgrades_maybe_to_buy():
-    # profit 40*0.9=36..40, roi just under 25%: maybe without AI, buy with a confident AI
+def test_evaluate_ai_never_upgrades_maybe_to_buy():
+    # v0.2: the AI may only downgrade — roi just under 25% stays "maybe" even with a sure AI
     listing = make_listing(price=175)
     est = sold_estimate(240)  # resale 216 -> profit 41, roi 0.234
     assert evaluate(listing, est, None, RESALE, PRICING).verdict == "maybe"
-    assert evaluate(listing, est, AI_BUY, RESALE, PRICING).verdict == "buy"
+    assert evaluate(listing, est, AI_BUY, RESALE, PRICING).verdict == "maybe"
 
 
 def test_evaluate_includes_delivery_cost():
@@ -488,20 +492,22 @@ def test_evaluate_auction_running_is_capped():
         ends_at=utcnow() + timedelta(days=2),
     )
     ev = evaluate(listing, sold_estimate(600), AI_BUY, RESALE, PRICING)
-    assert ev.verdict == "maybe"
+    assert ev.verdict == "maybe" and ev.action == "bid"
     assert ev.score <= 60
+    assert ev.expected_profit is None and ev.roi is None  # never from the current bid
     assert "Аукцион ещё идёт — итоговая цена будет выше" in ev.reasons
-    assert "Аукцион: ставь максимум 432 €" in ev.reasons
+    assert "Аукцион: ставь максимум 432 € (сейчас 250 €)" in ev.reasons
     assert any("5 ставок" in r for r in ev.reasons)
 
 
-def test_evaluate_auction_ending_soon_can_be_buy():
+def test_evaluate_auction_ending_soon_is_a_bid_not_a_buy():
+    # v0.2: an auction is never "buy" — the answer is how high to bid
     now = utcnow()
     listing = make_listing(
         price=250, buying_options=["AUCTION"], bid_count=3, ends_at=now + timedelta(hours=1)
     )
     ev = evaluate(listing, sold_estimate(600), AI_BUY, RESALE, PRICING, now=now)
-    assert ev.verdict == "buy"
+    assert ev.verdict == "maybe" and ev.action == "bid" and ev.max_buy_price == 432
     assert any("3 ставки" in r and "1 ч" in r for r in ev.reasons)
     ended = listing.model_copy(update={"ends_at": now - timedelta(minutes=5)})
     assert evaluate(ended, sold_estimate(600), AI_BUY, RESALE, PRICING, now=now).verdict == "skip"

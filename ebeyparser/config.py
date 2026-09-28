@@ -140,6 +140,8 @@ class LLMSettings(BaseModel):
     max_images: int = 3
     timeout_seconds: float = 240.0
     temperature: float = 0.2  # ignored for Claude
+    max_tokens: int = 700  # cap on the model's answer (a looping 7B model otherwise runs to the timeout)
+    image_max_side: int = 1024  # photos are downscaled to this many px (needs Pillow; otherwise sent as is)
 
 
 class SecondOpinionConfig(LLMSettings):

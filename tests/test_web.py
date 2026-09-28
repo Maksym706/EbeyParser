@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 from datetime import timedelta
@@ -17,10 +18,12 @@ from ebeyparser.config import AppConfig, SearchConfig, load_config, save_searche
 from ebeyparser.db import Database
 from ebeyparser.demo import demo_deals, seed_demo
 from ebeyparser.models import DealView, Evaluation, Listing, RunSummary, utcnow
+from ebeyparser.scraper.categories import merge_categories, parse_category_links
 from ebeyparser.web.app import (
     DealFilters,
     create_app,
     fmt_money,
+    fmt_number,
     fmt_percent,
     mask_email,
     mask_secret,
@@ -34,6 +37,7 @@ BOSCH = "2893402211"  # maybe, ignored by the user
 THINKPAD = "2893987145"  # bought
 MACMINI = "2894311780"  # starred
 EBAY_AUCTION = "ebay-306512349871"
+LOCAL = "http://localhost"  # the app only accepts loopback Host headers (DNS-rebinding protection)
 
 
 # --------------------------------------------------------------------- fakes
@@ -100,7 +104,7 @@ def monitor() -> FakeMonitor:
 @pytest.fixture()
 def client(db: Database, monitor: FakeMonitor):
     app = create_app(AppConfig(), db, monitor=monitor)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOCAL) as c:
         yield c
 
 
@@ -120,7 +124,7 @@ def config_file(tmp_path: Path) -> Path:
 def editable(db: Database, monitor: FakeMonitor, config_file: Path):
     config = load_config(config_file)
     app = create_app(config, db, config_path=config_file, monitor=monitor)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOCAL) as c:
         yield c, config, config_file
 
 
@@ -209,7 +213,7 @@ def test_dashboard_filters(client: TestClient) -> None:
 
 def test_dashboard_empty_state() -> None:
     app = create_app(AppConfig(), Database())
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOCAL) as c:
         r = c.get("/")
     assert r.status_code == 200
     assert "Пока нет ни одного объявления" in r.text
@@ -224,7 +228,7 @@ def test_dashboard_pagination(db: Database) -> None:
                                   price=10 + i, search_name="Filler"))
         db.save_evaluation(Evaluation(ad_id=ad, verdict="maybe", score=40, buy_price=10 + i))
     app = create_app(AppConfig(), db)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOCAL) as c:
         first = c.get("/")
         assert 'aria-label="Страницы"' in first.text
         second = c.get("/", params={"page": 2})
@@ -270,7 +274,7 @@ def test_status_page(db: Database, monitor: FakeMonitor) -> None:
     config.notifications.email.to_addrs = ["student.berlin@gmail.com"]
     config.notifications.telegram.chat_id = "518204417"
     app = create_app(config, db, monitor=monitor)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOCAL) as c:
         html = c.get("/status").text
     for text in ("Последние проверки", "ИИ выключен в конфиге", "Отправить тестовое уведомление", "st***@gmail.com",
                  "51***17", "Второе мнение", "eBay API", "Не настроен", "Главные настройки", "HTTP 429",
@@ -286,7 +290,7 @@ def test_status_page_ai_health(db: Database, monitor: FakeMonitor) -> None:
     config.ebay.client_id = "MaxMuste-EbeyPars-PRD-a1b2c3d4e-12345678"
     config.ebay.client_secret = "secret"
     app = create_app(config, db, monitor=monitor)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOCAL) as c:
         html = c.get("/status").text
         assert "Работает, модель на месте" in html
         assert "Подключён" in html and "12345678" not in html
@@ -298,7 +302,7 @@ def test_status_page_ai_health(db: Database, monitor: FakeMonitor) -> None:
 def test_searches_page_renders(editable) -> None:
     c, _, _ = editable
     html = c.get("/searches").text
-    for text in ("Самый надёжный способ — настроить поиск на kleinanzeigen.de", "Видеокарты Берлин",
+    for text in ("мастер настройки", "настрой его на kleinanzeigen.de", "Видеокарты Берлин",
                  "Новый поиск", "Добавить поиск", "Источник", "Категории eBay", "Формат продажи"):
         assert text in html, text
     edit = c.get("/searches", params={"edit": "Видеокарты Берлин"}).text
@@ -352,7 +356,7 @@ def test_api_rejects_foreign_origin(client: TestClient, db: Database) -> None:
     r = client.post(f"/api/deals/{RTX3090}/status", json={"status": "ignored"}, headers={"Origin": "https://evil.example"})
     assert r.status_code == 403
     assert db.get_deal(RTX3090).status == "new"
-    r = client.post(f"/api/deals/{RTX3090}/status", json={"status": "starred"}, headers={"Origin": "http://testserver"})
+    r = client.post(f"/api/deals/{RTX3090}/status", json={"status": "starred"}, headers={"Origin": "http://localhost"})
     assert r.status_code == 200
 
 
@@ -365,12 +369,12 @@ def test_api_stats_and_runs(client: TestClient, db: Database) -> None:
 
 
 def test_api_run(db: Database, monitor: FakeMonitor) -> None:
-    with TestClient(create_app(AppConfig(), db)) as c:
+    with TestClient(create_app(AppConfig(), db), base_url=LOCAL) as c:
         r = c.post("/api/run")
         assert r.status_code == 503 and "Монитор" in r.json()["detail"]
 
     app = create_app(AppConfig(), db, monitor=monitor)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOCAL) as c:
         monitor.is_running = True
         assert c.post("/api/run").status_code == 409
         monitor.is_running = False
@@ -393,7 +397,7 @@ def test_api_run(db: Database, monitor: FakeMonitor) -> None:
 
 def test_start_monitor_lifespan(db: Database, monitor: FakeMonitor) -> None:
     app = create_app(AppConfig(), db, monitor=monitor, start_monitor=True)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOCAL) as c:
         deadline = time.time() + 5
         while not monitor.loop_started and time.time() < deadline:
             time.sleep(0.01)
@@ -404,7 +408,7 @@ def test_start_monitor_lifespan(db: Database, monitor: FakeMonitor) -> None:
 
 def test_api_health(db: Database, monitor: FakeMonitor) -> None:
     app = create_app(AppConfig(), db, monitor=monitor)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOCAL) as c:
         data = c.get("/api/health").json()
         assert data["ok"] is True
         assert data["monitor"]["available"] is True and data["monitor"]["next_run_at"]
@@ -413,20 +417,20 @@ def test_api_health(db: Database, monitor: FakeMonitor) -> None:
         data = c.get("/api/health").json()
         assert data["ai"]["ok"] is True and data["ai"]["model_available"] is True
         assert c.get("/api/health", params={"ai": "0"}).json()["ai"] is None
-    with TestClient(create_app(AppConfig(), db)) as c:
+    with TestClient(create_app(AppConfig(), db), base_url=LOCAL) as c:
         data = c.get("/api/health").json()
         assert data["monitor"]["available"] is False
 
 
 def test_api_notify_test(db: Database) -> None:
-    with TestClient(create_app(AppConfig(), db)) as c:
+    with TestClient(create_app(AppConfig(), db), base_url=LOCAL) as c:
         r = c.post("/api/notify/test")
         assert r.status_code == 400 and "канал" in r.json()["detail"]
-    with TestClient(create_app(AppConfig(), db, notifiers_factory=lambda: [])) as c:
+    with TestClient(create_app(AppConfig(), db, notifiers_factory=lambda: []), base_url=LOCAL) as c:
         assert c.post("/api/notify/test").status_code == 400
 
     good, bad = FakeNotifier("telegram"), FakeNotifier("email", fail=True)
-    with TestClient(create_app(AppConfig(), db, notifiers_factory=lambda: [good, bad])) as c:
+    with TestClient(create_app(AppConfig(), db, notifiers_factory=lambda: [good, bad]), base_url=LOCAL) as c:
         r = c.post("/api/notify/test")
     assert r.status_code == 200
     results = r.json()["results"]
@@ -516,7 +520,7 @@ def test_searches_form_flow(editable) -> None:
 def test_searches_read_only(db: Database) -> None:
     config = AppConfig(searches=[SearchConfig(name="Видеокарты Берлин", query="rtx 3090")])
     app = create_app(config, db)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOCAL) as c:
         html = c.get("/searches").text
         assert "Только просмотр" in html and "Видеокарты Берлин" in html
         assert 'action="/searches/save"' not in html
@@ -545,3 +549,219 @@ def test_formatters() -> None:
     f = DealFilters.from_params({"verdict": "buy", "q": "rtx", "min_score": "70"})
     assert f.url(page=2) == "/?verdict=buy&q=rtx&min_score=70&page=2"
     assert DealFilters.from_params({}).url() == "/"
+
+
+# ------------------------------------------------------------- setup wizard
+SETUP_CONFIG = """# мой конфиг
+general:
+  interval_minutes: 15   # как часто проверять
+  data_dir: {data}
+notifications:
+  email:
+    password: ${{SMTP_PASSWORD}}   # секрет из .env
+searches:
+  - name: Мой поиск
+    query: dyson
+"""
+
+
+@pytest.fixture()
+def restore_environ():
+    saved = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
+
+
+@pytest.fixture()
+def setup_env(tmp_path: Path, db: Database, monitor: FakeMonitor, restore_environ):
+    """Editable app on a commented config with data_dir in tmp; category discovery is faked."""
+    path = tmp_path / "config.yaml"
+    path.write_text(SETUP_CONFIG.format(data=tmp_path / "data"), encoding="utf-8")
+    calls: list[tuple[str, int]] = []
+    state: dict[str, Any] = {"fail": False}
+
+    async def discover(location: str, radius: int):
+        calls.append((location, radius))
+        if state["fail"]:
+            raise RuntimeError("proxy says no")
+        html = ('<a href="/s-berlin/handy-telefon/c173l3331r30">Handy &amp; Telefon</a> (12.345)'
+                '<a href="/s-berlin/sammeln/c234l3331r30">Sammeln</a> (321)')
+        return merge_categories(parse_category_links(html))
+
+    config = load_config(path)
+    app = create_app(config, db, config_path=path, monitor=monitor, category_discovery=discover,
+                     ai_probe=lambda url: {"data": [{"id": "qwen/qwen2.5-vl-7b"}]} if "1234" in url else None)
+    with TestClient(app, base_url=LOCAL) as c:
+        yield c, config, path, calls, state
+
+
+def test_dashboard_setup_banner_when_no_searches(db: Database) -> None:
+    with TestClient(create_app(AppConfig(), db), base_url=LOCAL) as c:
+        html = c.get("/").text
+    assert "Настрой поиски за 2 минуты" in html and 'href="/setup"' in html and "Настройка" in html
+    with TestClient(create_app(AppConfig(), Database()), base_url=LOCAL) as c:
+        empty = c.get("/").text
+    assert "Настроить за 2 минуты" in empty and "Добавить поиск" in empty
+    config = AppConfig(searches=[SearchConfig(name="x", query="y")])
+    with TestClient(create_app(config, db), base_url=LOCAL) as c:
+        assert "Настрой поиски за 2 минуты" not in c.get("/").text
+
+
+def test_setup_page_uses_builtin_list_without_requests(setup_env) -> None:
+    c, config, _, calls, _ = setup_env
+    r = c.get("/setup")
+    assert r.status_code == 200 and calls == []  # no request to Kleinanzeigen on a normal visit
+    html = r.text
+    for text in ("Настройка за 2 минуты", "Встроенный справочник категорий", "Handy &amp; Telefon",
+                 "смартфоны и телефоны", "рекомендуем", "Сверить с сайтом", "Для себя: список желаний",
+                 "Как часто проверять", "стр. выдачи в час", "Заменить текущие поиски (1)", "Сохранить поиски",
+                 'value="Berlin"', "Нейросеть, уведомления, выгода"):
+        assert text in html, text
+    assert 'name="category" value="173" checked' in html and 'name="category" value="228" checked' not in html
+    assert 'class="active" aria-current="page"' in html  # subnav
+
+
+def test_setup_refresh_discovers_once_and_caches(setup_env, tmp_path: Path) -> None:
+    c, _, _, calls, state = setup_env
+    r = c.get("/setup", params={"location": "Berlin", "radius": "30", "category": ["173", "234"],
+                                "wish_item": ["RTX 3090"], "wish_price": ["550"], "refresh": "1"})
+    assert r.status_code == 200 and calls == [("Berlin", 30)]
+    assert "с kleinanzeigen.de" in r.text and f"{fmt_number(12345)} объявлений" in r.text and "Sammeln" in r.text
+    assert 'name="category" value="234" checked' in r.text and 'value="RTX 3090"' in r.text  # form state kept
+    assert (tmp_path / "data" / "categories.json").is_file()
+    again = c.get("/setup", params={"location": "berlin", "radius": "30"})
+    assert calls == [("Berlin", 30)] and "Sammeln" in again.text  # served from the cache
+    state["fail"] = True
+    failed = c.get("/setup", params={"location": "Hamburg", "radius": "30", "refresh": "1"})
+    assert failed.status_code == 200 and "получить не удалось" in failed.text and "proxy says no" in failed.text
+    assert "Handy &amp; Telefon" in failed.text  # built-in fallback
+
+
+def test_setup_save_replaces_searches_and_keeps_comments(setup_env, monitor: FakeMonitor) -> None:
+    c, config, path, _, _ = setup_env
+    form = {"location": "berlin", "radius": "25", "purpose": "resale", "max_price": "300", "min_profit": "50",
+            "category": ["173", "278"], "wish_item": ["RTX 3090", ""], "wish_price": ["550", ""],
+            "interval_minutes": "20", "replace": "1"}
+    r = c.post("/setup", data=form, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/searches?setup=3"
+    saved = load_config(path)
+    assert [s.name for s in saved.searches] == ["Handy & Telefon · berlin 30 км", "Notebooks · berlin 30 км",
+                                                "Для себя: RTX 3090"]
+    assert saved.searches[0].category_id == 173 and saved.searches[0].min_profit == 50
+    assert saved.searches[2].target_price == 550 and saved.general.interval_minutes == 20
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith("# мой конфиг") and "# как часто проверять" in text and "${SMTP_PASSWORD}   # секрет" in text
+    assert "dyson" in (path.parent / "config.yaml.bak").read_text(encoding="utf-8")
+    assert monitor.updated is config and [s.name for s in config.searches] == [s.name for s in saved.searches]
+    assert config.general.interval_minutes == 20
+    assert "Готово: сохранено 3 поиска" in c.get(r.headers["location"]).text
+
+
+def test_setup_save_can_keep_existing_and_validates(setup_env) -> None:
+    c, _, path, _, _ = setup_env
+    r = c.post("/setup", data={"location": "Berlin", "radius": "30", "category": ["279"]}, follow_redirects=False)
+    assert r.status_code == 303
+    assert [s.name for s in load_config(path).searches] == ["Мой поиск", "Konsolen · Berlin 30 км"]
+    r = c.post("/setup", data={"location": "Berlin", "radius": "30"})
+    assert r.status_code == 400 and "Выбери хотя бы одну категорию" in r.text
+    r = c.post("/setup", data={"location": "", "category": ["173"], "max_price": "abc",
+                               "wish_item": ["RTX"], "wish_price": ["дёшево"], "interval_minutes": "1"})
+    assert r.status_code == 400
+    for text in ("Укажи город", "Максимальная цена за вещь", "«RTX»: цена", "Как часто проверять"):
+        assert text in r.text, text
+
+
+def test_setup_read_only_and_foreign_origin(db: Database) -> None:
+    config = AppConfig(searches=[SearchConfig(name="Видеокарты", query="rtx")])
+    with TestClient(create_app(config, db), base_url=LOCAL) as c:
+        html = c.get("/setup").text
+        assert "Только просмотр" in html and "disabled" in html
+        assert c.post("/setup", data={"location": "Berlin", "category": ["173"]}).status_code == 403
+        assert c.post("/settings/ai", data={"provider": "openai", "model": "x"}).status_code == 403
+        assert "Только просмотр" in c.get("/settings").text
+    with TestClient(create_app(AppConfig(), db, config_path=Path("/nonexistent/config.yaml")), base_url=LOCAL) as c:
+        r = c.post("/setup", data={"location": "Berlin", "category": ["173"]}, headers={"Origin": "https://evil.example"})
+        assert r.status_code == 403
+    assert [s.name for s in config.searches] == ["Видеокарты"]
+
+
+# ----------------------------------------------------------------- settings
+def test_settings_ai_telegram_pricing(setup_env, monitor: FakeMonitor) -> None:
+    c, config, path, _, _ = setup_env
+    html = c.get("/settings").text
+    for text in ("Локальная нейросеть", "Найти LM Studio / Ollama", "Проверить", "Telegram", "@BotFather",
+                 "Что считать выгодным", "Минимальный ROI"):
+        assert text in html, text
+
+    r = c.post("/settings/ai", data={"enabled": "1", "provider": "openai", "base_url": "http://localhost:1234/v1",
+                                     "model": "qwen/qwen2.5-vl-7b"}, follow_redirects=False)
+    assert r.status_code == 303 and "saved=ai" in r.headers["location"]
+    assert (config.ai.provider, config.ai.model, config.ai.enabled) == ("openai", "qwen/qwen2.5-vl-7b", True)
+    assert monitor.updated is config and "Настройки нейросети сохранены" in c.get("/settings?saved=ai").text
+    assert c.post("/settings/ai", data={"provider": "openai", "base_url": "ftp://x", "model": ""}).status_code == 400
+
+    token = "123456789:AAHfakeTokenFakeTokenFake_12345"
+    r = c.post("/settings/telegram", data={"enabled": "1", "bot_token": token, "chat_id": "987654"},
+               follow_redirects=False)
+    assert r.status_code == 303
+    assert token in (path.parent / ".env").read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8")
+    assert token not in text and "${TELEGRAM_BOT_TOKEN}" in text and "# мой конфиг" in text
+    assert config.notifications.telegram.enabled and config.notifications.telegram.bot_token == token
+    assert c.post("/settings/telegram", data={"enabled": "1", "bot_token": "nope", "chat_id": "x"}).status_code == 400
+
+    r = c.post("/settings/pricing", data={"min_profit": "60", "min_roi": "30", "max_capital": "500",
+                                          "vb_discount": "12"}, follow_redirects=False)
+    assert r.status_code == 303
+    saved = load_config(path)
+    assert saved.pricing.min_profit == 60 and saved.pricing.min_roi == pytest.approx(0.3)
+    assert config.pricing.min_roi == pytest.approx(0.3)
+    if hasattr(saved.pricing, "max_capital"):
+        assert saved.pricing.max_capital == 500
+    if hasattr(saved.pricing, "vb_expected_discount"):
+        assert saved.pricing.vb_expected_discount == pytest.approx(0.12)
+    assert c.post("/settings/pricing", data={"min_roi": "много"}).status_code == 400
+    assert [s.name for s in load_config(path).searches] == ["Мой поиск"]  # searches untouched
+
+
+def test_api_ai_detect_and_check(setup_env, monitor: FakeMonitor) -> None:
+    c, config, _, _, _ = setup_env
+    servers = c.get("/api/ai/detect").json()["servers"]
+    assert servers == [{"name": "LM Studio", "provider": "openai", "base_url": "http://localhost:1234/v1",
+                        "models": ["qwen/qwen2.5-vl-7b"], "vision_models": ["qwen/qwen2.5-vl-7b"],
+                        "default_model": "qwen/qwen2.5-vl-7b"}]
+    config.ai.enabled = True
+    check = c.get("/api/ai/check").json()
+    assert check["ok"] is True and check["model_available"] is True
+
+
+# ----------------------------------------------------------------- security
+def test_trusted_hosts_block_dns_rebinding(db: Database) -> None:
+    app = create_app(AppConfig(), db)
+    with TestClient(app, base_url="http://evil.example") as c:
+        assert c.get("/").status_code == 400
+    with TestClient(app, base_url="http://127.0.0.1:8000") as c:
+        assert c.get("/").status_code == 200
+        assert c.get("/api/docs").status_code == 200  # docs only on loopback
+
+
+def test_network_mode_requires_token(db: Database, monkeypatch: pytest.MonkeyPatch) -> None:
+    token = "s3cret-token-for-tests-123"
+    monkeypatch.setenv("EBEYPARSER_ALLOWED_HOSTS", "pc.tail1234.ts.net")
+    app = create_app(AppConfig(), db, bind_host="0.0.0.0", access_token=token)
+    with TestClient(app, base_url=LOCAL) as c:
+        gate = c.get("/")
+        assert gate.status_code == 401 and "Нужен ключ доступа" in gate.text
+        assert c.get("/api/stats").status_code == 401
+        assert c.get("/static/style.css").status_code == 200
+        assert c.get("/api/docs").status_code in (401, 404)
+        r = c.get("/searches?token=wrong")
+        assert r.status_code == 401
+        r = c.get(f"/searches?token={token}&x=1", follow_redirects=False)
+        assert r.status_code == 303 and r.headers["location"] == "/searches?x=1"
+        assert "ebp_token" in r.headers["set-cookie"] and "httponly" in r.headers["set-cookie"].lower()
+        assert c.get("/").status_code == 200  # cookie remembered
+        assert c.get("/api/docs").status_code == 404  # no API docs in network mode
+    with TestClient(app, base_url="http://pc.tail1234.ts.net") as c:
+        assert c.get("/api/stats", headers={"X-EbeyParser-Token": token}).status_code == 200

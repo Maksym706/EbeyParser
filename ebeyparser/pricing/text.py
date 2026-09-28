@@ -204,6 +204,70 @@ def make_search_query(title: str, max_words: int = 5) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Price history keys
+# ---------------------------------------------------------------------------
+
+# family words sellers often leave out ("Samsung S21", "Nvidia 3080"): useless as anchors
+_OMITTED_FAMILY = frozenset({"galaxy", "geforce", "radeon", "core", "playstation", "series", "edition"})
+_GLUED_RE = re.compile(r"^([a-z]{3,})(\d{2,})[a-z]*$")  # "iphone13" -> "iphone" + "13"
+
+
+def product_key(title: str) -> str:
+    """Key under which the price of an ad is remembered (same as its comparables query)."""
+    return make_search_query(title)
+
+
+def _is_model_token(tok: str) -> bool:
+    return any(c.isdigit() for c in tok) and not _UNIT_TOKEN_RE.fullmatch(tok)
+
+
+def _unglued(tokens: list[str]) -> list[str]:
+    """Split "iphone13" into "iphone", "13" (sellers write both ways)."""
+    out: list[str] = []
+    for tok in tokens:
+        glued = _GLUED_RE.match(tok)
+        out.extend(glued.groups() if glued else (tok,))
+    return out
+
+
+def price_point_words(title: str, key: str = "") -> set[str]:
+    """Index words of a remembered price: the product key's words plus model numbers and
+    product families from the whole title (a key keeps only its 5 strongest words)."""
+    key_toks = normalize(key).split()
+    words = set(key_toks) | set(_unglued(key_toks))
+    for tok in normalize(title).split():
+        if _is_model_token(tok):
+            words.add(tok)
+            words.update(_unglued([tok]))
+        elif tok in _FAMILY:
+            words.add(tok)
+    return words
+
+
+def history_anchor_words(key: str) -> list[str]:
+    """One or two words every remembered price of this product must share — the most specific
+    model number and the product line ('iphone 13 128gb' -> ['13', 'iphone']). A cheap index
+    lookup; comparable_is_relevant() makes the real decision afterwards."""
+    toks = _unglued(normalize(key).split())
+    if not toks:
+        return []
+    anchors: list[str] = []
+    models = [t for t in toks if _is_model_token(t)]
+    if models:  # "m1"/"s21"/"3080" beat bare small numbers like "13" or "2"
+        anchors.append(max(models, key=lambda t: (any(c.isalpha() for c in t), len(t))))
+    family = next(
+        (t for t in toks if t in _FAMILY and t not in _MODEL_SUFFIXES and t not in _OMITTED_FAMILY), None
+    )
+    if family and family not in anchors:
+        anchors.append(family)
+    if not anchors:
+        rest = [t for t in toks if t not in _BRANDS and t not in _LOW_VALUE and t not in _COLORS
+                and t not in _FILLER and not _UNIT_TOKEN_RE.fullmatch(t)]
+        anchors.append(max(rest, key=len) if rest else toks[0])
+    return anchors
+
+
+# ---------------------------------------------------------------------------
 # Wanted ads
 # ---------------------------------------------------------------------------
 
@@ -243,9 +307,12 @@ FLAG_SIMLOCK = "Привязка к оператору (SIM-lock)"
 FLAG_UNTESTED = "Не проверено продавцом"
 FLAG_WHATSAPP = "Просит связь через WhatsApp"
 FLAG_RESERVED = "Возможно, уже зарезервировано"
+FLAG_DELETED = "Объявление удалено"
+FLAG_TOO_GOOD = "Подозрительно дёшево и только пересылка — похоже на развод"
 
 SEVERE_FLAGS: frozenset[str] = frozenset(
-    {FLAG_WANTED, FLAG_DEFECT, FLAG_BOX_ONLY, FLAG_LOCKED, FLAG_FAKE, FLAG_SCAM, FLAG_SWAP, FLAG_RENT}
+    {FLAG_WANTED, FLAG_DEFECT, FLAG_BOX_ONLY, FLAG_LOCKED, FLAG_FAKE, FLAG_SCAM, FLAG_SWAP, FLAG_RENT,
+     FLAG_DELETED, FLAG_TOO_GOOD}
 )
 
 _PUNCT = frozenset(":?!.,;")
@@ -295,6 +362,8 @@ def _rule(
 
 
 _PACKAGING = "ovp karton verpackung box schachtel packung originalverpackung huelle tasche"
+# "keine Garantie oder Rücknahme bei Defekten" is the usual private-sale disclaimer, not a defect
+_DISCLAIMER = "garantie gewaehrleistung ruecknahme haftung umtausch sachmaengelhaftung garantieanspruch"
 
 _RULES: tuple[_Rule, ...] = (
     _rule(
@@ -327,7 +396,7 @@ _RULES: tuple[_Rule, ...] = (
             r"faulty",
             r"defective",
         ],
-        exclude_near=_PACKAGING,  # "Karton leicht kaputt" is not a defect
+        exclude_near=f"{_PACKAGING} {_DISCLAIMER}",  # "Karton leicht kaputt" is not a defect
         near_after=False,
     ),
     _rule(
@@ -509,6 +578,36 @@ def _rule_hits(rule: _Rule, s: str) -> bool:
                     continue
             return True
     return False
+
+
+# Seller won't meet: harmless on its own, a scam pattern together with a too-good price.
+_REMOTE_ONLY_RULE = _rule(
+    "remote-only",
+    [
+        r"nur (?:per |mit )?(?:versand|verschicken|post|dhl|hermes)",
+        r"(?:keine|kein) (?:abholung|selbstabholung|abholer|besichtigung|treffen)",
+        r"(?:abholung|selbstabholung|besichtigung) (?:ist )?(?:nicht|leider nicht) (?:moeglich|drin)",
+        r"(?:versand|verkauf) (?:nur )?(?:gegen|per|ueber|via) paypal",
+        r"nur (?:per |ueber |via |mit )?paypal",
+        r"vor(?:aus)?kasse",
+        r"only shipping",
+        r"no pick ?up",
+    ],
+)
+
+
+def is_remote_only(text: str) -> bool:
+    """"Nur Versand", "keine Abholung", "nur PayPal", "Vorkasse": the buyer can't see the item."""
+    if not text or not text.strip():
+        return False
+    return _rule_hits(_REMOTE_ONLY_RULE, _flag_text(text))
+
+
+def is_model_key(key: str) -> bool:
+    """Does a product key name a concrete model ("iphone 13", "rtx 3080") rather than a kind
+    of thing ("kinderwagen bugaboo")? Only such keys give prices precise enough to skip an ad
+    without looking at it."""
+    return any(_is_model_token(t) for t in _unglued(normalize(key).split()))
 
 
 def detect_red_flags(text: str) -> list[str]:

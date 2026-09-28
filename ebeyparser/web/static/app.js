@@ -349,4 +349,134 @@
       if (!window.confirm(form.dataset.confirm)) ev.preventDefault();
     });
   });
+
+  // ---------------------------------------------------------- setup wizard
+  var setupForm = $("[data-setup]");
+  if (setupForm) {
+    $$("[data-js-only]", setupForm).forEach(function (el) { el.hidden = false; });
+    var countEl = $("[data-setup-count]", setupForm);
+    var estimateEl = $("[data-estimate]", setupForm);
+    var num = function (el) { var v = parseFloat(String(el && el.value || "").replace(",", ".")); return isFinite(v) ? v : 0; };
+    var updateSetup = function () {
+      var cats = $$('input[name="category"]:checked', setupForm).length;
+      var wishes = $$('input[name="wish_item"]', setupForm).filter(function (i) { return i.value.trim(); }).length;
+      if (countEl) {
+        countEl.textContent = (cats || wishes)
+          ? "Будет создано: " + cats + " " + plural(cats, "поиск", "поиска", "поисков") + " по категориям" +
+            (wishes ? " и " + wishes + " «для себя»" : "")
+          : "Выбери хотя бы одну категорию или добавь вещь «для себя»";
+      }
+      if (estimateEl) {  // same formula as RequestEstimate in scraper/categories.py
+        var d = estimateEl.dataset;
+        var n = cats + wishes;
+        var cap = parseFloat(d.cap) || 0;
+        var interval = Math.max(1, num($('[name="interval_minutes"]', setupForm)) || parseFloat(d.interval) || 15);
+        var pagesHour = Math.round(n * parseFloat(d.pages) * 60 / interval);
+        var raw = Math.round((n * parseFloat(d.pages) + (n ? parseFloat(d.extra) : 0)) * 60 / interval);
+        var perHour = cap ? Math.max(pagesHour, Math.min(raw, cap)) : raw;
+        var tight = cap && pagesHour > cap / 2;
+        var text = $("[data-estimate-text]", estimateEl);
+        if (text) {
+          text.textContent = "Проверка раз в " + interval + " мин: " + pagesHour + " стр. выдачи в час (~" + pagesHour * 24 +
+            " в сутки) + страницы и цены аналогов только для перспективных объявлений — всего не больше " + perHour +
+            " запросов в час (~" + perHour * 24 + " в сутки)" + (cap ? "; лимит программы — " + cap + " в час." : ".") +
+            (tight ? " Слишком часто для такого числа поисков — увеличь интервал." : "");
+        }
+        estimateEl.classList.toggle("warn", !!tight);
+      }
+    };
+    var syncPurpose = function () {
+      var checked = $('input[name="purpose"]:checked', setupForm);
+      var value = checked ? checked.value : "resale";
+      $$("[data-purpose-only]", setupForm).forEach(function (el) { el.hidden = el.dataset.purposeOnly !== value; });
+    };
+    setupForm.addEventListener("change", function () { updateSetup(); syncPurpose(); });
+    setupForm.addEventListener("input", updateSetup);
+    setupForm.addEventListener("click", function (ev) {
+      var sel = ev.target.closest("[data-cat-select]");
+      if (sel) {
+        $$('input[name="category"]', setupForm).forEach(function (box) {
+          box.checked = sel.dataset.catSelect === "recommended" ? box.dataset.recommended === "1" : false;
+        });
+        updateSetup();
+        return;
+      }
+      if (ev.target.closest("[data-wish-add]")) {
+        var tpl = $("[data-wish-template]", setupForm);
+        var list = $("[data-wish-list]", setupForm);
+        if (tpl && list) {
+          list.appendChild(tpl.content.cloneNode(true));
+          var items = $$('input[name="wish_item"]', list);
+          items[items.length - 1].focus();
+        }
+        return;
+      }
+      var rm = ev.target.closest("[data-wish-remove]");
+      if (rm) {
+        var row = rm.closest("[data-wish-row]");
+        if (row && $$("[data-wish-row]", setupForm).length > 1) row.remove();
+        else if (row) $$("input", row).forEach(function (i) { i.value = ""; });
+        updateSetup();
+      }
+    });
+    $$("[data-busy-on-click]", setupForm).forEach(function (btn) {
+      btn.addEventListener("click", function () { setTimeout(function () { btn.classList.add("is-busy"); }, 0); });
+    });
+    syncPurpose();
+    updateSetup();
+  }
+
+  // --------------------------------------------------------------- settings
+  $$("[data-ai-check]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var out = $("[data-ai-result]");
+      btn.classList.add("is-busy");
+      api("GET", "/api/ai/check").then(function (d) {
+        if (!out) return;
+        out.className = "result " + (d.ok && d.model_available !== false ? "ok" : "err");
+        out.textContent = d.ok && d.model_available !== false
+          ? "✓ Работает: " + (d.resolved_model || d.model) + " на " + d.base_url
+          : "✗ " + (d.error || (d.ok ? "Сервер работает, но модели «" + d.model + "» на нём нет" : "Нет ответа"));
+        out.hidden = false;
+      }).catch(function (e) { toast(e.message, "err"); })
+        .then(function () { btn.classList.remove("is-busy"); });
+    });
+  });
+  $$("[data-ai-detect]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var box = $("[data-ai-servers]");
+      btn.classList.add("is-busy");
+      api("GET", "/api/ai/detect").then(function (d) {
+        if (!box) return;
+        box.innerHTML = "";
+        if (!d.servers.length) {
+          box.textContent = "Не нашёл: LM Studio (порт 1234) и Ollama (порт 11434) не отвечают. Запусти сервер и нажми ещё раз.";
+          return;
+        }
+        d.servers.forEach(function (s) {
+          var head = document.createElement("div");
+          head.className = "small";
+          head.textContent = s.name + " · " + s.base_url + " — нажми на модель, чтобы подставить:";
+          box.appendChild(head);
+          var list = document.createElement("div");
+          list.className = "model-list";
+          s.models.forEach(function (m) {
+            var b = document.createElement("button");
+            b.type = "button";
+            b.textContent = m;
+            if (s.vision_models.indexOf(m) >= 0) { b.className = "vision"; b.title = "Видит фото"; }
+            b.addEventListener("click", function () {
+              var f = btn.closest("form");
+              $('[name="provider"]', f).value = s.provider;
+              $('[name="base_url"]', f).value = s.base_url;
+              $('[name="model"]', f).value = m;
+            });
+            list.appendChild(b);
+          });
+          box.appendChild(list);
+        });
+      }).catch(function (e) { toast(e.message, "err"); })
+        .then(function () { btn.classList.remove("is-busy"); });
+    });
+  });
 })();

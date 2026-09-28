@@ -1,117 +1,195 @@
 # ─────────────────────────────────────────────────────────────────────────────
-#  EbeyParser — настройки. Скопируй в config.yaml:  python -m ebeyparser init
+#  EbeyParser — настройки.
+#  Проще всего настроить мастером:  python -m ebeyparser setup
+#  (или в панели: http://localhost:8000/setup). Мастер меняет только нужные строки,
+#  комментарии в этом файле остаются.
 #  Секреты (пароли, токены, ключи) держи в .env и ссылайся на них как ${ИМЯ}.
 # ─────────────────────────────────────────────────────────────────────────────
 
 general:
-  interval_minutes: 15          # как часто проверять (не ставь меньше 5 — Kleinanzeigen может забанить)
-  max_pages: 1                  # сколько страниц выдачи смотреть за раз (новые всё равно сверху)
-  fetch_details: true           # открывать каждое новое объявление: полный текст + все фото
+  interval_minutes: 20          # как часто проверять. Мастер подбирает безопасное значение: ~2 мин на поиск, не меньше 10
+  max_pages: 1                  # сколько страниц выдачи смотреть за раз (новые объявления всё равно сверху)
+  fetch_details: true           # открывать перспективные объявления: полный текст + все фото
   request_delay_seconds: [3, 7] # пауза между запросами к сайту (случайная, в секундах)
   max_new_per_search: 25        # максимум новых объявлений на поиск за одну проверку
-  data_dir: data                # где лежит база SQLite
+  data_dir: data                # где лежат база SQLite, логи (data/logs) и кэш категорий
+
+  # ── Воронка: категория — это сотни объявлений, дорогие шаги только для перспективных ──
+  # Всё, что не влезло в лимиты, не теряется: оценится в следующей проверке.
+  max_comps_lookups_per_run: 40 # сколько раз за проверку искать цены аналогов (это запросы к сайту)
+  max_details_per_run: 40       # сколько страниц объявлений открывать за проверку (текст + фото)
+  max_ai_per_run: 30            # сколько объявлений за проверку показывать нейросети (0 — без ИИ)
+  min_listing_price: 10         # платные объявления дешевле этого — мусор, пропускаем (бесплатные «zu verschenken» смотрим)
+
+  # ── Защита от блокировки на Kleinanzeigen ──
+  max_requests_per_hour: 150    # жёсткий лимит страниц в час на один сайт
+  block_cooldown_hours: [1, 2, 4, 12]  # после блокировки (403/429/капча) пауза растёт: 1 ч, 2 ч, 4 ч, 12 ч; переживает перезапуск
+  baseline_first_run: true      # первая проверка НОВОГО поиска только изучает цены, без уведомлений о «старых» объявлениях
 
 # ─── Что мониторить ──────────────────────────────────────────────────────────
-# source: kleinanzeigen | ebay
-# purpose: resale (перепродажа — считаем чистую прибыль) | personal (для себя — считаем экономию)
-#
-# Kleinanzeigen, способ 1 (надёжный): настрой поиск на kleinanzeigen.de — регион, радиус,
-#   категория, цена, «Angebote», — скопируй адрес страницы в url.
-# Kleinanzeigen, способ 2: query + location (город/индекс) + radius_km (+ category_id).
-#   category_id — число из адреса категории, например .../c225 → 225.
-# eBay: работает через официальный API (нужны ключи в разделе ebay ниже).
+# Главный режим — сканировать КАТЕГОРИИ в радиусе от города: category_id + location + radius_km.
+#   Программа смотрит все новые объявления категории и сама находит те, что дешевле рынка.
+#   Номера категорий: python -m ebeyparser categories  (с сайта: --live)
+#   173 Handy & Telefon · 278 Notebooks · 279 Konsolen · 225 PC-Zubehör & Software · 245 Foto
+#   172 Audio & Hifi · 285 Tablets & Reader · 228 PCs · 175 TV & Video · 227 Videospiele
+# Точечный поиск: query (ключевые слова) вместо категории или вместе с ней.
+# По ссылке: настрой поиск на kleinanzeigen.de и вставь адрес страницы в url.
+# purpose: resale — перепродажа (считаем чистую прибыль) | personal — для себя (считаем экономию,
+#   target_price — сколько готов заплатить).
+# min_price отсекает чехлы, кабели и прочую мелочь; exclude_keywords — объявления с этими словами
+#   пропускаются (defekt, bastler — сломано; suche — «куплю»; tausch — обмен; ersatzteil — на запчасти).
+# min_profit у поиска переопределяет pricing.min_profit.
+# source: ebay — через официальный API (нужны ключи в разделе ebay ниже).
 searches:
-  - name: "Видеокарты рядом (перепродажа)"
+  - name: "Handy & Telefon · Berlin 30 км"
     source: kleinanzeigen
-    query: "rtx 3080"
-    location: "Berlin"
+    enabled: true
+    purpose: resale
+    location: Berlin
     radius_km: 30
-    min_price: 150
-    max_price: 600
+    category_id: 173
+    category_name: Handy & Telefon
+    min_price: 50
+    max_price: 400
+    exclude_keywords: [defekt, bastler, suche, tausch, ersatzteil]
+
+  - name: "Notebooks · Berlin 30 км"
+    source: kleinanzeigen
+    enabled: true
     purpose: resale
-    exclude_keywords: [defekt, bastler, tausch, suche, mining]
-    # reference_price: 450        # если точно знаешь, за сколько уйдёт — оценка станет точнее
-    # min_profit: 60              # переопределяет pricing.min_profit для этого поиска
+    location: Berlin
+    radius_km: 30
+    category_id: 278
+    category_name: Notebooks
+    min_price: 60
+    max_price: 500
+    exclude_keywords: [defekt, bastler, suche, tausch, ersatzteil]
 
-  - name: "Apple техника по ссылке"
+  - name: "Konsolen · Berlin 30 км"
     source: kleinanzeigen
-    enabled: false
-    url: "https://www.kleinanzeigen.de/s-berlin/macbook/k0l3331r20"   # вставь свою ссылку
+    enabled: true
     purpose: resale
-    exclude_keywords: [icloud, gesperrt, defekt, displayschaden]
+    location: Berlin
+    radius_km: 30
+    category_id: 279
+    category_name: Konsolen
+    min_price: 40
+    max_price: 350
+    exclude_keywords: [defekt, bastler, suche, tausch, ersatzteil]
 
-  - name: "AI-сервер: RTX 3090 (для себя)"
+  - name: "PC-Zubehör & Software · Berlin 30 км"
     source: kleinanzeigen
-    query: "rtx 3090"
-    location: "Berlin"
-    radius_km: 50
-    max_price: 700
-    purpose: personal
-    target_price: 550             # сколько готов заплатить — ниже этого придёт уведомление
-    exclude_keywords: [defekt, bastler, tausch, suche]
+    enabled: true
+    purpose: resale
+    location: Berlin
+    radius_km: 30
+    category_id: 225
+    category_name: PC-Zubehör & Software
+    min_price: 30
+    max_price: 400
+    exclude_keywords: [defekt, bastler, suche, tausch, ersatzteil]
 
-  - name: "AI-сервер: DDR4 ECC 64GB (для себя)"
+  - name: "Foto · Berlin 30 км"
     source: kleinanzeigen
-    query: "ddr4 ecc 64gb"
+    enabled: true
+    purpose: resale
+    location: Berlin
+    radius_km: 30
+    category_id: 245
+    category_name: Foto
+    min_price: 40
+    max_price: 500
+    exclude_keywords: [defekt, bastler, suche, tausch, ersatzteil]
+
+  - name: "Audio & Hifi · Berlin 30 км"
+    source: kleinanzeigen
+    enabled: true
+    purpose: resale
+    location: Berlin
+    radius_km: 30
+    category_id: 172
+    category_name: Audio & Hifi
+    min_price: 30
+    max_price: 300
+    exclude_keywords: [defekt, bastler, suche, tausch, ersatzteil]
+
+  - name: "Tablets & Reader · Berlin 30 км"
+    source: kleinanzeigen
+    enabled: true
+    purpose: resale
+    location: Berlin
+    radius_km: 30
+    category_id: 285
+    category_name: Tablets & Reader
+    min_price: 40
+    max_price: 350
+    exclude_keywords: [defekt, bastler, suche, tausch, ersatzteil]
+
+  - name: "Для себя: RTX 3090 для AI-сервера"
+    source: kleinanzeigen
+    enabled: true
     purpose: personal
-    target_price: 90
-    enabled: false
+    query: rtx 3090
+    location: Berlin
+    radius_km: 30
+    max_price: 660
+    target_price: 550
+    exclude_keywords: [defekt, bastler, suche, tausch]
 
   - name: "eBay: аукционы видеокарт, заканчиваются скоро"
     source: ebay
-    enabled: false                # включи, когда добавишь ключи eBay
-    query: "rtx 3080"
-    ebay_category_ids: ["27386"]  # Grafikkarten (номер из адреса категории на ebay.de)
-    buying_options: [AUCTION]
-    ending_within_hours: 3        # классика: аукционы, которые никто не заметил
-    max_price: 400
-    purpose: resale
-
-  - name: "eBay: самовывоз рядом"
-    source: ebay
     enabled: false
-    query: "thinkpad t480"
-    buying_options: [FIXED_PRICE, BEST_OFFER]
-    local_pickup_only: true       # только с самовывозом...
-    location: "10115"             # ...в радиусе от этого индекса
-    radius_km: 40
-    max_price: 250
     purpose: resale
+    query: rtx 3080
+    max_price: 400
+    ebay_category_ids: ['27386']
+    buying_options: [AUCTION]
+    ending_within_hours: 3
 
 # ─── Как считать выгоду ──────────────────────────────────────────────────────
 pricing:
   min_profit: 40                # € чистой прибыли, чтобы сказать «покупать»
   min_roi: 0.25                 # и минимум 25% на вложенные деньги
+  max_capital:                  # € — дороже этого «покупать» не советовать (пусто = без лимита)
   selling_fee_percent: 0        # частные продавцы на eBay.de и Kleinanzeigen комиссию не платят
   payment_fee_percent: 0        # например 2.49, если продаёшь через PayPal «Waren und Dienstleistungen»
+  paypal_fixed_fee: 0           # и фиксированная часть PayPal, например 0.35
   default_shipping_cost: 0      # сколько потратишь на отправку при перепродаже
   safety_margin_percent: 10     # запас: торг, риск, твоё время
   asking_price_discount: 0.85   # цены в объявлениях выше реальных продаж — берём 85%
+  vb_expected_discount: 0.10    # «VB» в цене — обычно уступают ~10%
   use_kleinanzeigen_comps: true # искать похожие объявления на Kleinanzeigen
-  use_ebay_sold_comps: true     # смотреть реально проданные на eBay.de (лучшая оценка)
+  use_ebay_sold_comps: true     # смотреть проданные на eBay.de (часто закрыто защитой 403 — тогда без них)
   comps_limit: 30
-  reference_prices: []          # твой справочник цен — только если ТОЧНО знаешь рынок, иначе оставь пустым:
+  min_comparables: 6            # меньше аналогов — рынок неясен, максимум «подумать»
+  max_price_spread: 0.4         # слишком большой разброс цен аналогов — тоже максимум «подумать»
+  # История цен: каждое увиденное объявление запоминается, и цена оценивается по ней без лишних
+  # запросов к сайту — поэтому сканирование категорий со временем становится точнее и дешевле.
+  use_price_history: true
+  history_days: 60              # сколько дней истории учитывать
+  history_min_points: 6         # сколько похожих объявлений нужно, чтобы доверять истории
+  reference_prices: []          # справочник цен — ТОЛЬКО если точно знаешь рынок; обычно оставь пустым:
   #  - keywords: ["rtx", "3080"]  # все слова должны быть в названии
   #    exclude: ["ti", "laptop"]  # и ни одного из этих
   #    price: 400                 # за сколько такое реально продаётся
-  # Без справочника цена считается по похожим объявлениям и продажам — это надёжнее.
+  # Без справочника цена считается по истории, похожим объявлениям и продажам — это надёжнее.
+  # Если справочная цена сильно расходится с историей, программа предупредит.
 
 # ─── Локальная ИИ-модель (смотрит фото и описание) ───────────────────────────
-# Вся оценка идёт локально на твоём компьютере. Поставь Ollama (https://ollama.com), затем:
-#   ollama pull qwen2.5vl:7b        (~6 ГБ видеопамяти; на слабом ПК: qwen2.5vl:3b или gemma3:4b)
-# Проверка: python -m ebeyparser ai-check
+# Вся оценка идёт на твоём компьютере. LM Studio (https://lmstudio.ai): вкладка Discover →
+# скачай Qwen2.5-VL-7B-Instruct → Developer → Start Server. Проверка: python -m ebeyparser ai-check
 ai:
   enabled: true
-  provider: ollama              # ollama | openai (= LM Studio, llama.cpp, vLLM — любой OpenAI-совместимый)
-  base_url: ${OLLAMA_URL:-http://localhost:11434}   # LM Studio: http://localhost:1234/v1
-  model: qwen2.5vl:7b
+  provider: openai              # openai = LM Studio (и любой OpenAI-совместимый сервер) | ollama
+  base_url: http://localhost:1234/v1
+  model: qwen/qwen2.5-vl-7b     # идентификатор модели в LM Studio (ai-check покажет список)
   max_images: 3                 # сколько фото показывать модели
   timeout_seconds: 240
   run_for: promising            # promising — только перспективные (быстрее), all — все подряд
-  # ── LM Studio вместо Ollama ──
-  # provider: openai
-  # base_url: http://localhost:1234/v1
-  # model: qwen2.5-vl-7b-instruct     # идентификатор модели из LM Studio (команда ai-check покажет список)
+  # ── Ollama вместо LM Studio ──
+  # provider: ollama
+  # base_url: http://localhost:11434
+  # model: qwen2.5vl:7b          # ollama pull qwen2.5vl:7b
 
   # Необязательно: «второе мнение» от Claude (облако, платно) — только для лучших находок.
   # Нужен ключ ANTHROPIC_API_KEY в .env и пакет:  pip install anthropic
@@ -124,7 +202,7 @@ ai:
     max_per_run: 5              # не больше N платных запросов за одну проверку
 
 # ─── eBay (официальный API) ──────────────────────────────────────────────────
-# developer.ebay.com → Application Keys → Production: App ID (Client ID) и Cert ID (Client Secret).
+# developer.ebay.com/my/keys → Production keyset: App ID → EBAY_CLIENT_ID, Cert ID → EBAY_CLIENT_SECRET (в .env).
 # С ними токен создаётся и обновляется сам. Разовый токен (EBAY_OAUTH_TOKEN) живёт ~2 часа.
 ebay:
   client_id: ${EBAY_CLIENT_ID}
@@ -148,12 +226,15 @@ notifications:
     from_addr: ${SMTP_USER}
     to_addrs: ${NOTIFY_EMAIL}
   telegram:
-    enabled: false
+    enabled: false              # мастер setup или страница «Настройка» включат и запишут токен в .env
     bot_token: ${TELEGRAM_BOT_TOKEN}
     chat_id: ${TELEGRAM_CHAT_ID}
 
 # ─── Веб-интерфейс ───────────────────────────────────────────────────────────
 web:
-  host: 127.0.0.1               # 0.0.0.0 — чтобы открыть с телефона в домашней сети
+  host: 127.0.0.1               # только этот компьютер. 0.0.0.0 — вся сеть: вход по ссылке с ключом,
+                                # но НЕ делай так в общем Wi-Fi (общежитие, кафе). Для телефона лучше Tailscale.
   port: 8000
   run_monitor: true             # мониторинг работает в фоне вместе с сайтом
+  # Доп. имена, под которыми открываешь панель (например Tailscale: my-pc.tail1234.ts.net) —
+  # впиши в .env строку  EBEYPARSER_ALLOWED_HOSTS=my-pc.tail1234.ts.net

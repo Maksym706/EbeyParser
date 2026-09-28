@@ -15,7 +15,7 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 
 import httpx
@@ -27,10 +27,21 @@ log = logging.getLogger(__name__)
 
 SCOPE = "https://api.ebay.com/oauth/api_scope"
 PAGE_SIZE = 50
+# Comparables: used items from private sellers only (dealers ask retail prices).
+COMPS_SELLER_FILTER = "sellerAccountTypes:{INDIVIDUAL}"
 
 
 class EbayAPIError(Exception):
-    pass
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def seller_account_type(item: dict[str, Any]) -> str:
+    """"BUSINESS" / "INDIVIDUAL" / "" — the Browse API puts it under `seller` (older
+    responses and our fixtures also have it at the top level)."""
+    value = item.get("sellerAccountType") or (item.get("seller") or {}).get("sellerAccountType") or ""
+    return str(value).upper()
 
 
 def _api_base(cfg: EbayConfig) -> str:
@@ -158,8 +169,8 @@ def item_to_listing(item: dict[str, Any], search_name: str = "") -> Listing:
         ends_at=_parse_dt(item.get("itemEndDate")),
         shipping_cost=shipping,
         seller_name=seller.get("username", ""),
-        seller_type="commercial" if item.get("sellerAccountType") == "BUSINESS"
-        else "private" if item.get("sellerAccountType") == "INDIVIDUAL" else "unknown",
+        seller_type="commercial" if seller_account_type(item) == "BUSINESS"
+        else "private" if seller_account_type(item) == "INDIVIDUAL" else "unknown",
         seller_feedback_percent=float(feedback) if feedback not in (None, "") else None,
         seller_feedback_score=seller.get("feedbackScore"),
         posted_at_text=item.get("itemCreationDate", "") or "",
@@ -227,12 +238,20 @@ class EbayBrowseClient:
             if resp.status_code == 401:
                 raise EbayAPIError("eBay: токен недействителен или истёк (401).")
             if resp.status_code >= 400:
-                raise EbayAPIError(f"eBay API {resp.status_code}: {resp.text[:300]}")
+                raise EbayAPIError(f"eBay API {resp.status_code}: {resp.text[:300]}", resp.status_code)
             return resp.json()
         raise EbayAPIError(f"eBay API не отвечает ({resp.status_code})")
 
     # ------------------------------------------------------------ searching
-    async def search(self, search: SearchConfig, max_pages: int = 1) -> list[Listing]:
+    async def search(
+        self,
+        search: SearchConfig,
+        max_pages: int = 1,
+        seen: Callable[[str], bool] | None = None,
+    ) -> list[Listing]:
+        """Same contract as KleinanzeigenScraper.search: with `seen(ad_id)`, stop after the
+        first page that contains a known item (newest-first searches only; ending-soon
+        auction searches ignore it)."""
         params: dict[str, Any] = {
             "q": search.query,
             "limit": PAGE_SIZE,
@@ -246,17 +265,21 @@ class EbayBrowseClient:
         if not search.query and not search.ebay_category_ids:
             raise EbayAPIError(f"Поиск «{search.name}»: для eBay нужен query или ebay_category_ids")
 
-        seen: dict[str, Listing] = {}
+        found: dict[str, Listing] = {}
         for page in range(max(1, max_pages)):
             params["offset"] = page * PAGE_SIZE
             data = await self._get("/buy/browse/v1/item_summary/search", params)
             items = data.get("itemSummaries") or []
+            page_ids: list[str] = []
             for item in items:
                 listing = item_to_listing(item, search.name)
-                seen.setdefault(listing.ad_id, listing)
+                found.setdefault(listing.ad_id, listing)
+                page_ids.append(listing.ad_id)
             if len(items) < PAGE_SIZE or (page + 1) * PAGE_SIZE >= int(data.get("total", 0)):
                 break
-        return list(seen.values())
+            if seen is not None and not search.ending_within_hours and any(seen(i) for i in page_ids):
+                break
+        return list(found.values())
 
     async def fetch_detail(self, listing: Listing) -> Listing:
         legacy = listing.ad_id.removeprefix("ebay-")
@@ -285,15 +308,27 @@ class EbayBrowseClient:
 
     async def comparables(self, query: str, *, exclude_ad_id: str | None = None, limit: int = 30,
                           min_price: float | None = None, max_price: float | None = None) -> list[Comparable]:
-        """Current fixed-price offers on eBay.de (asking prices, not sales)."""
+        """Current fixed-price offers of USED items from private sellers on eBay.de (asking
+        prices, not sales). Business sellers are excluded: shop prices are not what a
+        private reseller gets."""
         search = SearchConfig(name="comps", source="ebay", query=query, buying_options=["FIXED_PRICE"],
-                              min_price=min_price, max_price=max_price)
-        params = {"q": query, "limit": min(limit * 2, 100), "filter": build_filters(search, self.cfg)}
-        data = await self._get("/buy/browse/v1/item_summary/search", params)
+                              ebay_conditions=["USED"], min_price=min_price, max_price=max_price)
+        base_filter = build_filters(search, self.cfg)
+        params = {"q": query, "limit": min(limit * 2, 100), "filter": f"{base_filter},{COMPS_SELLER_FILTER}"}
+        try:
+            data = await self._get("/buy/browse/v1/item_summary/search", params)
+        except EbayAPIError as exc:
+            if exc.status_code != 400:
+                raise
+            # marketplace without the seller-type filter: filter the results ourselves
+            log.info("eBay rejected %s (%s), filtering business sellers locally", COMPS_SELLER_FILTER, exc)
+            data = await self._get("/buy/browse/v1/item_summary/search", {**params, "filter": base_filter})
         comps: list[Comparable] = []
         for item in data.get("itemSummaries") or []:
             listing = item_to_listing(item)
             if listing.ad_id == exclude_ad_id or not listing.price:
+                continue
+            if seller_account_type(item) == "BUSINESS":
                 continue
             if "defekt" in listing.condition.lower() or "ersatzteil" in listing.condition.lower():
                 continue

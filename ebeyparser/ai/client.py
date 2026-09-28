@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import re
@@ -18,6 +19,15 @@ log = logging.getLogger(__name__)
 # Photos are expensive in tokens: 3 images at ~1000 tokens each overflow Ollama's
 # default 2k/4k context, so ask for a bigger window.
 OLLAMA_NUM_CTX = 8192
+# The JSON answer is ~300-450 tokens; the cap stops a 7B model that starts rambling or
+# repeating (the parser salvages a cut-off answer).
+MAX_OUTPUT_TOKENS = 700
+# Images for the model: long side <= 1024 px (a 7B VL model gains nothing from more,
+# each extra pixel costs tokens and time), JPEG q85, and a cap on the total payload.
+IMAGE_MAX_SIDE = 1024
+IMAGE_JPEG_QUALITY = 85
+IMAGE_REENCODE_BYTES = 350_000  # re-compress even small-dimension images above this size
+MAX_TOTAL_IMAGE_BYTES = 3_000_000
 
 
 class LLMError(Exception):
@@ -36,8 +46,8 @@ class ChatModel(Protocol):
     async def aclose(self) -> None: ...
 
 
-def image_mime(data: bytes) -> str:
-    """Mime type from magic bytes (jpeg/png/webp/gif); jpeg if unknown."""
+def _sniff_mime(data: bytes) -> str | None:
+    """Mime type from magic bytes (jpeg/png/webp/gif), None if not one of those."""
     if data[:3] == b"\xff\xd8\xff":
         return "image/jpeg"
     if data[:8] == b"\x89PNG\r\n\x1a\n":
@@ -46,11 +56,79 @@ def image_mime(data: bytes) -> str:
         return "image/webp"
     if data[:6] in (b"GIF87a", b"GIF89a"):
         return "image/gif"
-    return "image/jpeg"
+    return None
+
+
+def image_mime(data: bytes) -> str:
+    """Mime type from magic bytes (jpeg/png/webp/gif); jpeg if unknown."""
+    return _sniff_mime(data) or "image/jpeg"
 
 
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
+
+
+def _shrink(data: bytes, max_side: int, quality: int) -> bytes | None:
+    """Downscale/re-encode one image with Pillow (optional dependency).
+    Returns the new bytes, the input when nothing needs to change, or None when the
+    bytes are not an image at all (e.g. an HTML error page)."""
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:  # Pillow not installed: pass through unchanged
+        return data
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            fmt = (img.format or "").upper()
+            too_big = max(img.size) > max_side
+            if not too_big and fmt in ("JPEG", "PNG") and len(data) <= IMAGE_REENCODE_BYTES:
+                return data
+            img.seek(0)  # first frame of a GIF / animated WebP
+            out = ImageOps.exif_transpose(img)
+            if out.mode not in ("RGB", "L"):
+                out = out.convert("RGBA")
+                background = Image.new("RGB", out.size, (255, 255, 255))  # transparent -> white
+                background.paste(out, mask=out.getchannel("A"))
+                out = background
+            if too_big:
+                out.thumbnail((max_side, max_side), getattr(Image, "Resampling", Image).LANCZOS)
+            buf = io.BytesIO()
+            out.convert("RGB").save(buf, "JPEG", quality=quality, optimize=True)
+    except Exception as exc:  # noqa: BLE001 - broken/truncated file or odd format
+        if _sniff_mime(data) is not None:
+            log.debug("Pillow could not process an image (%s), sending it unchanged", exc)
+            return data
+        log.info("Skipping a download that is not an image (%d bytes)", len(data))
+        return None
+    small = buf.getvalue()
+    # WebP/GIF/... always become JPEG (not every local server decodes them)
+    return small if too_big or fmt not in ("JPEG", "PNG") or len(small) < len(data) else data
+
+
+def prepare_images(
+    images: list[bytes] | None,
+    *,
+    max_side: int = IMAGE_MAX_SIDE,
+    quality: int = IMAGE_JPEG_QUALITY,
+    max_total_bytes: int = MAX_TOTAL_IMAGE_BYTES,
+) -> list[bytes]:
+    """Images ready for a vision model: long side <= `max_side` px as JPEG (when Pillow is
+    installed; otherwise unchanged), non-images dropped, and no more than
+    `max_total_bytes` in total (later images are dropped, the first one is always kept).
+    Idempotent: prepared images pass through unchanged."""
+    out: list[bytes] = []
+    total = 0
+    for data in images or []:
+        if not data:
+            continue
+        small = _shrink(data, max_side, quality)
+        if small is None:
+            continue
+        if out and total + len(small) > max_total_bytes:
+            log.info("Image payload cap %d bytes reached, sending %d image(s)", max_total_bytes, len(out))
+            break
+        out.append(small)
+        total += len(small)
+    return out
 
 
 def _model_names_match(wanted: str, available: str) -> bool:
@@ -131,6 +209,9 @@ class VisionLLM:
                     base = base[: -len(suffix)]
         self.base_url = base
         headers = {"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else {}
+        # optional config knobs (not in LLMSettings yet): ai.max_tokens / ai.image_max_side
+        self._max_tokens = int(getattr(cfg, "max_tokens", None) or MAX_OUTPUT_TOKENS)
+        self._image_max_side = int(getattr(cfg, "image_max_side", None) or IMAGE_MAX_SIDE)
         timeout = httpx.Timeout(cfg.timeout_seconds, connect=min(10.0, cfg.timeout_seconds))
         self._client = httpx.AsyncClient(timeout=timeout, headers=headers, transport=transport)
 
@@ -206,7 +287,7 @@ class VisionLLM:
         self, system: str, user: str, images: list[bytes] | None = None, schema: dict | None = None
     ) -> str:
         """Ask for a JSON answer; returns the raw text content of the reply."""
-        images = [img for img in (images or []) if img]
+        images = prepare_images(images, max_side=self._image_max_side)
         if self.provider == "ollama":
             return await self._chat_ollama(system, user, images, schema)
         return await self._chat_openai(system, user, images, schema)
@@ -222,7 +303,11 @@ class VisionLLM:
             "messages": [{"role": "system", "content": system}, user_msg],
             "stream": False,
             "format": schema or "json",
-            "options": {"temperature": self.cfg.temperature, "num_ctx": OLLAMA_NUM_CTX},
+            "options": {
+                "temperature": self.cfg.temperature,
+                "num_ctx": OLLAMA_NUM_CTX,
+                "num_predict": self._max_tokens,
+            },
         }
         resp = await self._request("POST", self._chat_url(), payload)
         if resp.status_code == 400 and schema and "format" in resp.text.lower():
@@ -259,6 +344,7 @@ class VisionLLM:
                 {"role": "user", "content": content},
             ],
             "temperature": self.cfg.temperature,
+            "max_tokens": self._max_tokens,
             "stream": False,
         }
         # Strictest first: json_schema (LM Studio, llama.cpp, vLLM constrain the output to

@@ -85,7 +85,7 @@ def test_debug_search_command(tmp_path, monkeypatch, capsys):
     cfg.write_text(f"general:\n  data_dir: {tmp_path / 'data'}\nsearches:\n  - name: gpu\n    query: rtx 3080\n",
                    encoding="utf-8")
     monkeypatch.setattr(http.PoliteClient, "from_config", classmethod(
-        lambda cls, general: cls(delay_range=(0, 0),
+        lambda cls, general, **_kw: cls(delay_range=(0, 0),
                                  transport=httpx.MockTransport(lambda r: httpx.Response(200, text=REDESIGNED)))))
     assert cli.main(["-c", str(cfg), "debug-search"]) == 0
     out = capsys.readouterr().out

@@ -88,7 +88,8 @@ SOLD = [Comparable(title=f"RTX 3080 #{i}", price=p, source="ebay_sold", sold=Tru
 
 def config(**overrides) -> AppConfig:
     data = {
-        "general": {"max_new_per_search": 10},
+        # v0.2: a new search's first pass only learns prices; these tests evaluate right away
+        "general": {"max_new_per_search": 10, "baseline_first_run": False},
         "searches": [{"name": "GPU", "query": "rtx 3080", "exclude_keywords": ["defekt"]}],
         "pricing": {"min_profit": 40, "min_roi": 0.25},
         "notifications": {"min_score": 50, "verdicts": ["buy"]},
@@ -389,7 +390,8 @@ def test_cross_check_prefers_careful_market_price():
 
 
 async def test_warns_when_almost_everything_is_a_buy():
-    listings = [make_listing(str(9100 + i), f"RTX 3080 #{i}", 200.0) for i in range(6)]
+    # v0.2: 250 € (not 200 €) — below 40 % of the market an ad is "suspiciously cheap", never a buy
+    listings = [make_listing(str(9100 + i), f"RTX 3080 #{i}", 250.0) for i in range(6)]
     monitor, db, _, _ = build(config(), listings, verdict=GOOD_AI)
     summary = await monitor.run_once()
     assert summary.deals_found == 6

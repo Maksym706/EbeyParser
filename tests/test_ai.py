@@ -211,20 +211,36 @@ def test_schema_is_strict_and_complete():
     props = VERDICT_SCHEMA["properties"]
     assert set(props) == {
         "product",
-        "search_query",
-        "photo_matches_description",
+        "item_type",
+        "variant",
         "condition",
+        "defects",
+        "locked",
+        "stock_photos",
+        "photo_matches_description",
         "red_flags",
+        "same_variant_indexes",
         "estimated_market_price",
+        "search_query",
+        "reasoning",
         "verdict",
         "confidence",
-        "reasoning",
     }
     assert set(VERDICT_SCHEMA["required"]) == set(props)
     assert VERDICT_SCHEMA["additionalProperties"] is False
+    variant = props["variant"]
+    assert variant["additionalProperties"] is False and set(variant["required"]) == set(variant["properties"])
+    assert set(variant["properties"]) == {"model", "storage_gb", "ram_gb", "vram_gb", "edition"}
+    assert all(p == {"type": ["string", "null"]} for p in variant["properties"].values())
+    assert props["defects"]["items"]["enum"] == [
+        "screen_broken", "water_damage", "not_working", "missing_parts", "battery_bad", "locked", "other"]
+    assert props["locked"] == {"type": ["boolean", "null"]}
     dumped = json.dumps(VERDICT_SCHEMA)
-    for forbidden in ("minimum", "maximum", "minLength", "maxLength"):
+    for forbidden in ("minimum", "maximum", "minLength", "maxLength", "minItems", "maxItems", "pattern"):
         assert forbidden not in dumped
+    # reasoning is generated before the verdict (think first, decide after)
+    order = list(props)
+    assert order.index("reasoning") < order.index("verdict") and order[0] == "product"
     assert "Russian" in SYSTEM_PROMPT and "JSON" in SYSTEM_PROMPT
 
 
@@ -245,8 +261,10 @@ def test_build_user_prompt_kleinanzeigen():
     assert "Zustand: Gut" in text
     assert "privat" in text
     assert "Fotos: 3 angehängt (von 4" in text
-    assert "~600 €" in text and "550 €" in text and "12" in text
-    assert text.count("RTX 3090 #") == 5
+    # no anchoring: our market estimate is not in the prompt, only numbered comparables
+    assert "600 €" not in text and "650 €" not in text and "Typischer" not in text
+    assert text.count("RTX 3090 #") == 8 and "[0] RTX 3090 #0 — 500 € (verkauft)" in text
+    assert "[7] RTX 3090 #7 — 507 € (verkauft)" in text and "same_variant_indexes" in text
     assert "x" * 2500 in text and "x" * 2600 not in text
     assert "resale" in text
 

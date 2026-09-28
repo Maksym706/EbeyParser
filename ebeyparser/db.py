@@ -7,20 +7,24 @@ calls are quick, so the async code calls these methods directly.
 from __future__ import annotations
 
 import json
+import math
+import re
 import sqlite3
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from .models import (
     DEAL_STATUSES,
+    Comparable,
     DealView,
     Evaluation,
     Listing,
     RunSummary,
     utcnow,
 )
+from .pricing.text import history_anchor_words, normalize, price_point_words
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS listings (
@@ -66,7 +70,63 @@ CREATE TABLE IF NOT EXISTS runs (
     finished_at  TEXT,
     data         TEXT NOT NULL
 );
+
+-- Price history: every price we have seen (search results, comparables), ONE row per ad;
+-- price and seen_at are refreshed whenever the ad shows up again.
+CREATE TABLE IF NOT EXISTS price_points (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ad_id        TEXT NOT NULL UNIQUE,
+    source       TEXT NOT NULL,
+    product_key  TEXT NOT NULL,
+    title        TEXT NOT NULL DEFAULT '',
+    price        REAL NOT NULL,
+    sold         INTEGER NOT NULL DEFAULT 0,
+    url          TEXT NOT NULL DEFAULT '',
+    seen_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_price_points_key ON price_points(product_key, seen_at);
+CREATE INDEX IF NOT EXISTS idx_price_points_seen ON price_points(seen_at);
+
+-- Words (model numbers, product lines) of each price point, to find the same product
+-- written differently ("Apple iPhone 13 128GB" ~ "iPhone13 128 GB") without a table scan.
+CREATE TABLE IF NOT EXISTS price_point_words (
+    word         TEXT NOT NULL,
+    point_id     INTEGER NOT NULL REFERENCES price_points(id) ON DELETE CASCADE,
+    PRIMARY KEY (word, point_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_price_point_words_point ON price_point_words(point_id);
+
+-- Searches that have run at least once (baseline_first_run: the first pass only learns prices).
+CREATE TABLE IF NOT EXISTS search_state (
+    name         TEXT PRIMARY KEY,
+    first_run_at TEXT NOT NULL,
+    last_run_at  TEXT NOT NULL,
+    baseline_at  TEXT
+);
 """
+
+_KA_AD_RE = re.compile(r"/s-anzeige/[^/]+/(\d+)")
+_EBAY_ITEM_RE = re.compile(r"/itm/(?:[^/?#]+/)?(\d{9,})")
+_POINT_SOURCES = frozenset({"kleinanzeigen", "ebay", "ebay_sold", "reference", "other"})
+
+
+def price_point_id(item: Listing | Comparable) -> str:
+    """Stable id of a price point: the ad id when the URL has one (so an ad seen in search
+    results and again as a comparable is stored once), else URL or title+price."""
+    if isinstance(item, Listing):
+        return item.ad_id
+    url = item.url or ""
+    if "ebay." in url:
+        match = _EBAY_ITEM_RE.search(url)
+        if match:
+            return f"ebay-{match.group(1)}"
+    else:
+        match = _KA_AD_RE.search(url)
+        if match:
+            return match.group(1)
+    if url:
+        return url
+    return f"{item.source}:{normalize(item.title)[:120]}:{item.price:.2f}"
 
 _SORTS = {
     "score": "COALESCE(e.score, -1) DESC, l.first_seen DESC",
@@ -173,6 +233,23 @@ class Database:
         for row in self._query("SELECT data FROM listings ORDER BY first_seen DESC"):
             yield Listing.model_validate_json(row["data"])
 
+    def pending_listings(
+        self, search_name: str, *, since: datetime | None = None, limit: int = 100
+    ) -> list[Listing]:
+        """Listings of a search that were stored but never evaluated (deferred by a budget,
+        interrupted run), oldest first."""
+        sql = (
+            "SELECT l.data FROM listings l LEFT JOIN evaluations e ON e.ad_id = l.ad_id"
+            " WHERE e.ad_id IS NULL AND l.search_name = ?"
+        )
+        params: list[Any] = [search_name]
+        if since is not None:
+            sql += " AND l.first_seen >= ?"
+            params.append(_ts(since))
+        sql += " ORDER BY l.first_seen ASC LIMIT ?"
+        params.append(max(0, int(limit)))
+        return [Listing.model_validate_json(r["data"]) for r in self._query(sql, params)]
+
     # --------------------------------------------------------------- evaluations
     def save_evaluation(self, ev: Evaluation) -> None:
         self._execute(
@@ -195,6 +272,10 @@ class Database:
     def clear_evaluations(self) -> int:
         """Forget all verdicts (listings stay); the next run evaluates them again."""
         return self._execute("DELETE FROM evaluations").rowcount
+
+    def delete_evaluation(self, ad_id: str) -> bool:
+        """Forget one verdict; the listing becomes pending again."""
+        return self._execute("DELETE FROM evaluations WHERE ad_id = ?", (ad_id,)).rowcount > 0
 
     def get_evaluation(self, ad_id: str) -> Evaluation | None:
         rows = self._query("SELECT data FROM evaluations WHERE ad_id = ?", (ad_id,))
@@ -371,6 +452,158 @@ class Database:
         rows = self._query("SELECT data FROM runs ORDER BY id DESC LIMIT ?", (limit,))
         return [RunSummary.model_validate_json(r["data"]) for r in rows]
 
+    # ------------------------------------------------------------ price history
+    def add_price_points(
+        self, product_key: str, items: Iterable[Listing | Comparable], *, seen_at: datetime | None = None
+    ) -> int:
+        """Remember prices of `items` under one product key (e.g. the comparables of a query).
+        Returns how many were stored; items without a positive price are ignored."""
+        return self.record_price_points(((product_key, item) for item in items), seen_at=seen_at)
+
+    def record_price_points(
+        self, rows: Iterable[tuple[str, Listing | Comparable]], *, seen_at: datetime | None = None
+    ) -> int:
+        """Like add_price_points, with a product key per item; one transaction. One row per ad:
+        seeing it again updates its price, key and seen_at. Listings count as asking prices;
+        a comparable keeps its source and `sold` flag."""
+        when = _ts(seen_at or utcnow())
+        prepared: list[tuple[Any, ...]] = []
+        for key, item in rows:
+            key = " ".join(normalize(key).split())
+            price = item.price
+            if not key or price is None or not math.isfinite(price) or price <= 0:
+                continue
+            if isinstance(item, Listing):
+                source, sold = item.source, False
+            else:
+                source = item.source if item.source in _POINT_SOURCES else "other"
+                sold = bool(item.sold or item.source == "ebay_sold")
+            words = price_point_words(item.title, key)
+            prepared.append((price_point_id(item), source, key, item.title, float(price), int(sold),
+                             item.url or "", when, words))
+        if not prepared:
+            return 0
+        with self._lock:
+            cur = self._conn.cursor()
+            try:
+                for ad_id, source, key, title, price, sold, url, ts, words in prepared:
+                    cur.execute(
+                        "INSERT INTO price_points (ad_id, source, product_key, title, price, sold, url, seen_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                        " ON CONFLICT(ad_id) DO UPDATE SET source = excluded.source,"
+                        " product_key = excluded.product_key, title = excluded.title, price = excluded.price,"
+                        " sold = excluded.sold, url = excluded.url, seen_at = excluded.seen_at",
+                        (ad_id, source, key, title, price, sold, url, ts),
+                    )
+                    point_id = cur.execute(
+                        "SELECT id FROM price_points WHERE ad_id = ?", (ad_id,)
+                    ).fetchone()[0]
+                    cur.execute("DELETE FROM price_point_words WHERE point_id = ?", (point_id,))
+                    cur.executemany(
+                        "INSERT OR IGNORE INTO price_point_words (word, point_id) VALUES (?, ?)",
+                        [(w, point_id) for w in words],
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return len(prepared)
+
+    def price_history(
+        self,
+        product_key: str,
+        since: datetime | None = None,
+        *,
+        exclude_ad_id: str | None = None,
+        limit: int = 400,
+    ) -> list[Comparable]:
+        """Remembered prices that may be `product_key`, newest first: all points sharing its
+        anchor words (model number + product line). They are candidates — filter them with
+        pricing.estimator.comparable_is_relevant (estimate_from_history does)."""
+        return [c for c, _ in self.price_history_dated(product_key, since, exclude_ad_id=exclude_ad_id, limit=limit)]
+
+    def price_history_dated(
+        self,
+        product_key: str,
+        since: datetime | None = None,
+        *,
+        exclude_ad_id: str | None = None,
+        limit: int = 400,
+    ) -> list[tuple[Comparable, datetime]]:
+        """Like price_history, with the time each price was last seen (for time weighting)."""
+        key = " ".join(normalize(product_key).split())
+        if not key:
+            return []
+        anchors = history_anchor_words(key)
+        params: list[Any] = []
+        if anchors:
+            sql = ("SELECT p.* FROM price_point_words w JOIN price_points p ON p.id = w.point_id"
+                   " WHERE w.word = ?")
+            params.append(anchors[0])
+            for word in anchors[1:]:
+                sql += (" AND EXISTS (SELECT 1 FROM price_point_words w2"
+                        " WHERE w2.word = ? AND w2.point_id = p.id)")
+                params.append(word)
+        else:
+            sql = "SELECT p.* FROM price_points p WHERE p.product_key = ?"
+            params.append(key)
+        if since is not None:
+            sql += " AND p.seen_at >= ?"
+            params.append(_ts(since))
+        if exclude_ad_id:
+            sql += " AND p.ad_id != ?"
+            params.append(exclude_ad_id)
+        sql += " ORDER BY p.seen_at DESC LIMIT ?"
+        params.append(max(0, int(limit)))
+        out: list[tuple[Comparable, datetime]] = []
+        for r in self._query(sql, params):
+            seen = datetime.fromisoformat(r["seen_at"])
+            out.append((
+                Comparable(title=r["title"], price=r["price"], url=r["url"], source=r["source"],
+                           sold=bool(r["sold"]), date_text=seen.strftime("%d.%m.%Y")),
+                seen,
+            ))
+        return out
+
+    def prune_price_points(self, days: float | None = None, *, before: datetime | None = None) -> int:
+        """Delete price points not seen for `days` days (or since `before`). Returns the count."""
+        if before is None:
+            if days is None:
+                raise ValueError("prune_price_points needs `days` or `before`")
+            before = utcnow() - timedelta(days=days)
+        return self._execute("DELETE FROM price_points WHERE seen_at < ?", (_ts(before),)).rowcount
+
+    def count_price_points(self, product_key: str | None = None) -> int:
+        if product_key is None:
+            return int(self._query("SELECT COUNT(*) FROM price_points")[0][0])
+        key = " ".join(normalize(product_key).split())
+        return int(self._query("SELECT COUNT(*) FROM price_points WHERE product_key = ?", (key,))[0][0])
+
+    # ------------------------------------------------------------- search state
+    def search_has_run(self, name: str) -> bool:
+        """Has this search completed a pass before? (Searches from before v0.2 count as run
+        when they already found listings.)"""
+        if self._query("SELECT 1 FROM search_state WHERE name = ?", (name,)):
+            return True
+        return bool(self._query("SELECT 1 FROM listings WHERE search_name = ? LIMIT 1", (name,)))
+
+    def mark_search_run(self, name: str, *, baseline: bool = False) -> None:
+        """Record a pass of `name`; `baseline` = this pass only learned prices."""
+        now = _ts(utcnow())
+        self._execute(
+            "INSERT INTO search_state (name, first_run_at, last_run_at, baseline_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(name) DO UPDATE SET last_run_at = excluded.last_run_at,"
+            " baseline_at = COALESCE(excluded.baseline_at, search_state.baseline_at)",
+            (name, now, now, now if baseline else None),
+        )
+
+    def search_baseline_at(self, name: str) -> datetime | None:
+        """End of the learning-only first pass of `name` (listings seen before it are not new)."""
+        rows = self._query("SELECT baseline_at FROM search_state WHERE name = ?", (name,))
+        if not rows or not rows[0]["baseline_at"]:
+            return None
+        return datetime.fromisoformat(rows[0]["baseline_at"])
+
     # -------------------------------------------------------------------- stats
     def stats(self) -> dict[str, Any]:
         day_ago = _ts(utcnow() - timedelta(days=1))
@@ -386,12 +619,16 @@ class Database:
                 " WHERE e.verdict = 'buy' AND l.first_seen >= ?",
                 (day_ago,),
             ),
-            "potential_profit": one(
+            "potential_profit": one(  # open resale deals of the last week
                 "SELECT COALESCE(SUM(e.profit), 0) FROM evaluations e"
+                " JOIN listings l ON l.ad_id = e.ad_id"
                 " LEFT JOIN deal_state s ON s.ad_id = e.ad_id"
                 " WHERE e.verdict = 'buy' AND e.purpose = 'resale'"
-                " AND COALESCE(s.status, 'new') != 'ignored' AND e.profit > 0"
+                " AND COALESCE(s.status, 'new') NOT IN ('ignored', 'bought') AND e.profit > 0"
+                " AND l.first_seen >= ?",
+                (_ts(utcnow() - timedelta(days=7)),),
             ),
             "bought_total": one("SELECT COUNT(*) FROM deal_state WHERE status = 'bought'"),
             "notified_total": one("SELECT COUNT(DISTINCT ad_id) FROM notifications"),
+            "price_points_total": one("SELECT COUNT(*) FROM price_points"),
         }

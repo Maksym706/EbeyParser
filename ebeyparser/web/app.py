@@ -10,7 +10,9 @@ import asyncio
 import hashlib
 import logging
 import math
-from collections.abc import Mapping
+import re
+import shutil
+from collections.abc import Awaitable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -25,11 +27,48 @@ from fastapi.templating import Jinja2Templates
 from markupsafe import Markup
 from pydantic import BaseModel, ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .. import __version__
-from ..config import AppConfig, SearchConfig, save_searches
+from ..config import AppConfig, ConfigError, SearchConfig, load_config
 from ..db import Database
 from ..models import DEAL_STATUSES, AIVerdict, DealView, RunSummary, utcnow
+from ..scraper.categories import (
+    DEFAULT_BUDGET,
+    RADIUS_CHOICES,
+    Category,
+    CategoryList,
+    SetupAnswers,
+    answers_from_searches,
+    builtin_by_id,
+    builtin_categories,
+    describe_error,
+    estimate_requests,
+    load_cached_categories,
+    merge_searches,
+    request_budgets,
+    save_cached_categories,
+    searches_from_answers,
+    snap_radius,
+    suggest_interval,
+)
+from .configfile import (
+    read_env_file,
+    save_searches_block,
+    update_yaml_values,
+    write_env_values,
+)
+from .localai import LMSTUDIO_URL, OLLAMA_URL, detect_local_ai, probe_json
+from .security import (
+    COOKIE_MAX_AGE,
+    COOKIE_NAME,
+    TOKEN_HEADER,
+    TOKEN_PARAM,
+    ensure_token,
+    is_loopback,
+    token_matches,
+    trusted_hosts,
+)
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +82,8 @@ API_MAX_LIMIT = 500
 AI_HEALTH_TIMEOUT = 8.0
 NOTIFY_TIMEOUT = 60.0
 SHUTDOWN_TIMEOUT = 10.0
+DISCOVERY_TIMEOUT = 25.0
+SETUP_MIN_WISH_ROWS = 3
 
 try:
     from zoneinfo import ZoneInfo
@@ -968,6 +1009,102 @@ def describe_search(search: SearchConfig) -> dict[str, Any]:
     }
 
 
+# ------------------------------------------------------------- setup wizard
+def setup_form_values(answers: SetupAnswers, *, replace: bool = True) -> dict[str, Any]:
+    """Wizard answers -> raw strings for the /setup form."""
+    return {
+        "location": answers.location,
+        "radius": answers.radius_km,
+        "purpose": answers.purpose,
+        "max_price": _num_text(answers.max_price),
+        "min_profit": _num_text(answers.min_profit),
+        "category_ids": list(answers.category_ids),
+        "wishlist": [(item, _num_text(price)) for item, price in answers.wishlist],
+        "interval_minutes": _num_text(answers.interval_minutes),
+        "replace": replace,
+    }
+
+
+def parse_setup_form(
+    form: Mapping[str, Any], getlist: Callable[[str], list[str]], *, default_min_profit: float
+) -> tuple[SetupAnswers, dict[str, Any], list[str]]:
+    """/setup form (POST body or GET query) -> (answers, raw values for re-render, errors)."""
+    errors: list[str] = []
+    location = " ".join(str(form.get("location") or "").split())[:80]
+    if not location:
+        errors.append("Укажи город или почтовый индекс")
+    radius_raw = str(form.get("radius") or "").strip()
+    radius = _to_float(radius_raw) if radius_raw else 30.0
+    if radius is None or radius < 0:
+        errors.append("«Радиус»: нужно целое число километров")
+        radius = 30.0
+    purpose = str(form.get("purpose") or "resale")
+    purpose = purpose if purpose in PURPOSE_LABELS else "resale"
+
+    def money(key: str, label: str, default: float | None) -> float | None:
+        text = str(form.get(key) or "").strip()
+        if not text:
+            return default
+        value = _to_float(text.replace("€", ""))
+        if value is None or value < 0:
+            errors.append(f"«{label}»: нужно число, например 400")
+            return default
+        return value
+
+    max_price = money("max_price", "Максимальная цена за вещь", None)
+    if max_price == 0:
+        errors.append("«Максимальная цена за вещь» должна быть больше нуля")
+    min_profit = money("min_profit", "Минимальная прибыль", default_min_profit)
+    interval = money("interval_minutes", "Как часто проверять", None)
+    if interval is not None and not 5 <= interval <= 1440:
+        errors.append("«Как часто проверять»: от 5 до 1440 минут (чаще 10 минут не советую)")
+        interval = None
+    category_ids: list[int] = []
+    for raw in getlist("category"):
+        value = _to_float(raw)
+        if value is not None and value.is_integer() and value > 0 and int(value) not in category_ids:
+            category_ids.append(int(value))
+    items, prices = getlist("wish_item"), getlist("wish_price")
+    rows: list[tuple[str, str]] = []
+    wishlist: list[tuple[str, float | None]] = []
+    for i, item in enumerate(items[:30]):
+        item = " ".join(str(item).split())[:80]
+        price_text = str(prices[i] if i < len(prices) else "").strip()
+        if not item:
+            continue
+        rows.append((item, price_text))
+        price = _to_float(price_text.replace("€", "")) if price_text else None
+        if price_text and (price is None or price <= 0):
+            errors.append(f"«{item}»: цена должна быть числом больше нуля")
+            continue
+        wishlist.append((item, price))
+    answers = SetupAnswers(
+        location=location,
+        radius_km=snap_radius(int(radius)),
+        category_ids=category_ids,
+        purpose=purpose,
+        max_price=max_price,
+        min_profit=min_profit if min_profit is not None else default_min_profit,
+        wishlist=wishlist,
+        interval_minutes=interval,
+    )
+    values = setup_form_values(answers, replace=bool(form.get("replace")))
+    for key in ("max_price", "min_profit", "interval_minutes"):
+        values[key] = str(form.get(key) or "").strip()
+    values["wishlist"] = rows
+    return answers, values, errors
+
+
+def setup_category_groups(categories: list[Category], selected: list[int]) -> list[tuple[str, list[Category]]]:
+    """Checkbox groups for the /setup page; selected ids missing from the list are appended."""
+    known = {c.id for c in categories}
+    missing = [builtin_by_id(cid) or Category(cid, f"Категория {cid}") for cid in selected if cid not in known]
+    resale = [c for c in categories if c.resale_friendly]
+    other = [c for c in categories if not c.resale_friendly] + missing
+    groups = [("Хорошо перепродаются", resale), ("Другие категории", other)]
+    return [(title, cats) for title, cats in groups if cats]
+
+
 # --------------------------------------------------------------------- pagination
 def page_links(page: int, pages: int) -> list[int | None]:
     """[1, None, 4, 5, 6, None, 10] — None is an ellipsis."""
@@ -1064,8 +1201,21 @@ def create_app(
     monitor: Any | None = None,
     notifiers_factory: Callable[[], list[Any]] | None = None,
     start_monitor: bool = False,
+    category_discovery: Callable[[str, int], Awaitable[Any]] | None = None,
+    bind_host: str | None = None,
+    access_token: str | None = None,
+    ai_probe: Callable[[str], Any] | None = None,
 ) -> FastAPI:
-    """Build the dashboard app. With `start_monitor` the monitor loop runs in the app lifespan."""
+    """Build the dashboard app. With `start_monitor` the monitor loop runs in the app lifespan.
+
+    `category_discovery(location, radius_km)`: live category list for /setup, only on the
+    "update from the site" button (default: 1–2 requests to kleinanzeigen.de, cached in
+    data/categories.json for 7 days). `bind_host` (default web.host): when it is not a
+    loopback address every request needs `access_token` (default: data/web_token.txt)
+    and /api/docs is off. `ai_probe(url)`: JSON GET used to find LM Studio / Ollama."""
+    loopback = is_loopback(bind_host if bind_host is not None else config.web.host)
+    if access_token is None and not loopback:
+        access_token = ensure_token(config.data_path)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):  # noqa: ANN202
@@ -1091,10 +1241,11 @@ def create_app(
         title="EbeyParser",
         version=__version__,
         lifespan=lifespan,
-        docs_url="/api/docs",
+        docs_url="/api/docs" if loopback else None,
         redoc_url=None,
-        openapi_url="/api/openapi.json",
+        openapi_url="/api/openapi.json" if loopback else None,
     )
+    app.state.access_token = access_token or None
     app.state.config = config
     app.state.db = db
     app.state.config_path = Path(config_path) if config_path else None
@@ -1103,6 +1254,7 @@ def create_app(
     app.state.monitor_task = None
     app.state.run_task = None
     app.state.static_version = _static_version()
+    app.state.category_cache = {}  # (location, radius) -> CategoryList
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
@@ -1156,6 +1308,42 @@ def create_app(
                     return JSONResponse({"detail": "Запрос с чужого сайта отклонён"}, status_code=403)
         return await call_next(request)
 
+    @app.middleware("http")
+    async def access_token_guard(request: Request, call_next: Callable) -> Response:
+        """Network mode: every page and API call needs the token (cookie, header or ?token=)."""
+        token: str | None = app.state.access_token
+        path = request.url.path
+        if not token or path.startswith("/static/"):
+            return await call_next(request)
+        if token_matches(request.query_params.get(TOKEN_PARAM), token):
+            if request.method == "GET" and not path.startswith("/api/"):
+                # remember the token in a cookie and drop it from the address bar
+                clean = request.url.remove_query_params(TOKEN_PARAM)
+                response: Response = RedirectResponse(clean.path + (f"?{clean.query}" if clean.query else ""), 303)
+            else:
+                response = await call_next(request)
+            response.set_cookie(COOKIE_NAME, token, max_age=COOKIE_MAX_AGE, httponly=True, samesite="lax")
+            return response
+        if token_matches(request.cookies.get(COOKIE_NAME), token) or token_matches(
+                request.headers.get(TOKEN_HEADER), token):
+            return await call_next(request)
+        if path.startswith("/api/"):
+            return JSONResponse({"detail": "Нужен ключ доступа: открой ссылку с ?token=… из окна программы"},
+                                status_code=401)
+        return render(request, "error.html", {
+            "code": 401,
+            "title": "Нужен ключ доступа",
+            "message": "Панель открыта для домашней сети, поэтому вход только по ссылке с ключом. "
+                       "Скопируй адрес с ?token=… из окна программы при запуске "
+                       "(ключ также лежит в файле data/web_token.txt) и открой его один раз — "
+                       "браузер запомнит ключ.",
+        }, 401)
+
+    extra_hosts = getattr(config.web, "allowed_hosts", None) or []
+    app.add_middleware(TrustedHostMiddleware,
+                       allowed_hosts=trusted_hosts(bind_host if bind_host is not None else config.web.host,
+                                                   extra_hosts))
+
     @app.exception_handler(StarletteHTTPException)
     async def http_error(request: Request, exc: StarletteHTTPException) -> Response:
         path = request.url.path
@@ -1199,6 +1387,7 @@ def create_app(
             "stats": stats,
             "last_run": runs[0] if runs else None,
             "has_searches": bool(app.state.config.searches),
+            "editable": app.state.config_path is not None,
         })
 
     @app.get("/deal/{ad_id}", response_class=HTMLResponse)
@@ -1257,6 +1446,10 @@ def create_app(
             notice = f"Поиск «{params['deleted']}» удалён"
         elif params.get("toggled"):
             notice = f"Поиск «{params['toggled']}» обновлён"
+        elif params.get("setup"):
+            count = _to_int(params.get("setup"), 0)
+            notice = (f"Готово: сохранено {count} {plural(count, 'поиск', 'поиска', 'поисков')}. "
+                      "Нажми «Проверить сейчас» на странице «Сделки» или подожди автоматической проверки")
         return render(request, "searches.html", {
             "nav": "searches",
             "cards": cards,
@@ -1268,6 +1461,7 @@ def create_app(
             "form_open": bool(errors) or bool(editing) or params.get("new") == "1" or not cfg.searches,
             "notice": notice,
             "labels": SEARCH_FIELD_LABELS,
+            "builtin_categories": builtin_categories(),
         }, status_code)
 
     @app.get("/status", response_class=HTMLResponse)
@@ -1288,6 +1482,297 @@ def create_app(
             "db_path": getattr(db, "path", ""),
         })
 
+    # ------------------------------------------------------------ setup wizard
+    async def _default_discovery(location: str, radius_km: int) -> CategoryList:
+        from ..scraper.categories import discover_categories, discovery_client
+
+        client = discovery_client(app.state.config.general)
+        try:
+            return await discover_categories(client, location, radius_km)
+        finally:
+            await client.aclose()
+
+    async def _categories_for(location: str, radius_km: int, *, live: bool = False) -> CategoryList:
+        """No requests by default: the cached live list (memory, then data/categories.json,
+        7 days) or the built-in one. `live=True` asks the site and caches a good answer."""
+        location = location.strip()
+        if not location:
+            return builtin_categories()
+        key = (location.lower(), radius_km)
+        cache: dict[tuple[str, int], CategoryList] = app.state.category_cache
+        data_dir = app.state.config.data_path
+        if not live:
+            if key in cache:
+                return cache[key]
+            cached = load_cached_categories(data_dir, location, radius_km)
+            if cached is not None:
+                cache[key] = cached
+                return cached
+            return builtin_categories()
+        discover = category_discovery or _default_discovery
+        try:
+            result = await asyncio.wait_for(discover(location, radius_km), DISCOVERY_TIMEOUT)
+            if not isinstance(result, CategoryList):
+                result = CategoryList(result or builtin_categories())
+            if not len(result):
+                result = CategoryList(builtin_categories(), error=result.error or "список категорий пуст")
+        except asyncio.TimeoutError:
+            result = CategoryList(builtin_categories(), error=f"kleinanzeigen.de не ответил за {DISCOVERY_TIMEOUT:g} с")
+        except Exception as exc:  # discovery must never break the page
+            log.warning("category discovery failed: %s", exc)
+            result = CategoryList(builtin_categories(), error=describe_error(exc))
+        if result.live:
+            cache[key] = result
+            save_cached_categories(data_dir, location, radius_km, result)
+        return result
+
+    def _render_setup(
+        request: Request,
+        answers: SetupAnswers,
+        values: dict[str, Any],
+        categories: CategoryList,
+        *,
+        errors: list[str] | None = None,
+        status_code: int = 200,
+        refreshed: bool = False,
+    ) -> HTMLResponse:
+        cfg: AppConfig = app.state.config
+        rows = list(values["wishlist"])
+        rows += [("", "")] * max(1, SETUP_MIN_WISH_ROWS - len(rows))
+        n_searches = answers.search_count
+        suggested = suggest_interval(n_searches, cfg.general)
+        interval = _to_float(values.get("interval_minutes")) or float(suggested)
+        estimate = estimate_requests(n_searches, interval, cfg.general)
+        pages, extra, cap = request_budgets(cfg.general)
+        return render(request, "setup.html", {
+            "nav": "setup",
+            "form": values,
+            "rows": rows,
+            "groups": setup_category_groups(list(categories), answers.category_ids),
+            "categories": categories,
+            "refreshed": refreshed,
+            "radius_choices": sorted({*RADIUS_CHOICES, answers.radius_km}),
+            "errors": errors or [],
+            "editable": app.state.config_path is not None,
+            "config_path": app.state.config_path,
+            "existing_count": len(cfg.searches),
+            "default_min_profit": cfg.pricing.min_profit,
+            "default_budget": DEFAULT_BUDGET,
+            "suggested_interval": suggested,
+            "current_interval": cfg.general.interval_minutes,
+            "estimate": estimate,
+            "budget": {"pages": pages, "extra": extra, "cap": cap},
+        }, status_code)
+
+    @app.get("/setup", response_class=HTMLResponse)
+    async def setup_page(request: Request) -> HTMLResponse:
+        params = request.query_params
+        cfg: AppConfig = app.state.config
+        if "location" in params:  # "update categories" re-submits the form as GET: keep what was typed
+            answers, values, _ = parse_setup_form(params, params.getlist, default_min_profit=cfg.pricing.min_profit)
+        else:
+            answers = answers_from_searches(cfg.searches, cfg.pricing.min_profit)
+            if answers.max_price is None and not cfg.searches:
+                answers.max_price = DEFAULT_BUDGET
+            values = setup_form_values(answers, replace=True)
+            if cfg.searches:  # keep the user's interval unless it is too aggressive
+                values["interval_minutes"] = _num_text(max(cfg.general.interval_minutes,
+                                                           suggest_interval(answers.search_count, cfg.general)))
+        live = bool(params.get("refresh"))
+        categories = await _categories_for(answers.location, answers.radius_km, live=live)
+        return _render_setup(request, answers, values, categories, refreshed=live)
+
+    @app.post("/setup", response_class=HTMLResponse)
+    async def setup_save(request: Request) -> Response:
+        path = _require_editable()
+        cfg: AppConfig = app.state.config
+        form = await request.form()
+        answers, values, errors = parse_setup_form(form, form.getlist, default_min_profit=cfg.pricing.min_profit)
+        categories = await _categories_for(answers.location, answers.radius_km)
+        known = {c.id: c for c in categories}
+        for cid in answers.category_ids:  # categories shown on the page but not cached any more
+            if cid not in known and builtin_by_id(cid) is None:
+                name = " ".join(str(form.get(f"cat_name_{cid}") or "").split())[:80] or f"Категория {cid}"
+                known[cid] = Category(cid, name)
+        generated: list[SearchConfig] = []
+        if not errors:
+            generated = searches_from_answers(answers, known.values(), global_min_profit=cfg.pricing.min_profit)
+            if not generated:
+                errors.append("Выбери хотя бы одну категорию или добавь вещь в список «для себя»")
+            for search in generated:
+                errors.extend(search_problems(search))
+        if errors:
+            return _render_setup(request, answers, values, categories, errors=errors, status_code=400)
+        merged = merge_searches(cfg.searches, generated, replace_all=bool(values["replace"]))
+        if path.is_file():
+            try:
+                shutil.copyfile(path, path.with_name(path.name + ".bak"))
+            except OSError as exc:
+                log.warning("backup of %s failed: %s", path, exc)
+        interval = answers.interval_minutes or float(suggest_interval(len(generated), cfg.general))
+        if interval != cfg.general.interval_minutes:
+            _write_settings({"general.interval_minutes": interval})
+        _persist(merged)
+        return RedirectResponse("/searches?" + urlencode({"setup": len(generated)}), status_code=303)
+
+    # ---------------------------------------------------------------- settings
+    def _write_settings(updates: dict[str, Any], env: dict[str, str] | None = None) -> None:
+        """Write config values (comment-preserving) / secrets to .env, then reload the
+        non-search sections into the running config and tell the monitor."""
+        path = _require_editable()
+        try:
+            if env:
+                write_env_values(path.parent / ".env", env)
+            if updates:
+                update_yaml_values(path, updates)
+            fresh = load_config(path)
+        except (OSError, ConfigError) as exc:
+            raise HTTPException(500, f"Не удалось записать {path}: {exc}") from exc
+        cfg: AppConfig = app.state.config
+        for section in ("general", "pricing", "ai", "notifications", "ebay", "web"):
+            if hasattr(fresh, section):
+                setattr(cfg, section, getattr(fresh, section))
+        update = getattr(app.state.monitor, "update_config", None)
+        if update is not None:
+            try:
+                update(cfg)
+            except Exception:
+                log.exception("monitor.update_config failed")
+
+    def _render_settings(request: Request, *, errors: list[str] | None = None, status_code: int = 200,
+                         form: dict[str, Any] | None = None) -> HTMLResponse:
+        cfg: AppConfig = app.state.config
+        path = app.state.config_path
+        env = read_env_file(path.parent / ".env") if path else {}
+        tg = cfg.notifications.telegram
+        saved = request.query_params.get("saved", "")
+        notices = {"ai": "Настройки нейросети сохранены", "telegram": "Telegram сохранён",
+                   "pricing": "Настройки выгоды сохранены"}
+        pricing = cfg.pricing
+        values = {
+            "ai_enabled": cfg.ai.enabled, "provider": cfg.ai.provider, "base_url": cfg.ai.base_url,
+            "model": cfg.ai.model,
+            "tg_enabled": tg.enabled, "chat_id": env.get("TELEGRAM_CHAT_ID") or tg.chat_id,
+            "min_profit": _num_text(pricing.min_profit), "min_roi": _num_text(round(pricing.min_roi * 100, 1)),
+            "max_capital": _num_text(getattr(pricing, "max_capital", None)),
+            "vb_discount": _num_text(round(float(getattr(pricing, "vb_expected_discount", 0.10) or 0) * 100, 1)),
+            **(form or {}),
+        }
+        return render(request, "settings.html", {
+            "nav": "setup",
+            "v": values,
+            "errors": errors or [],
+            "notice": notices.get(saved, ""),
+            "editable": path is not None,
+            "config_path": path,
+            "token_set": bool(tg.bot_token),
+            "has_notifiers": notifiers_factory is not None,
+            "has_monitor": getattr(app.state.monitor, "ai_health", None) is not None,
+            "has_vb": hasattr(pricing, "vb_expected_discount"),
+            "has_capital": hasattr(pricing, "max_capital"),
+        }, status_code)
+
+    @app.get("/settings", response_class=HTMLResponse)
+    async def settings_page(request: Request) -> HTMLResponse:
+        return _render_settings(request)
+
+    @app.post("/settings/ai", response_class=HTMLResponse)
+    async def settings_ai(request: Request) -> Response:
+        _require_editable()
+        form = await request.form()
+        provider = str(form.get("provider") or "openai")
+        base_url = str(form.get("base_url") or "").strip()
+        model = str(form.get("model") or "").strip()
+        errors = []
+        if provider not in ("openai", "ollama"):
+            errors.append("Неизвестный сервер нейросети")
+        if base_url and urlsplit(base_url).scheme not in ("http", "https"):
+            errors.append("Адрес сервера должен начинаться с http://, например http://localhost:1234/v1")
+        if not model:
+            errors.append("Укажи модель, например qwen/qwen2.5-vl-7b")
+        if errors:
+            return _render_settings(request, errors=errors, status_code=400, form={
+                "provider": provider, "base_url": base_url, "model": model, "ai_enabled": bool(form.get("enabled"))})
+        if not base_url:
+            base_url = LMSTUDIO_URL if provider == "openai" else OLLAMA_URL
+        _write_settings({"ai.enabled": bool(form.get("enabled")), "ai.provider": provider,
+                         "ai.base_url": base_url, "ai.model": model})
+        return RedirectResponse("/settings?saved=ai#ai", status_code=303)
+
+    @app.post("/settings/telegram", response_class=HTMLResponse)
+    async def settings_telegram(request: Request) -> Response:
+        path = _require_editable()
+        form = await request.form()
+        token = str(form.get("bot_token") or "").strip()
+        chat_id = str(form.get("chat_id") or "").strip()
+        enabled = bool(form.get("enabled"))
+        errors = []
+        if token and not re.match(r"^\d{5,}:[\w-]{20,}$", token):
+            errors.append("Токен бота выглядит как 123456789:AAH… — скопируй его из сообщения @BotFather целиком")
+        if chat_id and not re.match(r"^(-?\d{3,}|@\w{4,})$", chat_id):
+            errors.append("chat_id — это число, например 123456789 (его пишет @userinfobot)")
+        has_token = bool(token or app.state.config.notifications.telegram.bot_token)
+        if enabled and not (has_token and (chat_id or app.state.config.notifications.telegram.chat_id)):
+            errors.append("Чтобы включить Telegram, нужны и токен бота, и chat_id")
+        if errors:
+            return _render_settings(request, errors=errors, status_code=400,
+                                    form={"tg_enabled": enabled, "chat_id": chat_id})
+        env = {}
+        if token:
+            env["TELEGRAM_BOT_TOKEN"] = token
+        if chat_id:
+            env["TELEGRAM_CHAT_ID"] = chat_id
+        updates: dict[str, Any] = {"notifications.telegram.enabled": enabled}
+        if env:  # config references the secrets, the values live in .env
+            updates["notifications.telegram.bot_token"] = "${TELEGRAM_BOT_TOKEN}"
+            updates["notifications.telegram.chat_id"] = "${TELEGRAM_CHAT_ID}"
+        _write_settings(updates, env)
+        log.info("Telegram settings saved (%s)", path.parent / ".env")
+        return RedirectResponse("/settings?saved=telegram#telegram", status_code=303)
+
+    @app.post("/settings/pricing", response_class=HTMLResponse)
+    async def settings_pricing(request: Request) -> Response:
+        _require_editable()
+        form = await request.form()
+        pricing = app.state.config.pricing
+        errors: list[str] = []
+        raw = {k: str(form.get(k) or "").strip() for k in ("min_profit", "min_roi", "max_capital", "vb_discount")}
+
+        def number(key: str, label: str, *, low: float = 0, high: float | None = None) -> float | None:
+            if not raw[key]:
+                return None
+            value = _to_float(raw[key].replace("€", "").replace("%", ""))
+            if value is None or value < low or (high is not None and value > high):
+                errors.append(f"«{label}»: нужно число" + (f" от {low:g} до {high:g}" if high is not None else ""))
+                return None
+            return value
+
+        min_profit = number("min_profit", "Минимальная прибыль")
+        min_roi = number("min_roi", "Минимальный ROI", high=1000)
+        max_capital = number("max_capital", "Максимум на одну покупку")
+        vb = number("vb_discount", "Скидка при торге (VB)", high=90)
+        if errors:
+            return _render_settings(request, errors=errors, status_code=400, form=raw)
+        updates: dict[str, Any] = {
+            "pricing.min_profit": min_profit if min_profit is not None else pricing.min_profit,
+            "pricing.min_roi": round(min_roi / 100, 4) if min_roi is not None else pricing.min_roi,
+        }
+        if hasattr(pricing, "max_capital"):
+            updates["pricing.max_capital"] = max_capital  # empty = no limit (null)
+        if hasattr(pricing, "vb_expected_discount") and vb is not None:
+            updates["pricing.vb_expected_discount"] = round(vb / 100, 4)
+        _write_settings(updates)
+        return RedirectResponse("/settings?saved=pricing#pricing", status_code=303)
+
+    @app.get("/api/ai/check")
+    async def api_ai_check() -> dict[str, Any]:
+        return await ai_status(app)
+
+    @app.get("/api/ai/detect")
+    async def api_ai_detect() -> dict[str, Any]:
+        servers = await asyncio.to_thread(detect_local_ai, ai_probe or probe_json)
+        return {"servers": [s.as_dict() for s in servers]}
+
     # --------------------------------------------------- search form actions
     def _require_editable() -> Path:
         path = app.state.config_path
@@ -1298,7 +1783,7 @@ def create_app(
     def _persist(searches: list[SearchConfig]) -> None:
         path = _require_editable()
         try:
-            save_searches(path, searches)
+            save_searches_block(path, searches)  # only the searches block: comments elsewhere survive
         except OSError as exc:
             raise HTTPException(500, f"Не удалось записать {path}: {exc}") from exc
         cfg: AppConfig = app.state.config
