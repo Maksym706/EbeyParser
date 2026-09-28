@@ -143,10 +143,24 @@ def _query_token_score(tok: str, first_unit: bool) -> float:
     return 2.5
 
 
+_GPU_CORE_RE = re.compile(r"\b(rtx|gtx|rx|arc)\s*([a-z]?\d{3,4})\s*(ti|super|xtx|xt)?\b")
+_MODEL_SUFFIXES = frozenset({"ti", "super", "xt", "xtx", "pro", "max", "plus", "mini", "ultra"})
+
+
+def _gpu_query(title: str) -> str | None:
+    """Graphics cards: board partner and cooler don't matter much for the price —
+    'MSI NVIDIA RTX 3080 Ti VENTUS 3X 12G OC' -> 'rtx 3080 ti'."""
+    m = _GPU_CORE_RE.search(normalize(title))
+    return " ".join(part for part in m.groups() if part) if m else None
+
+
 def make_search_query(title: str, max_words: int = 5) -> str:
     """Turn a messy German ad title into a short query for finding comparables."""
     if not title or max_words <= 0:
         return ""
+    gpu = _gpu_query(title)
+    if gpu:
+        return gpu
     cleaned = _PRICE_RE.sub(" ", unicodedata.normalize("NFKC", title))
     extras = _EXTRAS_RE.search(cleaned)
     if extras:
@@ -173,6 +187,19 @@ def make_search_query(title: str, max_words: int = 5) -> str:
     if sum(1 for s, _, _ in scored if s >= 2.5) >= 3:
         scored = [t for t in scored if t[0] >= 1.5]
     best = sorted(scored, key=lambda t: (-t[0], t[1]))[:max_words]
+    # never lose a model suffix right after a model number ("13 pro max", "3080 ti")
+    chosen = {idx for _, idx, _ in best}
+    for _, idx, tok in list(best):
+        nxt = idx + 1
+        while nxt < len(tokens) and tokens[nxt] in _MODEL_SUFFIXES and any(c.isdigit() for c in tok):
+            if nxt not in chosen:
+                if len(best) >= max_words:
+                    weakest = max((b for b in best if b[1] != idx), key=lambda b: (b[0] * -1, b[1]))
+                    best.remove(weakest)
+                    chosen.discard(weakest[1])
+                best.append((0.0, nxt, tokens[nxt]))
+                chosen.add(nxt)
+            nxt += 1
     return " ".join(tok for _, _, tok in sorted(best, key=lambda t: t[1]))
 
 
@@ -506,11 +533,39 @@ def detect_red_flags(text: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+_NEGATION_WORDS = frozenset({
+    "kein", "keine", "keinen", "keinem", "keiner", "keines", "nicht", "nie", "niemals", "ohne",
+    "no", "not", "never", "without",
+})
+
+
+def _keyword_positions(norm: str, keyword: str) -> list[int]:
+    """Where `keyword` starts a word ("tausch" matches "tausche", not "umtausch")."""
+    return [m.start() for m in re.finditer(r"(?<![a-z0-9])" + re.escape(keyword), norm)]
+
+
+def _negated(norm: str, pos: int) -> bool:
+    """'kein Mining', 'nie für Mining genutzt', 'keine Defekte' — the keyword is denied."""
+    return any(w in _NEGATION_WORDS for w in norm[:pos].split()[-3:])
+
+
 def matches_keywords(text: str, include: list[str], exclude: list[str]) -> bool:
-    """Case/umlaut-insensitive substring match. include=[] means no requirement."""
+    """Case/umlaut-insensitive, word-start matching. include=[] means no requirement.
+    An exclude word right after a negation ("kein Umtausch", "nie für Mining") does not count."""
     norm = normalize(text)
     inc = [k for k in (normalize(x) for x in include or []) if k]
     exc = [k for k in (normalize(x) for x in exclude or []) if k]
-    if any(k in norm for k in exc):
-        return False
-    return not inc or any(k in norm for k in inc)
+    for k in exc:
+        if any(not _negated(norm, pos) for pos in _keyword_positions(norm, k)):
+            return False
+    return not inc or any(_keyword_positions(norm, k) for k in inc)
+
+
+def matched_exclude_keyword(text: str, exclude: list[str]) -> str | None:
+    """Which exclude keyword killed the ad (for the reason shown to the user)."""
+    norm = normalize(text)
+    for raw in exclude or []:
+        k = normalize(raw)
+        if k and any(not _negated(norm, pos) for pos in _keyword_positions(norm, k)):
+            return raw
+    return None

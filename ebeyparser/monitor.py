@@ -299,8 +299,9 @@ class Monitor:
                 summary.errors.append(f"{search.name} / {listing.title[:40]}: {exc}")
                 continue
             summary.evaluated += 1
-            log.info("         → %s, балл %.0f%s", _VERDICT_RU.get(evaluation.verdict, evaluation.verdict),
-                     evaluation.score, _profit_note(evaluation))
+            why = f" — {evaluation.reasons[0]}" if evaluation.verdict == "skip" and evaluation.reasons else ""
+            log.info("         → %s, балл %.0f%s%s", _VERDICT_RU.get(evaluation.verdict, evaluation.verdict),
+                     evaluation.score, _profit_note(evaluation), why)
             if evaluation.verdict == "buy":
                 summary.deals_found += 1
             if self._should_notify(evaluation):

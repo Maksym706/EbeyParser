@@ -192,6 +192,10 @@ class Database:
             ),
         )
 
+    def clear_evaluations(self) -> int:
+        """Forget all verdicts (listings stay); the next run evaluates them again."""
+        return self._execute("DELETE FROM evaluations").rowcount
+
     def get_evaluation(self, ad_id: str) -> Evaluation | None:
         rows = self._query("SELECT data FROM evaluations WHERE ad_id = ?", (ad_id,))
         return Evaluation.model_validate_json(rows[0]["data"]) if rows else None

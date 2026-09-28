@@ -543,3 +543,40 @@ def test_fmt_money():
     assert fmt_money(290) == "290 €"
     assert fmt_money(7.5) == "7,50 €"
     assert fmt_money(-30) == "-30 €"
+
+
+def test_exclude_keywords_are_word_start_and_negation_aware():
+    ex = ["defekt", "bastler", "tausch", "suche", "mining"]
+    ok = "Privatverkauf, kein Umtausch und keine Rücknahme. Nie für Mining genutzt, keine Defekte."
+    assert matches_keywords(ok, [], ex)
+    for bad in ("Karte defekt, für Bastler", "Nur Tausch gegen PS5", "Tausche gegen 4070",
+                "Wurde fürs Mining benutzt", "Suche RTX 3080"):
+        assert not matches_keywords(bad, [], ex), bad
+    from ebeyparser.pricing.text import matched_exclude_keyword
+
+    assert matched_exclude_keyword("Nur Tausch", ex) == "tausch"
+    assert matched_exclude_keyword(ok, ex) is None
+
+
+def test_prefilter_keeps_kein_umtausch_ads():
+    from ebeyparser.config import SearchConfig
+    from ebeyparser.models import Listing
+    from ebeyparser.pricing.estimator import prefilter
+
+    search = SearchConfig(name="gpu", exclude_keywords=["defekt", "tausch", "mining"])
+    listing = Listing(ad_id="1", url="u", title="ZOTAC RTX 3080 Trinity OC LHR 10GB", price=320,
+                      description="Läuft einwandfrei, nie für Mining. Privatverkauf, kein Umtausch.")
+    assert prefilter(listing, search) == (True, [])
+    keep, reasons = prefilter(listing.model_copy(update={"description": "Nur Tausch"}), search)
+    assert not keep and reasons == ["Стоп-слова: «tausch»"]
+
+
+@pytest.mark.parametrize(("title", "query"), [
+    ("MSI NVIDIA RTX 3080 Ti VENTUS 3X 12G OC Gaming Grafikkarte", "rtx 3080 ti"),
+    ("ZOTAC RTX 3080 Trinity OC LHR 10GB GDDR6X – kaum genutzt", "rtx 3080"),
+    ("Gigabyte RTX3090 24GB", "rtx 3090"),
+    ("AMD Radeon RX 7900 XTX", "rx 7900 xtx"),
+    ("Apple iPhone 13 Pro Max 256GB", "apple iphone 13 pro max"),
+])
+def test_make_search_query_keeps_model_and_suffix(title, query):
+    assert make_search_query(title) == query

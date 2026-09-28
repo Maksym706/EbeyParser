@@ -143,6 +143,8 @@ def cmd_once(args: argparse.Namespace) -> int:
     from .monitor import Monitor
 
     config, db = _open(Path(args.config))
+    if args.reevaluate:
+        print(f"♻  Сбросил старые оценки ({db.clear_evaluations()} шт.) — всё найденное оценю заново.")
 
     async def go():
         monitor = Monitor(config, db, web_base_url=_web_base_url(config))
@@ -466,6 +468,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("once", help="одна проверка всех поисков и вывод лучших находок")
     p.add_argument("--top", type=int, default=10)
+    p.add_argument("--reevaluate", action="store_true",
+                   help="переоценить и уже виденные объявления (после изменения настроек)")
     p.set_defaults(func=cmd_once)
 
     p = sub.add_parser("check", help="оценить одно объявление по ссылке")

@@ -15,6 +15,7 @@ from .text import (
     SEVERE_FLAGS,
     detect_red_flags,
     is_wanted_ad,
+    matched_exclude_keyword,
     matches_keywords,
     normalize,
 )
@@ -285,7 +286,7 @@ def prefilter(listing: Listing, search: SearchConfig) -> tuple[bool, list[str]]:
     text = f"{listing.title}\n{listing.description}"
     if is_wanted_ad(listing.title):
         reasons.append("Это объявление о поиске/покупке, а не продажа")
-    hits = [kw for kw in search.exclude_keywords if kw.strip() and matches_keywords(text, [kw], [])]
+    hits = [kw for kw in search.exclude_keywords if kw.strip() and matched_exclude_keyword(text, [kw])]
     if hits:
         reasons.append("Стоп-слова: " + ", ".join(f"«{kw}»" for kw in hits))
     if search.include_keywords and not matches_keywords(text, search.include_keywords, []):

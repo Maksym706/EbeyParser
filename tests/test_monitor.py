@@ -326,3 +326,24 @@ def test_debug_ad_rejects_placeholder_url(capsys):
 
     assert cli.main(["-c", "/nonexistent.yaml", "debug-ad", "https://www.kleinanzeigen.de/s-anzeige/..."]) == 2
     assert "полная ссылка" in capsys.readouterr().out
+
+
+def test_once_reevaluate_clears_old_verdicts(tmp_path, monkeypatch, capsys):
+    from ebeyparser import cli
+    from ebeyparser.models import Evaluation
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"general:\n  data_dir: {tmp_path / 'data'}\n", encoding="utf-8")
+    db = Database(tmp_path / "data" / "ebeyparser.sqlite3")
+    db.upsert_listing(make_listing("9001", "RTX 3080", 300.0))
+    db.save_evaluation(Evaluation(ad_id="9001", verdict="skip"))
+    db.close()
+
+    async def fake_run_once(self):
+        from ebeyparser.models import RunSummary
+        return RunSummary()
+
+    monkeypatch.setattr(Monitor, "run_once", fake_run_once)
+    cli.main(["-c", str(cfg), "once", "--reevaluate"])
+    assert "Сбросил старые оценки (1 шт.)" in capsys.readouterr().out
+    assert Database(tmp_path / "data" / "ebeyparser.sqlite3").get_evaluation("9001") is None
