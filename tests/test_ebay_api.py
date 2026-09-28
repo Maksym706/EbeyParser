@@ -183,3 +183,42 @@ def test_listing_roundtrip_json():
     again = Listing.model_validate_json(listing.model_dump_json())
     assert again == listing
     assert json.loads(listing.model_dump_json())["source"] == "ebay"
+
+
+async def test_rate_limits_app_then_user_fallback():
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path.endswith("/rate_limit/"):
+            return httpx.Response(403, json={"errors": [{"message": "Insufficient permissions"}]})
+        assert request.url.path.endswith("/user_rate_limit/")
+        assert request.url.params["api_context"] == "buy"
+        return httpx.Response(200, json={"rateLimits": [{
+            "apiContext": "buy", "apiName": "Browse", "apiVersion": "v1",
+            "resources": [{"name": "buy.browse", "rates": [{
+                "count": 12, "limit": 5000, "remaining": 4988,
+                "reset": "2026-09-29T07:00:00.000Z", "timeWindow": 86400,
+            }]}],
+        }]})
+
+    client = _client(handler, oauth_token="v^1.1#static")
+    rows = await client.rate_limits()
+    await client.aclose()
+    assert seen[-1].endswith("/user_rate_limit/")
+    assert rows == [{
+        "api": "buy/Browse v1", "resource": "buy.browse", "count": 12, "limit": 5000,
+        "remaining": 4988, "reset": datetime(2026, 9, 29, 7, 0, tzinfo=timezone.utc),
+        "window_seconds": 86400,
+    }]
+
+
+def test_estimate_ebay_calls():
+    from ebeyparser.cli import _estimate_ebay_calls
+    from ebeyparser.config import parse_config
+
+    cfg = parse_config({"general": {"interval_minutes": 15},
+                        "searches": [{"name": "a", "source": "ebay", "query": "x"},
+                                     {"name": "b", "source": "ebay", "query": "y", "max_pages": 2},
+                                     {"name": "c", "query": "z"}]})
+    assert _estimate_ebay_calls(cfg) == (96 + 192, 2)

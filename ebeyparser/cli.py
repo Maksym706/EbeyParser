@@ -225,6 +225,51 @@ def cmd_test_notify(args: argparse.Namespace) -> int:
     return 1 if asyncio.run(go()) else 0
 
 
+def _estimate_ebay_calls(config: AppConfig) -> tuple[int, int]:
+    """Rough daily eBay API usage of the current config: (search calls, per-new-item calls)."""
+    runs_per_day = int(24 * 60 / max(1.0, config.general.interval_minutes))
+    searches = [s for s in config.searches if s.enabled and s.source == "ebay"]
+    search_calls = sum(runs_per_day * (s.max_pages or config.general.max_pages) for s in searches)
+    per_item = (1 if config.general.fetch_details else 0) + 1  # detail + comparables (cached 6 h)
+    return search_calls, per_item
+
+
+def cmd_ebay_limits(args: argparse.Namespace) -> int:
+    from .scraper.ebay_api import EbayAPIError, EbayBrowseClient
+
+    config = load_config(Path(args.config))
+    if not config.ebay.configured:
+        print("✖ Ключи eBay не заданы: впиши EBAY_CLIENT_ID и EBAY_CLIENT_SECRET (или EBAY_OAUTH_TOKEN) в .env")
+        return 2
+
+    async def go():
+        client = EbayBrowseClient(config.ebay)
+        try:
+            return await client.rate_limits(api_context=None if args.all else "buy")
+        finally:
+            await client.aclose()
+
+    try:
+        rows = asyncio.run(go())
+    except EbayAPIError as exc:
+        print(f"✖ {exc}")
+        return 1
+    if not rows:
+        print("eBay не вернул лимитов для этого ключа.")
+        return 1
+    print(f"{'API':<22} {'ресурс':<28} {'использовано':>12} {'лимит':>8} {'осталось':>9}  сброс")
+    for r in rows:
+        window = r["window_seconds"]
+        per = "/день" if window == 86400 else f"/{window}с" if window else ""
+        reset = r["reset"].astimezone().strftime("%d.%m %H:%M") if r["reset"] else "—"
+        print(f"{r['api']:<22} {r['resource']:<28} {r['count'] if r['count'] is not None else '—':>12} "
+              f"{str(r['limit']) + per:>8} {r['remaining'] if r['remaining'] is not None else '—':>9}  {reset}")
+    search_calls, per_item = _estimate_ebay_calls(config)
+    print(f"\nТвои настройки: ~{search_calls} поисковых запросов в день к eBay "
+          f"+ до {per_item} запроса на каждое новое объявление.")
+    return 0
+
+
 def cmd_ai_check(args: argparse.Namespace) -> int:
     from .monitor import Monitor
 
@@ -278,6 +323,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("demo", help="заполнить базу демо-данными для просмотра интерфейса").set_defaults(func=cmd_demo)
     sub.add_parser("test-notify", help="отправить тестовое уведомление").set_defaults(func=cmd_test_notify)
     sub.add_parser("ai-check", help="проверить, доступна ли локальная модель").set_defaults(func=cmd_ai_check)
+    p = sub.add_parser("ebay-limits", help="показать лимиты запросов твоего ключа eBay")
+    p.add_argument("--all", action="store_true", help="все API, а не только Buy (Browse)")
+    p.set_defaults(func=cmd_ebay_limits)
     return parser
 
 

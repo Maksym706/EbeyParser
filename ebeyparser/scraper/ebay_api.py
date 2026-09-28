@@ -303,6 +303,32 @@ class EbayBrowseClient:
                 break
         return comps
 
+    async def rate_limits(self, api_context: str | None = "buy") -> list[dict[str, Any]]:
+        """Exact call quotas of *your* key (eBay Developer Analytics API).
+        Tries the application limits first, then the user-token limits."""
+        params = {"api_context": api_context} if api_context else None
+        try:
+            data = await self._get("/developer/analytics/v1_beta/rate_limit/", params)
+        except EbayAPIError as app_error:
+            try:
+                data = await self._get("/developer/analytics/v1_beta/user_rate_limit/", params)
+            except EbayAPIError:
+                raise app_error
+        rows: list[dict[str, Any]] = []
+        for api in data.get("rateLimits") or []:
+            for resource in api.get("resources") or []:
+                for rate in resource.get("rates") or []:
+                    rows.append({
+                        "api": f"{api.get('apiContext', '')}/{api.get('apiName', '')} {api.get('apiVersion', '')}".strip(),
+                        "resource": resource.get("name", ""),
+                        "count": rate.get("count"),
+                        "limit": rate.get("limit"),
+                        "remaining": rate.get("remaining"),
+                        "reset": _parse_dt(rate.get("reset")),
+                        "window_seconds": rate.get("timeWindow"),
+                    })
+        return rows
+
     async def download_images(self, listing: Listing, max_images: int = 3) -> list[bytes]:
         images: list[bytes] = []
         for url in listing.image_urls[:max_images]:

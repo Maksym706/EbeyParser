@@ -104,6 +104,7 @@ python -m ebeyparser run --no-monitor
 | `python -m ebeyparser check <ссылка> --purpose personal --target 300` | то же, но для себя с бюджетом |
 | `python -m ebeyparser test-notify` | отправить тестовое уведомление на почту / в Telegram |
 | `python -m ebeyparser ai-check` | проверить локальную модель |
+| `python -m ebeyparser ebay-limits` | сколько запросов к eBay API осталось на твоём ключе и сколько их тратят твои настройки |
 | `python -m ebeyparser demo` | демо-данные для просмотра интерфейса |
 
 Общие опции: `-c путь/к/config.yaml`, `-v` (подробный лог).
@@ -159,7 +160,7 @@ searches:
    EBAY_CLIENT_ID=<App ID (Client ID)>
    EBAY_CLIENT_SECRET=<Cert ID (Client Secret)>
    ```
-   Программа сама получает и обновляет токен. Разовый токен `v^1.1#...` (`EBAY_OAUTH_TOKEN`) тоже работает, но живёт всего около двух часов, поэтому для 24/7 нужны ключи.
+   Программа сама получает и обновляет токен. Лимиты ключа: `python -m ebeyparser ebay-limits`; обычно Browse API даёт 5 000 запросов в день, больше можно запросить у eBay через Application Growth Check. Разовый токен `v^1.1#...` (`EBAY_OAUTH_TOKEN`) тоже работает, но живёт всего около двух часов, поэтому для 24/7 нужны ключи.
 
 > Никогда не коммить `.env` и не публикуй токены. `.env` уже добавлен в `.gitignore`.
 
