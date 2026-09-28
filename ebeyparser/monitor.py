@@ -269,20 +269,27 @@ class Monitor:
         summary.listings_seen += len(listings)
 
         todo: list[Listing] = []
+        new_here = 0
         for listing in listings:
             listing.search_name = search.name
             previous = self.db.get_listing(listing.ad_id)
             self.db.upsert_listing(listing)
             if previous is None:
                 todo.append(listing)
-                summary.new_listings += 1
-            elif _price_dropped(previous, listing):
-                log.info("Price drop on %s: %s -> %s", listing.ad_id, previous.price, listing.price)
+                new_here += 1
+            elif self.db.get_evaluation(listing.ad_id) is None:
+                # seen before but never evaluated (run interrupted / failed): retry it
                 todo.append(self.db.get_listing(listing.ad_id) or listing)
+            elif _price_dropped(previous, listing):
+                log.info("Цена снизилась: %s %s € → %s €", listing.title[:50], previous.price, listing.price)
+                todo.append(self.db.get_listing(listing.ad_id) or listing)
+        summary.new_listings += new_here
         todo = todo[: self.config.general.max_new_per_search]
+        log.info("🔎 %s: объявлений %d, новых %d, к оценке %d", search.name, len(listings), new_here, len(todo))
 
         to_notify: list[DealView] = []
-        for listing in todo:
+        for i, listing in enumerate(todo, 1):
+            log.info("   [%d/%d] %s — %s", i, len(todo), listing.title[:60], listing.price_text or "цена ?")
             try:
                 evaluation = await self.evaluate_listing(listing, search)
             except BlockedError:
@@ -292,6 +299,8 @@ class Monitor:
                 summary.errors.append(f"{search.name} / {listing.title[:40]}: {exc}")
                 continue
             summary.evaluated += 1
+            log.info("         → %s, балл %.0f%s", _VERDICT_RU.get(evaluation.verdict, evaluation.verdict),
+                     evaluation.score, _profit_note(evaluation))
             if evaluation.verdict == "buy":
                 summary.deals_found += 1
             if self._should_notify(evaluation):
@@ -485,6 +494,19 @@ class Monitor:
                 self.db.mark_notified(deal.listing.ad_id, notifier.name)
                 delivered.add(deal.listing.ad_id)
         return len(delivered)
+
+
+_VERDICT_RU = {"buy": "ПОКУПАТЬ", "maybe": "подумать", "skip": "пропустить"}
+
+
+def _profit_note(ev: Evaluation) -> str:
+    if ev.expected_profit is None:
+        return ""
+    label = "экономия" if ev.purpose == "personal" else "прибыль"
+    note = f", {label} ≈ {ev.expected_profit:.0f} €"
+    if ev.estimate.market_price is not None:
+        note += f" (рынок ~{ev.estimate.market_price:.0f} €)"
+    return note
 
 
 def _price_dropped(previous: Listing, current: Listing) -> bool:

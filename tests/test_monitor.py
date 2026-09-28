@@ -306,3 +306,23 @@ def test_ai_check_lists_models_and_fixes_config(tmp_path, monkeypatch, capsys):
     assert "google/gemma-3-12b   ← умеет смотреть фото" in out and "ai-check --fix" in out
     assert cli.main(["-c", str(cfg), "ai-check", "--fix"]) == 0
     assert "  model: google/gemma-3-12b\n" in cfg.read_text(encoding="utf-8")
+
+
+async def test_listings_stored_but_not_evaluated_are_retried():
+    """A run interrupted (Ctrl+C) after storing listings must not lose them."""
+    listing = make_listing("8001", "Gigabyte RTX 3080 Gaming OC", 250.0)
+    monitor, db, source, notifier = build(config(), [listing], verdict=GOOD_AI)
+    db.upsert_listing(listing.model_copy(update={"search_name": "GPU"}))  # seen, never evaluated
+    summary = await monitor.run_once()
+    assert summary.new_listings == 0 and summary.evaluated == 1
+    assert db.get_evaluation("8001").verdict == "buy"
+    assert notifier.sent == [["8001"]]
+    again = await monitor.run_once()
+    assert again.evaluated == 0  # evaluated ones are not repeated
+
+
+def test_debug_ad_rejects_placeholder_url(capsys):
+    from ebeyparser import cli
+
+    assert cli.main(["-c", "/nonexistent.yaml", "debug-ad", "https://www.kleinanzeigen.de/s-anzeige/..."]) == 2
+    assert "полная ссылка" in capsys.readouterr().out

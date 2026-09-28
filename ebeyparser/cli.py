@@ -151,6 +151,8 @@ def cmd_once(args: argparse.Namespace) -> int:
         finally:
             await monitor.aclose()
 
+    print("⏳ Проверяю поиски. Каждое новое объявление: страница, цены аналогов, фото и нейросеть —"
+          " первый запуск может занять 10–20 минут, прогресс ниже.")
     summary = asyncio.run(go())
     print(f"\nПоисков: {summary.searches} · объявлений: {summary.listings_seen} · новых: "
           f"{summary.new_listings} · оценено: {summary.evaluated} · выгодных: {summary.deals_found}"
@@ -329,11 +331,21 @@ def cmd_debug_ad(args: argparse.Namespace) -> int:
 
     config = load_config(Path(args.config))
 
+    from .monitor import ad_id_from_url
+
+    if not ad_id_from_url(args.url) or "ebay." in args.url:
+        print("✖ Нужна полная ссылка на объявление Kleinanzeigen, например\n"
+              "  https://www.kleinanzeigen.de/s-anzeige/gigabyte-rtx-3080/3525778616-225-3331")
+        return 2
+
     async def go() -> int:
         client = PoliteClient.from_config(config.general)
         scraper = KleinanzeigenScraper(client, debug_dir=config.data_path / "debug")
         try:
             html = await client.get_text(args.url)
+        except Exception as exc:
+            print(f"✖ Не удалось открыть объявление: {exc}")
+            return 1
         finally:
             await client.aclose()
         print(f"итоговый URL: {client.last_url}  (HTTP {client.last_status}), {len(html) // 1024} КБ")
