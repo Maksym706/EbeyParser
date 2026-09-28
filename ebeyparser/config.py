@@ -89,6 +89,11 @@ class GeneralConfig(BaseModel):
     max_details_per_run: int = 40
     max_ai_per_run: int = 30
     min_listing_price: float = 10.0  # ignore cheaper paid ads (junk); free ads are still considered
+    # Ban protection: hard cap of HTML pages per hour per site, and a growing, persisted cooldown
+    # after 403/429/captcha (hours for the 1st, 2nd, 3rd, ... block in a row).
+    max_requests_per_hour: int = 150
+    block_cooldown_hours: list[float] = Field(default_factory=lambda: [1.0, 2.0, 4.0, 12.0])
+    baseline_first_run: bool = True  # first pass of a NEW search only learns prices, no alerts
 
     @field_validator("request_delay_seconds", mode="before")
     @classmethod
@@ -110,6 +115,11 @@ class PricingConfig(BaseModel):
     use_ebay_sold_comps: bool = True
     comps_limit: int = 30
     use_price_history: bool = True  # learn prices from every ad seen; estimate without extra requests
+    vb_expected_discount: float = 0.10  # "VB" ads usually go ~10 % below the asking price
+    max_capital: float | None = None  # never recommend buying above this (your budget)
+    min_comparables: int = 6  # fewer data points -> at most "maybe"
+    max_price_spread: float = 0.4  # IQR/median above this -> market too unclear -> at most "maybe"
+    paypal_fixed_fee: float = 0.0  # e.g. 0.35 for PayPal goods & services
     history_days: int = 60
     history_min_points: int = 6
     reference_prices: list[ReferencePrice] = Field(default_factory=list)

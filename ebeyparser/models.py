@@ -95,6 +95,14 @@ class AIVerdict(BaseModel):
     confidence: float = 0.0  # 0..1
     reasoning: str = ""  # short explanation in Russian
     model: str = ""
+    # structured extraction (v0.2): what the photos/text show, used for hard vetoes in code
+    item_type: Literal[
+        "single", "bundle", "complete_pc", "laptop", "part", "accessory", "box_only", "wanted", "unclear"
+    ] = "unclear"
+    variant: dict[str, str] = Field(default_factory=dict)  # e.g. {"model": "iPhone 13", "storage_gb": "128"}
+    defects: list[str] = Field(default_factory=list)
+    locked: bool | None = None  # iCloud / activation / account lock visible or mentioned
+    stock_photos: bool | None = None  # photos look like catalogue/internet images
 
 
 class Evaluation(BaseModel):
@@ -107,6 +115,10 @@ class Evaluation(BaseModel):
     ai: AIVerdict | None = None  # local model
     ai_second: AIVerdict | None = None  # optional second opinion (e.g. Claude)
     max_buy_price: float | None = None  # highest price/bid that still meets your profit targets
+    # what to do: buy now / haggle (VB, offer_price) / bid (auction, up to max_buy_price) / watch
+    action: Literal["buy", "haggle", "bid", "watch", "skip", ""] = ""
+    offer_price: float | None = None  # suggested offer for VB / Preisvorschlag
+    ai_checked: bool | None = None  # False = AI enabled but unavailable -> photos NOT checked
     fees: float = 0.0  # selling fees when reselling
     shipping_cost: float = 0.0
     expected_profit: float | None = None  # resale: net profit; personal: savings vs market
@@ -141,3 +153,11 @@ class RunSummary(BaseModel):
     deals_found: int = 0  # verdict == "buy"
     notified: int = 0
     errors: list[str] = Field(default_factory=list)
+    # funnel (v0.2): how much work the pass did and what it saved
+    prefiltered: int = 0  # dropped by free checks (keywords, wanted ad, below min price)
+    early_skips: int = 0  # market known without requests and no deal -> no ad page / AI
+    history_hits: int = 0  # market price taken from our own price history
+    comps_lookups: int = 0  # comparables searches that went to the network (cache hits are free)
+    details_fetched: int = 0  # ad pages opened
+    ai_calls: int = 0  # local AI evaluations
+    deferred: int = 0  # left for the next pass because a budget was used up
