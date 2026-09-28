@@ -580,3 +580,44 @@ def test_prefilter_keeps_kein_umtausch_ads():
 ])
 def test_make_search_query_keeps_model_and_suffix(title, query):
     assert make_search_query(title) == query
+
+
+@pytest.mark.parametrize(("query", "title", "relevant"), [
+    ("rtx 3080", "Gigabyte GeForce RTX 3080 Gaming OC 10G", True),
+    ("rtx 3080", "RTX3080 MSI Ventus", True),
+    ("rtx 3080", "Gaming PC mit RTX 3080, Ryzen 7 5800X, 32GB", False),
+    ("rtx 3080", "Gaming-PC RTX 3080", False),
+    ("rtx 3080", "MSI RTX 3080 Ti Suprim X", False),
+    ("rtx 3080", "RTX 3080Ti Founders Edition", False),
+    ("rtx 3080", "EVGA RTX 3080 FTW3 Kühler", False),
+    ("rtx 3080", "Alphacool Eisblock RTX 3080 waterblock", False),
+    ("rtx 3080", "Laptop Lenovo Legion RTX 3080", False),
+    ("rtx 3080", "Suche RTX 3080", False),
+    ("rtx 3080", "RTX 3080 defekt", False),
+    ("rtx 3080", "RTX 3070", False),
+    ("rtx 3080 ti", "MSI RTX 3080 Ti Suprim X", True),
+    ("apple iphone 13 pro max", "iPhone 13 Pro Max 256GB Graphit", True),
+    ("apple iphone 13", "Apple iPhone 13 Pro 128GB", False),
+    ("apple iphone 13", "iPhone 13 128GB", True),
+    ("lenovo thinkpad t480", "Lenovo ThinkPad T480 Laptop i5 16GB", True),
+    ("sony ps5", "PS5 Disc Edition", True),
+])
+def test_comparable_relevance(query, title, relevant):
+    from ebeyparser.pricing.estimator import comparable_is_relevant
+
+    assert comparable_is_relevant(query, title) is relevant
+
+
+def test_gaming_pcs_no_longer_inflate_gpu_market_price():
+    from ebeyparser.models import Comparable
+    from ebeyparser.pricing.estimator import estimate_from_comparables, relevant_comparables
+
+    cards = [Comparable(title=f"RTX 3080 {b}", price=p, source="kleinanzeigen")
+             for b, p in [("MSI", 380), ("Zotac", 350), ("Asus TUF", 420), ("Palit", 400), ("Gigabyte", 390)]]
+    pcs = [Comparable(title=f"Gaming PC RTX 3080 Ryzen {i}", price=1100 + 50 * i, source="kleinanzeigen")
+           for i in range(8)]
+    tis = [Comparable(title="RTX 3080 Ti", price=560, source="kleinanzeigen")] * 3
+    everything = cards + pcs + tis
+    assert estimate_from_comparables(everything, asking_price_discount=0.85).market_price > 700
+    clean = estimate_from_comparables(relevant_comparables("rtx 3080", everything), asking_price_discount=0.85)
+    assert clean.sample_size == 5 and 320 <= clean.market_price <= 350

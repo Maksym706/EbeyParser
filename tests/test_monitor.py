@@ -372,3 +372,25 @@ def test_broken_config_gives_readable_error(tmp_path, capsys):
     cfg.write_text("pricing:\n  min_profit: много\n", encoding="utf-8")
     assert cli.main(["-c", str(cfg), "once"]) == 2
     assert "pricing.min_profit" in capsys.readouterr().out
+
+
+def test_cross_check_prefers_careful_market_price():
+    from ebeyparser.models import PriceEstimate
+    from ebeyparser.monitor import _cross_check
+
+    est = PriceEstimate(market_price=850, source="kleinanzeigen", sample_size=20)
+    low_ai = AIVerdict(estimated_market_price=420, confidence=0.7, verdict="buy")
+    checked = _cross_check(est, low_ai)
+    assert checked.market_price == pytest.approx(566.67, abs=0.01) and "осторожную" in checked.notes
+    assert _cross_check(est, AIVerdict(estimated_market_price=800, confidence=0.7)).market_price == 850
+    assert _cross_check(est, AIVerdict(estimated_market_price=420, confidence=0.0)).market_price == 850
+    ref = PriceEstimate(market_price=850, source="reference")
+    assert _cross_check(ref, low_ai).market_price == 850
+
+
+async def test_warns_when_almost_everything_is_a_buy():
+    listings = [make_listing(str(9100 + i), f"RTX 3080 #{i}", 200.0) for i in range(6)]
+    monitor, db, _, _ = build(config(), listings, verdict=GOOD_AI)
+    summary = await monitor.run_once()
+    assert summary.deals_found == 6
+    assert any("оценка рынка завышена" in e for e in summary.errors)

@@ -115,6 +115,75 @@ def _asking_where(comps: list[Comparable]) -> str:
     return ""
 
 
+# Words that mean "a whole computer" or "a part/accessory", not the component itself.
+_BUNDLE_WORDS = frozenset({
+    "pc", "gamingpc", "rechner", "computer", "komplettsystem", "komplett", "tower", "laptop",
+    "notebook", "setup", "konvolut", "bundle", "system", "workstation", "server", "barebone",
+})
+_PART_WORDS = frozenset({
+    "kuehler", "cooler", "kuehlung", "waterblock", "wasserblock", "wasserkuehler", "wasserkuehlung",
+    "eisblock", "eiswolf", "backplate", "halterung", "stuetze", "luefter", "fan", "fans", "shroud",
+    "kabel", "adapter", "riser", "bracket", "anti", "sag", "gehaeuse", "netzteil", "mainboard",
+})
+_SUFFIXES = frozenset({"ti", "super", "xt", "xtx", "pro", "max", "plus", "ultra", "mini"})
+# sellers often leave the brand out: "PS5 Disc" for "Sony PS5", "Mac mini" for "Apple Mac mini"
+_OPTIONAL_BRANDS = frozenset({
+    "apple", "sony", "samsung", "lenovo", "dell", "hp", "asus", "acer", "msi", "gigabyte", "nvidia",
+    "amd", "intel", "microsoft", "nintendo", "bosch", "makita", "dewalt", "dyson", "canon", "nikon",
+    "lg", "xiaomi", "google", "huawei", "philips", "logitech", "razer", "corsair", "geforce", "radeon",
+})
+_COMPONENT_QUERY_RE = re.compile(
+    r"\b(?:rtx|gtx|rx|arc|radeon|geforce|ddr\d|ryzen|i[3579]|xeon|threadripper)\b|\b\d{4,5}[a-z]{0,2}\b"
+)
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text)
+
+
+def _has_word(words: list[str], squashed: str, token: str) -> bool:
+    return any(w.startswith(token) for w in words) or (token.isalnum() and _squash(token) in squashed and any(
+        c.isdigit() for c in token))
+
+
+def comparable_is_relevant(query: str, title: str) -> bool:
+    """Is `title` the same kind of item as `query` (not a PC with it inside, a cooler for it,
+    the Ti version of it, a broken one or someone looking to buy it)?"""
+    q_words = normalize(query).split()
+    t_norm = normalize(title)
+    t_words = t_norm.split()
+    t_squashed = _squash(t_norm)
+    if not q_words or not t_words:
+        return False
+    # every query word must be there (numbers exactly, words by prefix: "grafikkarte" ~ "grafikkarten")
+    missing = [w for w in q_words if w not in _OPTIONAL_BRANDS and not _has_word(t_words, t_squashed, w)]
+    if missing and (len(q_words) <= 3 or len(missing) > 1 or any(c.isdigit() for m in missing for c in m)):
+        return False
+    q_set = set(q_words)
+    # "rtx 3080" must not match "rtx 3080 ti" / "3080ti"; "iphone 13" not "iphone 13 pro"
+    for i, w in enumerate(t_words):
+        if any(c.isdigit() for c in w):
+            base = re.match(r"^([a-z]*\d+)([a-z]+)?$", w)
+            glued = base.group(2) if base else None
+            if glued in _SUFFIXES and glued not in q_set and base.group(1) in q_set:
+                return False
+            if w in q_set and i + 1 < len(t_words) and t_words[i + 1] in _SUFFIXES and t_words[i + 1] not in q_set:
+                return False
+    if _COMPONENT_QUERY_RE.search(" ".join(q_words)) and not q_set & _BUNDLE_WORDS:
+        if set(t_words) & _BUNDLE_WORDS or "gamingpc" in t_squashed:
+            return False
+    if not q_set & _PART_WORDS and set(t_words) & _PART_WORDS:
+        return False
+    if is_wanted_ad(title) or any(f in SEVERE_FLAGS for f in detect_red_flags(title)):
+        return False
+    return True
+
+
+def relevant_comparables(query: str, comps: list[Comparable]) -> list[Comparable]:
+    """Drop comparables that are a different product (see comparable_is_relevant)."""
+    return [c for c in comps if comparable_is_relevant(query, c.title)]
+
+
 def estimate_from_comparables(
     comps: list[Comparable], *, asking_price_discount: float = 0.85, query: str = ""
 ) -> PriceEstimate:
@@ -618,6 +687,8 @@ def evaluate(
         basis = _basis_reason(est)
         if basis:
             reasons.append(basis)
+        if "осторожную оценку" in (est.notes or ""):
+            reasons.append("⚠ " + est.notes.split(". ")[-1])
 
     # AI-only market price is a guess: "buy" needs the AI to be sure as well
     if est.source == "ai" and verdict == "buy" and not ai_buy_strong:

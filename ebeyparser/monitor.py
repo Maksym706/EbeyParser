@@ -22,10 +22,11 @@ from .ai.claude import make_llm
 from .ai.evaluator import AIEvaluator
 from .config import AppConfig, SearchConfig
 from .db import Database
-from .models import DealView, Evaluation, Listing, PriceEstimate, RunSummary, utcnow
+from .models import AIVerdict, DealView, Evaluation, Listing, PriceEstimate, RunSummary, utcnow
 from .notify.base import build_notifiers
 from .pricing.estimator import (
     estimate_from_comparables,
+    relevant_comparables,
     evaluate,
     find_reference_price,
     prefilter,
@@ -308,6 +309,13 @@ class Monitor:
                 deal = self.db.get_deal(listing.ad_id)
                 if deal is not None:
                     to_notify.append(deal)
+        if len(todo) >= 6 and summary_buy_share(self.db, todo) >= 0.7:
+            warning = (
+                f"{search.name}: «покупать» у большинства объявлений — похоже, оценка рынка завышена."
+                " Проверь цены вручную или задай reference_price для этого поиска."
+            )
+            log.warning(warning)
+            summary.errors.append(warning)
         return to_notify
 
     # ------------------------------------------------------------ evaluation
@@ -355,6 +363,7 @@ class Monitor:
                 ai_estimate = await self._estimate(listing, search, query=verdict.search_query)
                 if ai_estimate.market_price is not None:
                     estimate = ai_estimate
+            estimate = _cross_check(estimate, verdict)
 
         evaluation = evaluate(listing, estimate, verdict, search, self.config.pricing)
         evaluation = await self._maybe_second_opinion(listing, search, estimate, evaluation, source)
@@ -461,8 +470,12 @@ class Monitor:
             except Exception as exc:
                 log.warning("Kleinanzeigen comps for %r failed: %s", query, exc)
 
+        relevant = relevant_comparables(query, comps)
+        if len(relevant) < len(comps):
+            log.debug("Comparables for %r: kept %d of %d (dropped PCs, parts, other models...)",
+                      query, len(relevant), len(comps))
         estimate = estimate_from_comparables(
-            comps, asking_price_discount=pricing.asking_price_discount, query=query
+            relevant, asking_price_discount=pricing.asking_price_discount, query=query
         )
         self._comps_cache[key] = (time.monotonic(), estimate)
         return estimate
@@ -495,6 +508,31 @@ class Monitor:
                 self.db.mark_notified(deal.listing.ad_id, notifier.name)
                 delivered.add(deal.listing.ad_id)
         return len(delivered)
+
+
+def summary_buy_share(db: Database, listings: list[Listing]) -> float:
+    verdicts = [ev.verdict for l in listings if (ev := db.get_evaluation(l.ad_id)) is not None]
+    return sum(v == "buy" for v in verdicts) / len(verdicts) if verdicts else 0.0
+
+
+def _cross_check(estimate: PriceEstimate, verdict: AIVerdict | None) -> PriceEstimate:
+    """Comparables say one thing, the model (which saw the photos) another: be careful —
+    for buying decisions an inflated market price is the expensive mistake."""
+    if (
+        verdict is None or verdict.confidence <= 0 or not verdict.estimated_market_price
+        or estimate.market_price is None or estimate.source == "reference"
+    ):
+        return estimate
+    ai_price = verdict.estimated_market_price
+    if estimate.market_price > ai_price * 1.5:
+        careful = round(max(ai_price, estimate.market_price / 1.5), 2)
+        note = (f"Аналоги дают ~{estimate.market_price:.0f} €, нейросеть ~{ai_price:.0f} € —"
+                f" взял осторожную оценку {careful:.0f} €")
+        return estimate.model_copy(update={
+            "market_price": careful,
+            "notes": f"{estimate.notes}. {note}" if estimate.notes else note,
+        })
+    return estimate
 
 
 _VERDICT_RU = {"buy": "ПОКУПАТЬ", "maybe": "подумать", "skip": "пропустить"}
