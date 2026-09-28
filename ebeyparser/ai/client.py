@@ -161,7 +161,7 @@ class VisionLLM:
         images = [img for img in (images or []) if img]
         if self.provider == "ollama":
             return await self._chat_ollama(system, user, images, schema)
-        return await self._chat_openai(system, user, images)
+        return await self._chat_openai(system, user, images, schema)
 
     async def _chat_ollama(
         self, system: str, user: str, images: list[bytes], schema: dict | None
@@ -191,7 +191,9 @@ class VisionLLM:
             raise LLMError(f"Неожиданный ответ Ollama: {json.dumps(data)[:200]}") from exc
         return content if isinstance(content, str) else json.dumps(content)
 
-    async def _chat_openai(self, system: str, user: str, images: list[bytes]) -> str:
+    async def _chat_openai(
+        self, system: str, user: str, images: list[bytes], schema: dict | None = None
+    ) -> str:
         if images:
             content: Any = [{"type": "text", "text": user}] + [
                 {
@@ -210,15 +212,28 @@ class VisionLLM:
             ],
             "temperature": self.cfg.temperature,
             "stream": False,
-            "response_format": {"type": "json_object"},
         }
+        # Strictest first: json_schema (LM Studio, llama.cpp, vLLM constrain the output to
+        # the schema), then json_object, then plain text (the prompt demands JSON anyway).
+        formats: list[dict[str, Any] | None] = [{"type": "json_object"}, None]
+        if schema:
+            formats.insert(0, {
+                "type": "json_schema",
+                "json_schema": {"name": "verdict", "strict": True, "schema": schema},
+            })
         url = self._chat_url()
-        resp = await self._request("POST", url, payload)
-        if resp.status_code in (400, 422) and "response_format" in resp.text.lower():
-            # e.g. LM Studio only accepts json_schema; the prompt demands JSON anyway
-            log.info("Server rejected response_format, retrying without it")
-            payload.pop("response_format")
+        for i, fmt in enumerate(formats):
+            if fmt is None:
+                payload.pop("response_format", None)
+            else:
+                payload["response_format"] = fmt
             resp = await self._request("POST", url, payload)
+            rejected = resp.status_code in (400, 422) and any(
+                word in resp.text.lower() for word in ("response_format", "json_schema", "json_object")
+            )
+            if not rejected or i == len(formats) - 1:
+                break
+            log.info("Server rejected response_format %s, trying a simpler one", fmt and fmt["type"])
         if resp.status_code >= 400:
             raise self._http_error(resp)
         data = self._json(resp)

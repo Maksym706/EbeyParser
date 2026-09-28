@@ -286,8 +286,14 @@ def cmd_ai_check(args: argparse.Namespace) -> int:
             print(f"   Установленные модели: {', '.join(health['models'])}")
         if config.ai.provider == "ollama":
             print(f"   Скачай её: ollama pull {health['model']}")
+        else:
+            print("   LM Studio: скачай vision-модель во вкладке Discover и впиши в ai.model её "
+                  "идентификатор из списка выше (или просто загрузи её в LM Studio).")
         return 1
     print(f"✖ Модель недоступна: {health.get('error')}")
+    if config.ai.provider == "openai":
+        print("   LM Studio: вкладка Developer → Start Server (или команда `lms server start`), "
+              "адрес по умолчанию http://localhost:1234/v1")
     return 1
 
 

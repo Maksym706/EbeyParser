@@ -111,6 +111,10 @@ ai:
   max_images: 3                 # сколько фото показывать модели
   timeout_seconds: 240
   run_for: promising            # promising — только перспективные (быстрее), all — все подряд
+  # ── LM Studio вместо Ollama ──
+  # provider: openai
+  # base_url: http://localhost:1234/v1
+  # model: qwen2.5-vl-7b-instruct     # идентификатор модели из LM Studio (команда ai-check покажет список)
 
   # Необязательно: «второе мнение» от Claude (облако, платно) — только для лучших находок.
   # Нужен ключ ANTHROPIC_API_KEY в .env и пакет:  pip install anthropic

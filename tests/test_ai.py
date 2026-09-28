@@ -372,7 +372,10 @@ async def test_openai_body_with_data_urls_and_auth():
     assert req.headers["authorization"] == "Bearer sk-local"
     body = rec.body()
     assert body["model"] == "qwen2-vl"
-    assert body["response_format"] == {"type": "json_object"}
+    assert body["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "verdict", "strict": True, "schema": VERDICT_SCHEMA},
+    }
     assert body["temperature"] == 0.2
     assert body["messages"][0] == {"role": "system", "content": "SYS"}
     parts = body["messages"][1]["content"]
@@ -404,6 +407,18 @@ async def test_openai_retries_without_response_format():
     assert len(rec.requests) == 2
     assert "response_format" in rec.body(0)
     assert "response_format" not in rec.body(1)
+
+
+async def test_openai_falls_back_from_json_schema_to_json_object():
+    rec = Recorder(
+        httpx.Response(400, json={"error": "response_format json_schema is not supported"}),
+        openai_reply('{"verdict": "buy"}'),
+    )
+    llm = make_llm(rec, provider="openai", base_url="http://localhost:1234")
+    out = await llm.chat_json("s", "u", [JPEG], VERDICT_SCHEMA)
+    assert out == '{"verdict": "buy"}'
+    assert rec.body(0)["response_format"]["type"] == "json_schema"
+    assert rec.body(1)["response_format"] == {"type": "json_object"}
 
 
 async def test_openai_other_400_is_error_without_retry():

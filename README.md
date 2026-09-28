@@ -76,7 +76,24 @@ python -m ebeyparser ai-check    # проверит, что модель дос�
 
 `llama3.2-vision` в Ollama принимает только одно фото (`max_images: 1`) и слабее по-русски.
 
-Вместо Ollama можно использовать **LM Studio** или **llama.cpp server**: `provider: openai`, `base_url: http://localhost:1234/v1`.
+### LM Studio вместо Ollama
+
+Если удобнее программа с интерфейсом, подойдёт **[LM Studio](https://lmstudio.ai)**:
+
+1. Во вкладке **Discover** скачай vision-модель, например `Qwen2.5-VL-7B-Instruct` (для слабого ПК — версия 3B или `Gemma 3 4B`).
+2. Загрузи её и поставь **Context Length не меньше 8192** (три фото занимают много токенов).
+3. Вкладка **Developer → Start Server** (или `lms server start`). В настройках включи автозапуск сервера при входе в систему, чтобы всё работало 24/7.
+4. В `config.yaml`:
+   ```yaml
+   ai:
+     enabled: true
+     provider: openai
+     base_url: http://localhost:1234/v1
+     model: qwen2.5-vl-7b-instruct
+   ```
+5. `python -m ebeyparser ai-check` покажет, видит ли программа модель, и выведет точные идентификаторы моделей.
+
+Так же работают **llama.cpp server** и **vLLM**: `provider: openai` и их адрес.
 
 ### Запуск
 
