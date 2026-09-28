@@ -216,6 +216,7 @@ class WebConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8000
     run_monitor: bool = True  # run the monitor loop inside the web server
+    allowed_hosts: list[str] = Field(default_factory=list)  # extra host names allowed to open the web UI
 
 
 class AppConfig(BaseModel):

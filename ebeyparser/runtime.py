@@ -18,9 +18,16 @@ LOG_FILE = "ebeyparser.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUPS = 5
 LOCK_FILE = "ebeyparser.lock"
+HTTP_STATE_FILE = "http_state.json"  # hourly page window + block cooldowns, shared by monitor/CLI/web
 _LOCK_OFFSET = 1 << 20  # Windows locks a byte far behind the PID text, so others can still read it
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def http_state_path(data_dir: str | Path) -> Path:
+    """Where PoliteClient keeps its hourly page window and block cooldowns (one file for all
+    commands, so a diagnostic run can't sneak past a cooldown the monitor is waiting out)."""
+    return Path(data_dir) / HTTP_STATE_FILE
 
 
 # ------------------------------------------------------------------ console
@@ -195,6 +202,7 @@ __all__ = [
     "InstanceLock",
     "file_logging",
     "force_utf8_console",
+    "http_state_path",
     "keep_awake",
     "onedrive_warning",
 ]

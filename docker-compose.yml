@@ -22,7 +22,10 @@ services:
       - ollama
     env_file: .env
     environment:
-      OLLAMA_URL: http://ollama:11434
+      # inside Docker the AI runs in the "ollama" container, not LM Studio on the host
+      AI_PROVIDER: ollama
+      AI_BASE_URL: http://ollama:11434
+      AI_MODEL: qwen2.5vl:7b
     volumes:
       - ./config.yaml:/app/config.yaml
       - ./data:/app/data

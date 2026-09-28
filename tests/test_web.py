@@ -765,3 +765,51 @@ def test_network_mode_requires_token(db: Database, monkeypatch: pytest.MonkeyPat
         assert c.get("/api/docs").status_code == 404  # no API docs in network mode
     with TestClient(app, base_url="http://pc.tail1234.ts.net") as c:
         assert c.get("/api/stats", headers={"X-EbeyParser-Token": token}).status_code == 200
+
+
+def _blocked_state(path: Path) -> None:
+    """A real PoliteClient that got HTTP 403 once: cooldown + strike persisted to `path`."""
+    import httpx
+
+    from ebeyparser.scraper.http import BlockedError, PoliteClient
+
+    async def go() -> None:
+        client = PoliteClient(delay_range=(0, 0), max_retries=0, state_path=path, max_requests_per_hour=150,
+                              transport=httpx.MockTransport(lambda request: httpx.Response(403, text="nope")))
+        with pytest.raises(BlockedError):
+            await client.get_text("https://www.kleinanzeigen.de/s-handy-telefon/c173")
+        await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_status_page_shows_site_limits_and_cooldown(tmp_path: Path, db: Database) -> None:
+    config = AppConfig()
+    config.general.data_dir = str(tmp_path)
+    with TestClient(create_app(config, db), base_url=LOCAL) as c:
+        html = c.get("/status").text
+    assert "Запросы к сайтам и защита от блокировки" in html and "Запросов к сайтам пока не было" in html
+    state = tmp_path / "http_state.json"
+    _blocked_state(state)
+    before = state.read_text(encoding="utf-8")
+    with TestClient(create_app(config, db), base_url=LOCAL) as c:
+        html = c.get("/status").text
+    assert "www.kleinanzeigen.de" in html and "пауза до" in html and "пауза после блокировки" in html
+    assert state.read_text(encoding="utf-8") == before  # the page only reads the shared state
+
+    class LimitsMonitor(FakeMonitor):
+        def http_status(self) -> dict[str, Any]:
+            return {"www.kleinanzeigen.de": {"requests_last_hour": 150, "images_last_hour": 3, "limit_per_hour": 150,
+                                             "remaining": 0, "blocked": False, "cooldown_until": None, "strikes": 0,
+                                             "last_block_at": None, "last_block_reason": "",
+                                             "note": "лимит 150 страниц в час исчерпан"}}
+
+    class IdleMonitor(FakeMonitor):
+        def http_status(self) -> dict[str, Any]:
+            return {}  # the monitor creates its HTTP client lazily
+
+    with TestClient(create_app(config, db, monitor=IdleMonitor()), base_url=LOCAL) as c:
+        assert "пауза до" in c.get("/status").text  # falls back to the shared state file
+    with TestClient(create_app(config, db, monitor=LimitsMonitor()), base_url=LOCAL) as c:
+        html = c.get("/status").text
+    assert "150 / 150" in html and "лимит в этот час исчерпан" in html and "всё спокойно" in html

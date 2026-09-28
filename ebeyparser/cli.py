@@ -346,9 +346,32 @@ def cmd_ebay_limits(args: argparse.Namespace) -> int:
     return 0
 
 
+def _site_client(config: AppConfig) -> Any:
+    """PoliteClient sharing data/http_state.json with the monitor: diagnostics count against the
+    same hourly page budget and respect block cooldowns."""
+    from .runtime import http_state_path
+    from .scraper.http import PoliteClient
+
+    return PoliteClient.from_config(config.general, state_path=http_state_path(config.data_path))
+
+
+def _site_refusal(exc: BaseException) -> str | None:
+    """Russian explanation for our own budget / a block cooldown (no request was sent)."""
+    from .scraper.categories import describe_error
+    from .scraper.http import BlockedError, RateBudgetExceeded
+
+    if isinstance(exc, RateBudgetExceeded):
+        return (describe_error(exc) + ". Это защита от блокировки: запрос не отправлялся"
+                " (лимит general.max_requests_per_hour).")
+    if isinstance(exc, BlockedError):
+        text = describe_error(exc)
+        return text + (". Запрос не отправлялся — пауза растёт с каждой блокировкой." if exc.cooling_down else
+                       f" ({exc}).")
+    return None
+
+
 def cmd_debug_search(args: argparse.Namespace) -> int:
     """Fetch page 1 of each Kleinanzeigen search and show what the parser sees."""
-    from .scraper.http import BlockedError, PoliteClient
     from .scraper.kleinanzeigen import (
         KleinanzeigenScraper,
         build_search_url,
@@ -364,7 +387,7 @@ def cmd_debug_search(args: argparse.Namespace) -> int:
         return 2
 
     async def go() -> int:
-        client = PoliteClient.from_config(config.general)
+        client = _site_client(config)
         scraper = KleinanzeigenScraper(client, debug_dir=config.data_path / "debug")
         problems = 0
         try:
@@ -374,12 +397,12 @@ def cmd_debug_search(args: argparse.Namespace) -> int:
                 print(f"запрос:      {url}")
                 try:
                     html = await client.get_text(url)
-                except BlockedError as exc:
-                    problems += 1
-                    print(f"✖ БЛОКИРОВКА: {exc}")
-                    continue
                 except Exception as exc:
+                    refusal = _site_refusal(exc)
                     problems += 1
+                    if refusal is not None:  # every further request would be refused too
+                        print(f"✖ {refusal}")
+                        break
                     print(f"✖ Ошибка: {type(exc).__name__}: {exc}")
                     continue
                 print(f"итоговый URL: {client.last_url}  (HTTP {client.last_status})")
@@ -403,7 +426,6 @@ def cmd_debug_search(args: argparse.Namespace) -> int:
 
 def cmd_debug_ad(args: argparse.Namespace) -> int:
     """Fetch one Kleinanzeigen ad page and show what the detail parser extracts."""
-    from .scraper.http import PoliteClient
     from .scraper.kleinanzeigen import KleinanzeigenScraper, parse_ad_detail
 
     config = load_config(Path(args.config))
@@ -416,12 +438,12 @@ def cmd_debug_ad(args: argparse.Namespace) -> int:
         return 2
 
     async def go() -> int:
-        client = PoliteClient.from_config(config.general)
+        client = _site_client(config)
         scraper = KleinanzeigenScraper(client, debug_dir=config.data_path / "debug")
         try:
             html = await client.get_text(args.url)
         except Exception as exc:
-            print(f"✖ Не удалось открыть объявление: {exc}")
+            print(f"✖ {_site_refusal(exc) or f'Не удалось открыть объявление: {exc}'}")
             return 1
         finally:
             await client.aclose()
@@ -533,7 +555,9 @@ def _discover_categories_sync(config: AppConfig, location: str, radius_km: int) 
     )
 
     async def go() -> Any:
-        client = discovery_client(config.general)
+        from .runtime import http_state_path
+
+        client = discovery_client(config.general, state_path=http_state_path(config.data_path))
         try:
             return await discover_categories(client, location, radius_km)
         finally:
@@ -1025,7 +1049,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("setup", help="мастер настройки: город, категории, бюджет, нейросеть, Telegram").set_defaults(
         func=cmd_setup)
-    p = sub.add_parser("categories", help="показать категории Kleinanzeigen в регионе (ID и число объявлений)")
+    p = sub.add_parser("categories", help="номера категорий Kleinanzeigen (--live — сверить с сайтом и узнать число объявлений)")
     p.add_argument("--location", default="Berlin", help="город или почтовый индекс (по умолчанию Berlin)")
     p.add_argument("--radius", type=int, default=30, help="радиус, км (по умолчанию 30)")
     p.add_argument("--live", action="store_true",

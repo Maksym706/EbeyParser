@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import logging
 import math
 import re
@@ -823,6 +824,58 @@ async def ai_status(app: FastAPI) -> dict[str, Any]:
     return {**base, **(result if isinstance(result, Mapping) else {})}
 
 
+async def http_limits(app: FastAPI) -> list[dict[str, Any]]:
+    """Per-site request budget and block cooldowns for the status page: from the monitor
+    (`http_status()`) when it has data, else read-only from data/http_state.json."""
+    from ..runtime import http_state_path
+
+    data: Any = None
+    fn = getattr(app.state.monitor, "http_status", None)
+    if callable(fn):
+        try:
+            data = fn()
+            if inspect.isawaitable(data):
+                data = await data
+        except Exception:  # status must never break the page
+            log.exception("monitor.http_status failed")
+            data = None
+    cfg: AppConfig = app.state.config
+    path = http_state_path(cfg.data_path)
+    if not data and path.is_file():  # monitor idle / its client not created yet: read the shared file
+        from ..scraper.http import PoliteClient
+
+        client = PoliteClient.from_config(cfg.general, state_path=path)
+        try:
+            data = client.host_status()
+        except Exception:
+            log.exception("reading %s failed", path)
+        finally:
+            client.state_path = None  # read-only: never overwrite the monitor's newer state
+            await client.aclose()
+    rows: list[dict[str, Any]] = []
+    for host, info in sorted((data or {}).items()) if isinstance(data, Mapping) else []:
+        if not isinstance(info, Mapping):
+            continue
+        until = info.get("cooldown_until")
+        last = info.get("last_block_at")
+        limit = info.get("limit_per_hour")
+        used = info.get("requests_last_hour") or 0
+        rows.append({
+            "host": host,
+            "requests": used,
+            "images": info.get("images_last_hour") or 0,
+            "limit": limit,
+            "blocked": bool(info.get("blocked")),
+            "until": fmt_datetime(until) if isinstance(until, datetime) else "",
+            "exhausted": bool(limit) and used >= limit,
+            "strikes": info.get("strikes") or 0,
+            "reason": str(info.get("last_block_reason") or ""),
+            "last_block": fmt_ago(last) if isinstance(last, datetime) else "",
+            "note": str(info.get("note") or ""),
+        })
+    return rows
+
+
 async def _guarded(coro: Any, label: str) -> Any:
     try:
         return await coro
@@ -1479,14 +1532,19 @@ def create_app(
             "has_notifiers": notifiers_factory is not None,
             "stats": db.stats(),
             "searches_enabled": sum(1 for s in cfg.searches if s.enabled),
+            "http": await http_limits(app),
+            "cooldown_steps": list(getattr(cfg.general, "block_cooldown_hours", []) or []),
+            "hourly_cap": getattr(cfg.general, "max_requests_per_hour", None),
             "db_path": getattr(db, "path", ""),
         })
 
     # ------------------------------------------------------------ setup wizard
     async def _default_discovery(location: str, radius_km: int) -> CategoryList:
+        from ..runtime import http_state_path
         from ..scraper.categories import discover_categories, discovery_client
 
-        client = discovery_client(app.state.config.general)
+        cfg: AppConfig = app.state.config
+        client = discovery_client(cfg.general, state_path=http_state_path(cfg.data_path))
         try:
             return await discover_categories(client, location, radius_km)
         finally:

@@ -168,7 +168,8 @@ def item_to_listing(item: dict[str, Any], search_name: str = "") -> Listing:
         bid_count=item.get("bidCount"),
         ends_at=_parse_dt(item.get("itemEndDate")),
         shipping_cost=shipping,
-        seller_name=seller.get("username", ""),
+        # no eBay usernames are stored: keeps the "I do not persist eBay user data" exemption honest
+        seller_name="",
         seller_type="commercial" if seller_account_type(item) == "BUSINESS"
         else "private" if seller_account_type(item) == "INDIVIDUAL" else "unknown",
         seller_feedback_percent=float(feedback) if feedback not in (None, "") else None,

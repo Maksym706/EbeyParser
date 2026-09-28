@@ -662,7 +662,7 @@ legend { padding: 0 6px; font-weight: 700; font-size: 13.5px; color: var(--text-
 .model-list button { border: 1px solid var(--border); background: var(--surface-2); color: var(--text-2); border-radius: 8px; padding: 4px 9px; font-size: 12.5px; font-family: var(--mono); cursor: pointer; }
 .model-list button:hover { border-color: var(--border-strong); color: var(--text); }
 .model-list button.vision { border-color: rgba(34, 197, 94, 0.45); color: var(--green-text); }
-[data-purpose-only][hidden] { display: none !important; }
+[data-purpose-only][hidden], .result[hidden] { display: none !important; }
 .gate { max-width: 560px; margin: 40px auto; padding: 28px; display: flex; flex-direction: column; gap: 12px; }
 
 /* ------------------------------------------------------------------ status */
@@ -792,7 +792,7 @@ legend { padding: 0 6px; font-weight: 700; font-size: 13.5px; color: var(--text-
   .step, .settings-card { padding: 16px; }
   .cat-grid, .choice-grid { grid-template-columns: minmax(0, 1fr); }
   .wish-row { grid-template-columns: minmax(0, 1fr) 96px 40px; }
-  .setup-save { bottom: calc(76px + env(safe-area-inset-bottom)); padding: 12px 14px; }
+  .setup-save { position: static; padding: 14px; }  /* a sticky bar would cover half the phone screen */
   .setup-save .btn { width: 100%; }
   .settings-grid { grid-template-columns: minmax(0, 1fr); }
 }

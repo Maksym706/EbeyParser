@@ -105,7 +105,7 @@ searches:
 ### LM Studio (рекомендуется)
 
 1. Установи **[LM Studio](https://lmstudio.ai)**. Во вкладке **Discover** скачай **Qwen2.5-VL-7B-Instruct** (для слабого ПК — версия 3B или Gemma 3 4B).
-2. Загрузи модель и поставь **Context Length не меньше 8192** (три фото занимают много токенов).
+2. Загрузи модель и поставь **Context Length не меньше 8192** (три фото занимают много токенов; при меньшем контексте модель обрезает запрос и отвечает ерундой).
 3. Вкладка **Developer → Start Server** (или `lms server start`). В настройках включи автозапуск сервера, чтобы всё работало 24/7.
 4. Мастер `setup` найдёт сервер сам. Вручную в `config.yaml`:
    ```yaml
@@ -116,6 +116,8 @@ searches:
      model: qwen/qwen2.5-vl-7b
    ```
 5. Проверка: `python -m ebeyparser ai-check` (покажет модели на сервере; `--fix` сам впишет найденную vision-модель).
+
+Фото перед отправкой в модель уменьшаются — для этого ставится пакет **Pillow** (идёт вместе с программой; в старой установке: `pip install pillow`). Без него всё работает, но нейросеть заметно медленнее.
 
 ### Ollama (альтернатива)
 
@@ -176,7 +178,7 @@ ollama pull qwen2.5vl:7b
 ## eBay API (необязательно)
 
 1. Зарегистрируйся на **[developer.ebay.com](https://developer.ebay.com)** (бесплатно) и открой **[developer.ebay.com/my/keys](https://developer.ebay.com/my/keys)**.
-2. Создай **Production keyset**. eBay попросит ответить на требование **Marketplace Account Deletion** (уведомления об удалении аккаунтов): для личного использования выбери исключение (exemption) **«I do not persist eBay data»** — иначе ключи не активируются.
+2. Создай **Production keyset**. eBay попросит ответить на требование **Marketplace Account Deletion** (уведомления об удалении аккаунтов): выбери исключение (exemption) **«I do not persist eBay data»** — иначе ключи не активируются. EbeyParser не сохраняет личные данные пользователей eBay (имена продавцов не записываются, только объявления и цены), так что это исключение подходит.
 3. Впиши в `.env`:
    ```
    EBAY_CLIENT_ID=<App ID (Client ID)>

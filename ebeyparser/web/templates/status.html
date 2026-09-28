@@ -54,7 +54,7 @@
       {% if ai.enabled and ai.model_available is not none %}<dt>Модель скачана</dt><dd class="{{ 'match-yes' if ai.model_available else 'match-no' }}">{{ '✓ да' if ai.model_available else '✗ нет' }}</dd>{% endif %}
     </dl>
     {% if not ai.enabled %}
-    <p class="muted small">Включи <code>ai.enabled: true</code> в config.yaml, чтобы нейросеть проверяла фото и описание.</p>
+    <p class="muted small">Включи нейросеть на странице <a class="link" href="/settings#ai">Настройка</a> (или <code>ai.enabled: true</code> в config.yaml), чтобы она проверяла фото и описание.</p>
     {% elif ai.error %}
     <p class="neg small">{{ ai.error }}</p>
     {% if ai.provider == 'ollama' and ai.ok %}<p class="muted small">Скачай модель: <code>ollama pull {{ ai.model }}</code></p>{% endif %}
@@ -96,6 +96,42 @@
   </article>
 </section>
 
+{# ------------------------------------------------------ site requests #}
+<section class="card section" style="margin-bottom: 20px" id="limits">
+  <div class="section-head">
+    <h2>{{ icon('shield') }}Запросы к сайтам и защита от блокировки</h2>
+    {% if http | selectattr('blocked') | list %}<span class="chip chip-skip">пауза после блокировки</span>{% else %}<span class="chip chip-buy">всё спокойно</span>{% endif %}
+  </div>
+  {% if http %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Сайт</th><th class="right">Страниц за час</th><th class="right">Фото</th><th>Состояние</th><th>Последняя блокировка</th></tr></thead>
+      <tbody>
+        {% for h in http %}
+        <tr>
+          <td><b>{{ h.host }}</b></td>
+          <td class="right num">{{ h.requests }}{% if h.limit %} / {{ h.limit }}{% endif %}</td>
+          <td class="right num">{{ h.images }}</td>
+          <td>
+            {% if h.blocked %}<span class="neg">пауза до {{ h.until }}</span>
+            {% elif h.exhausted %}<span class="neg">лимит в этот час исчерпан</span>
+            {% else %}<span class="ok-text">работает</span>{% endif %}
+          </td>
+          <td>{% if h.last_block %}{{ h.last_block }}{% if h.reason %} · {{ h.reason }}{% endif %}{% if h.strikes %}<div class="muted small">блокировок подряд: {{ h.strikes }}</div>{% endif %}{% else %}<span class="zero">не было</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="muted small">Запросов к сайтам пока не было — таблица появится после первой проверки.</p>
+  {% endif %}
+  <p class="muted small" style="margin-top: 10px">
+    {% if hourly_cap %}Не больше {{ hourly_cap }} страниц в час на сайт. {% endif %}
+    {% if cooldown_steps %}После блокировки (403, 429, капча) программа ждёт {{ cooldown_steps | map('num') | join(' → ') }} ч — пауза растёт с каждой блокировкой подряд и переживает перезапуск.{% endif %}
+  </p>
+</section>
+
 <section class="two-col">
   {# -------------------------------------------------------- notifications #}
   <article class="card section">
@@ -122,6 +158,7 @@
       <div><dt>Страниц на поиск</dt><dd>{{ config.general.max_pages }}</dd></div>
       <div><dt>Открывать объявления</dt><dd>{{ 'да' if config.general.fetch_details else 'нет' }}</dd></div>
       <div><dt>Пауза между запросами</dt><dd>{{ config.general.request_delay_seconds[0] | num }}–{{ config.general.request_delay_seconds[1] | num }} с</dd></div>
+      {% if hourly_cap %}<div><dt>Лимит страниц в час</dt><dd>{{ hourly_cap }} на сайт</dd></div>{% endif %}
       <div><dt>Мин. прибыль</dt><dd>{{ config.pricing.min_profit | money }}</dd></div>
       <div><dt>Мин. ROI</dt><dd>{{ config.pricing.min_roi | pct }}</dd></div>
       <div><dt>Запас на торг и риск</dt><dd>{{ config.pricing.safety_margin_percent | num }} %</dd></div>

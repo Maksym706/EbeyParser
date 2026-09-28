@@ -339,3 +339,29 @@ def test_file_logging_and_helpers(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("OneDrive", str(tmp_path / "OneDrive - Uni"))
     assert onedrive_warning(tmp_path / "OneDrive - Uni" / "EbeyParser" / "data") is not None
     assert onedrive_warning(tmp_path / "EbeyParser" / "data") is None
+
+
+def test_debug_search_respects_shared_cooldown(tmp_path: Path, capsys) -> None:
+    """Diagnostics use data/http_state.json: during a block cooldown no request is sent."""
+    import asyncio
+
+    import httpx
+
+    from ebeyparser.scraper.http import BlockedError, PoliteClient
+
+    data = tmp_path / "data"
+
+    async def block() -> None:
+        client = PoliteClient(delay_range=(0, 0), max_retries=0, state_path=data / "http_state.json",
+                              transport=httpx.MockTransport(lambda request: httpx.Response(403)))
+        with pytest.raises(BlockedError):
+            await client.get_text("https://www.kleinanzeigen.de/s-foo/k0")
+        await client.aclose()
+
+    asyncio.run(block())
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"general:\n  data_dir: {data}\nsearches:\n  - name: Handy\n    category_id: 173\n"
+                   "    location: Berlin\n", encoding="utf-8")
+    assert cli.main(["-c", str(cfg), "debug-search"]) == 1
+    out = capsys.readouterr().out
+    assert "на паузе после блокировки" in out and "Запрос не отправлялся" in out
