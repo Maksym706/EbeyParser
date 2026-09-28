@@ -24,10 +24,14 @@ class FakeSource:
         self.comps = comps or []
         self.detail_calls: list[str] = []
         self.search_calls = 0
+        self.search_pages: list[int] = []  # max_pages of each search call
+        self.seen_given: list[bool] = []  # was a `seen` callback passed (stop at known ads)
         self.block_search = False
 
-    async def search(self, search: SearchConfig, max_pages: int = 1) -> list[Listing]:
+    async def search(self, search: SearchConfig, max_pages: int = 1, seen=None) -> list[Listing]:
         self.search_calls += 1
+        self.search_pages.append(max_pages)
+        self.seen_given.append(seen is not None)
         if self.block_search:
             raise BlockedError("captcha")
         return [l.model_copy(update={"search_name": search.name}) for l in self.listings]

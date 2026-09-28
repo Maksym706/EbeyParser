@@ -2052,7 +2052,7 @@ def _score(market: Market, scored: list[SiteAd], db: Database, config: AppConfig
     est_eligible = 0
     mistakes: list[Mistake] = []
     bad_estimates: list[Mistake] = []
-    true_deals = buys = correct = maybe_deals = traps = trap_buys = trap_maybes = 0
+    true_deals = buys = correct = deal_buys = maybe_deals = traps = trap_buys = trap_maybes = 0
     severe_plain = severe_explicit = false_buys = notify_n = notify_correct = notify_traps = 0
     buy_ids = {d.listing.ad_id for d in db.list_deals(verdict="buy", include_ignored=True, limit=100_000)}
 
@@ -2074,6 +2074,7 @@ def _score(market: Market, scored: list[SiteAd], db: Database, config: AppConfig
         if is_buy:
             buys += 1
             correct += acceptable
+            deal_buys += deal
             cs["correct_buys"] += acceptable
         if deal and verdict in ("buy", "maybe"):
             maybe_deals += 1
@@ -2222,7 +2223,7 @@ def _score(market: Market, scored: list[SiteAd], db: Database, config: AppConfig
         ebay_sold=params["ebay"], ebay_api=params["api"], category_scan=params["cats"], passes=market.passes,
         passes_run=passes_run, market=market.stats(),
         verdicts={k: verdicts.get(k, 0) for k in ("buy", "maybe", "skip", "none")}, true_deals=true_deals,
-        buys=buys, correct_buys=correct, precision=_share(correct, buys), recall=_share(correct, true_deals),
+        buys=buys, correct_buys=correct, precision=_share(correct, buys), recall=_share(deal_buys, true_deals),
         recall_buy_or_maybe=_share(maybe_deals, true_deals), notify_n=notify_n, notify_correct=notify_correct,
         notify_traps=notify_traps, notify_precision=_share(notify_correct, notify_n), traps=traps,
         trap_buys=trap_buys, trap_maybes=trap_maybes, severe_plain_trap_buys=severe_plain,

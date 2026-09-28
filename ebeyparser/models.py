@@ -82,6 +82,9 @@ class PriceEstimate(BaseModel):
     notes: str = ""
     history_days: int | None = None  # source "history": the look-back window
     age_days: float | None = None  # source "history": weighted mean age of the prices used
+    # how many of the comparables shown to the AI it called the same product variant
+    # (None = not asked / no answer; 0 = none: the market price may belong to another variant)
+    ai_variant_matches: int | None = None
 
 
 class AIVerdict(BaseModel):

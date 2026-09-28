@@ -5,10 +5,13 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+from ebeyparser.ai.evaluator import SAME_VARIANT_KEY
 from ebeyparser.config import parse_config
 from ebeyparser.db import Database
-from ebeyparser.models import AIVerdict, Comparable, Evaluation, utcnow
-from ebeyparser.monitor import Monitor
+from ebeyparser.models import AIVerdict, Comparable, Evaluation, PriceEstimate, utcnow
+from ebeyparser.monitor import Monitor, _comparables_for_ai
+from ebeyparser.pricing.estimator import product_query
+from ebeyparser.scraper.http import BlockedError, RateBudgetExceeded
 
 from test_monitor import GOOD_AI, SOLD, FakeEvaluator, FakeNotifier, FakeSource, make_listing
 
@@ -230,7 +233,9 @@ async def test_category_scan_with_empty_query():
     summary = await monitor.run_once()
     assert summary.evaluated == 2 and not summary.errors
     # every ad gets its own product key / comparables query
-    assert source.comps_queries == ebay.queries == ["apple iphone 13 128gb", "samsung galaxy s21 ultra 256gb"]
+    expected = [product_query(l.title) for l in listings]
+    assert source.comps_queries == ebay.queries == expected
+    assert "iphone 13 128gb" in expected[0] and "s21 ultra 256gb" in expected[1]
     assert db.get_listing("1").search_name == "Handys"
 
 
@@ -346,3 +351,158 @@ def test_potential_profit_counts_open_deals_of_the_last_week():
         db.save_evaluation(Evaluation(ad_id=ad_id, verdict="buy", expected_profit=profit))
     db.set_status("bought", "bought")
     assert db.stats()["potential_profit"] == 100
+
+
+# ---------------------------------------------------------------------------- network limits
+
+
+def rate_limit(host: str = "www.kleinanzeigen.de") -> RateBudgetExceeded:
+    return RateBudgetExceeded(f"{host}: лимит 150 страниц в час исчерпан", host=host, limit=150,
+                              retry_at=utcnow() + timedelta(minutes=20))
+
+
+async def test_search_pages_on_until_known_ads_and_category_scans_get_more_pages():
+    monitor, _, source, _, _, _ = build([], search={"name": "Handys", "category_id": 173})
+    await monitor.run_once()
+    assert source.seen_given == [True] and source.search_pages == [3]
+    monitor, _, source, _, _, _ = build([])
+    await monitor.run_once()
+    assert source.search_pages == [1]  # keyword searches keep general.max_pages
+
+
+async def test_hourly_budget_on_ad_pages_defers_without_counting_a_request():
+    listings = [make_listing("1", "RTX 3080 A", 300.0), make_listing("2", "RTX 3080 B", 310.0)]
+    monitor, db, source, _, _, _ = build(listings)
+    real_fetch = source.fetch_detail
+
+    async def limited(listing):
+        raise rate_limit()
+
+    source.fetch_detail = limited
+    summary = await monitor.run_once()
+    assert summary.deferred == 2 and summary.evaluated == 0 and summary.details_fetched == 0
+    assert db.get_evaluation("1") is None and db.get_evaluation("2") is None
+    assert sum("лимит 150 страниц" in e for e in summary.errors) == 1  # said once, not a block
+    assert not any("ограничил" in e for e in summary.errors)
+    source.fetch_detail = real_fetch  # next pass: the hour is over
+    again = await monitor.run_once()
+    assert again.evaluated == 2 and again.deferred == 0
+
+
+async def test_hourly_budget_on_the_search_page_skips_only_that_search():
+    monitor, db, source, _, _, _ = build(
+        [make_listing("1", "RTX 3080", 300.0)],
+        searches=[{"name": "A", "query": "rtx 3080"}, {"name": "B", "query": "rtx 3080"}])
+    calls = {"n": 0}
+    real_search = source.search
+
+    async def first_limited(search, max_pages=1, seen=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise rate_limit()
+        return await real_search(search, max_pages=max_pages, seen=seen)
+
+    source.search = first_limited
+    summary = await monitor.run_once()
+    assert calls["n"] == 2 and summary.evaluated == 1  # search B still ran
+    assert any("лимит 150 страниц" in e for e in summary.errors)
+
+
+async def test_comparables_blocked_by_hourly_budget_defer_the_ad():
+    monitor, db, source, ebay, _, _ = build([make_listing("1", "RTX 3080", 300.0)], verdict=None, sold=[])
+
+    async def limited(query, limit=30):
+        raise rate_limit("www.ebay.de")
+
+    ebay.sold_comparables = limited
+    summary = await monitor.run_once()  # eBay sold limited, Kleinanzeigen comps empty: nothing to go on
+    assert summary.deferred == 1 and summary.comps_lookups == 0 and db.get_evaluation("1") is None
+    source.comps = [Comparable(title=f"RTX 3080 {i}", price=560.0 + i, url=KA.format(800000 + i),
+                               source="kleinanzeigen") for i in range(8)]
+    summary = await monitor.run_once()  # partial lookup: used, but not cached
+    ev = db.get_evaluation("1")
+    assert ev is not None and ev.estimate.market_price is not None
+    assert monitor._cached_comps("rtx 3080") is None
+
+
+async def test_cooldown_after_a_block_is_a_short_note():
+    monitor, _, source, _, _, _ = build([])
+
+    async def cooling(search, max_pages=1, seen=None):
+        raise BlockedError("Kleinanzeigen: пауза", host="www.kleinanzeigen.de", cooling_down=True,
+                           cooldown_until=utcnow() + timedelta(minutes=42))
+
+    source.search = cooling
+    summary = await monitor.run_once()
+    assert len(summary.errors) == 1 and summary.errors[0].startswith("Kleinanzeigen: пауза после блокировки ещё")
+    assert "увеличь" not in summary.errors[0]
+
+
+def test_http_client_state_is_persisted_and_status_exposed(tmp_path):
+    cfg = parse_config({"general": {"data_dir": str(tmp_path)}})
+    monitor = Monitor(cfg, Database(), notifiers=[])
+    assert monitor.http_status() == {}
+    monitor._ensure_components()
+    assert monitor._client.state_path == tmp_path / "http_state.json"
+    assert isinstance(monitor.http_status(), dict)
+
+
+# ---------------------------------------------------------------------------- AI and comparables
+
+
+class VariantEvaluator(FakeEvaluator):
+    """Fake AI that picks the same-variant comparables by index."""
+
+    def __init__(self, verdict, picks: str | None):
+        super().__init__(verdict)
+        self.picks = picks
+        self.shown: list[list[Comparable]] = []
+
+    async def evaluate(self, listing, images, *, purpose="resale", estimate=None, target_price=None,
+                       comparables=None):
+        self.calls.append(listing.ad_id)
+        self.shown.append(list(comparables or []))
+        variant = {} if self.picks is None else {SAME_VARIANT_KEY: self.picks}
+        return self.verdict.model_copy(update={"variant": variant})
+
+
+def history_monitor(picks):
+    monitor, db, _, _, _, _ = build([make_listing("1", "RTX 3080 Gaming", 300.0)])
+    monitor._evaluator = evaluator = VariantEvaluator(GOOD_AI, picks)
+    teach(db)
+    return monitor, db, evaluator
+
+
+async def test_ai_sees_typical_comparables_and_confirms_the_variant():
+    monitor, db, evaluator = history_monitor("0,1,2,3,4,5,6")
+    await monitor.run_once()
+    assert len(evaluator.shown[0]) == 8
+    ev = db.get_evaluation("1")
+    assert ev.estimate.ai_variant_matches == 7 and ev.estimate.sample_size == 7
+    assert ev.estimate.notes.startswith("ИИ подтвердил 7 точных аналогов")
+    assert ev.verdict == "buy"
+
+
+async def test_ai_finding_no_same_variant_caps_at_maybe():
+    monitor, db, _ = history_monitor("")
+    await monitor.run_once()
+    ev = db.get_evaluation("1")
+    assert ev.estimate.ai_variant_matches == 0 and ev.verdict == "maybe"
+    assert any("тот же вариант" in r for r in ev.reasons)
+
+
+async def test_ai_without_variant_answer_changes_nothing():
+    monitor, db, _ = history_monitor(None)
+    await monitor.run_once()
+    ev = db.get_evaluation("1")
+    assert ev.estimate.ai_variant_matches is None and ev.verdict == "buy"
+
+
+def test_comparables_for_ai_are_the_typical_ones():
+    comps = [Comparable(title=f"RTX 3080 {p}", price=float(p)) for p in (50, 90, 380, 390, 400, 410, 420,
+                                                                           430, 440, 450, 900)]
+    chosen = _comparables_for_ai(PriceEstimate(market_price=415, comparables=comps))
+    assert len(chosen) == 8 and min(c.price for c in chosen) == 380 and max(c.price for c in chosen) == 450
+    spread = _comparables_for_ai(PriceEstimate(comparables=comps))
+    assert len(spread) == 8 and spread[0].price == 50  # no market yet: a spread of prices
+    assert _comparables_for_ai(PriceEstimate()) == []

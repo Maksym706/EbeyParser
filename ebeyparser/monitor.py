@@ -17,6 +17,7 @@ The single-ad check (evaluate_url) runs every step without budgets.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import random
 import re
@@ -29,7 +30,8 @@ from typing import Any
 import httpx
 
 from .ai.claude import make_llm
-from .ai.evaluator import AIEvaluator
+from .ai.evaluator import AIEvaluator, same_variant_comparables
+from .ai.prompts import MAX_PROMPT_COMPARABLES, prompt_comparables
 from .config import AppConfig, GeneralConfig, SearchConfig
 from .db import Database
 from .models import AIVerdict, Comparable, DealView, Evaluation, Listing, PriceEstimate, RunSummary, utcnow
@@ -45,12 +47,13 @@ from .pricing.estimator import (
     no_deal_reasons,
     prefilter,
     prefilter_score,
+    product_query,
     relevant_comparables,
 )
-from .pricing.text import is_model_key, make_search_query, normalize
+from .pricing.text import is_model_key, normalize
 from .scraper.ebay_api import EbayAPIError, EbayBrowseClient
 from .scraper.ebay_sold import EbaySoldScraper
-from .scraper.http import BlockedError, PoliteClient
+from .scraper.http import BlockedError, PoliteClient, RateBudgetExceeded
 from .scraper.kleinanzeigen import KleinanzeigenScraper, PageLayoutError
 
 log = logging.getLogger(__name__)
@@ -64,6 +67,8 @@ RECHECK_AFTER = timedelta(hours=6)  # an ad skipped by market data is re-checked
 EARLY_SKIP_MIN_POINTS = 8
 EARLY_SKIP_MAX_SPREAD = 0.35
 UNKNOWN_DISCOUNT = 0.75  # candidates with an unknown market rank after clear bargains
+CATEGORY_MIN_PAGES = 3  # category scans page on until the first already-known ad
+_COMPS_SOURCES = frozenset({"ebay_sold", "mixed", "kleinanzeigen", "history"})  # estimates from offers
 
 # RunSummary counters of the funnel, and which GeneralConfig limit caps each paid step
 _FUNNEL_COUNTERS = (
@@ -193,6 +198,7 @@ class Monitor:
             "notifiers": notifiers is not None,
         }
         self._second_calls = 0
+        self._rate_limited: dict[str, datetime] = {}  # host -> retry_at, this pass
         self._budget: _Budget | None = None
         self._comps_cache: dict[str, tuple[float, PriceEstimate]] = {}
         self._ebay_blocked = False
@@ -222,7 +228,10 @@ class Monitor:
 
     def _ensure_components(self) -> None:
         if self._client is None and not (self._injected["scraper"] and self._injected["ebay"]):
-            self._client = PoliteClient.from_config(self.config.general)
+            # cooldowns after blocks and the hourly page window survive restarts
+            self._client = PoliteClient.from_config(
+                self.config.general, state_path=self.config.data_path / "http_state.json"
+            )
         if self._scraper is None:
             self._scraper = KleinanzeigenScraper(self._client, debug_dir=self.config.data_path / "debug")
         if self._ebay is None:
@@ -256,6 +265,10 @@ class Monitor:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+
+    def http_status(self) -> dict[str, Any]:
+        """Per host: pages in the last hour, hourly limit, cooldown after a block (status page)."""
+        return self._client.host_status() if self._client is not None else {}
 
     async def ai_health(self) -> dict[str, Any]:
         ai = self.config.ai
@@ -306,6 +319,7 @@ class Monitor:
 
         self._running = True
         self._ebay_blocked = False
+        self._rate_limited = {}
         self._second_calls = 0
         summary = self.db.start_run()
         digest: list[DealView] = []
@@ -317,12 +331,19 @@ class Monitor:
                 try:
                     deals = await self._process_search(search, summary)
                 except BlockedError as exc:
-                    summary.errors.append(
-                        f"Kleinanzeigen ограничил запросы ({exc}). Проверка остановлена — "
-                        "увеличь general.interval_minutes и request_delay_seconds."
-                    )
-                    log.warning("Blocked by Kleinanzeigen: %s", exc)
+                    if getattr(exc, "cooling_down", False):  # no request was sent this time
+                        summary.errors.append(f"Kleinanzeigen: пауза после блокировки{_minutes_left(exc)}")
+                        log.info("Kleinanzeigen still cooling down after a block: %s", exc)
+                    else:
+                        summary.errors.append(
+                            f"Kleinanzeigen ограничил запросы ({exc}). Проверка остановлена — "
+                            "увеличь general.interval_minutes и request_delay_seconds."
+                        )
+                        log.warning("Blocked by Kleinanzeigen: %s", exc)
                     break
+                except RateBudgetExceeded as exc:  # our own hourly cap: not a block, try next pass
+                    self._note_rate_limit(exc, summary)
+                    continue
                 except (EbayAPIError, PageLayoutError) as exc:
                     log.warning("Search %r: %s", search.name, exc)
                     summary.errors.append(f"{search.name}: {exc}")
@@ -366,8 +387,7 @@ class Monitor:
     async def _process_search(self, search: SearchConfig, summary: RunSummary) -> list[DealView]:
         """One search: scrape, store, feed the price history, run the funnel. Instant
         notifications go out as soon as a deal is found; returns the deals for a digest."""
-        max_pages = search.max_pages or self.config.general.max_pages
-        listings = await self._source_for(search).search(search, max_pages=max_pages)
+        listings = await self._search(search)
         summary.listings_seen += len(listings)
         before = {name: getattr(summary, name) for name in _FUNNEL_COUNTERS}
         evaluated_before = summary.evaluated
@@ -449,10 +469,12 @@ class Monitor:
             budget.start_listing()
             try:
                 evaluation = await self._finish(cand, search, budget)
-            except _Deferred as why:
+            except (_Deferred, RateBudgetExceeded) as why:
                 summary.deferred += 1
                 if listing.ad_id in price_dropped:  # the old verdict is stale: retry at the new price
                     self.db.delete_evaluation(listing.ad_id)
+                if isinstance(why, RateBudgetExceeded):
+                    self._note_rate_limit(why, summary)
                 log.info("         → отложено до следующей проверки: %s", why)
                 continue
             except BlockedError:
@@ -489,6 +511,27 @@ class Monitor:
         self._log_funnel(search, summary, before, evaluated_here)
         return to_notify
 
+    async def _search(self, search: SearchConfig) -> list[Listing]:
+        """Result pages of a search. Pages on only while they bring unknown ads; category
+        scans (no query) get a few pages since many new ads arrive between passes."""
+        source = self._source_for(search)
+        max_pages = search.max_pages or self.config.general.max_pages
+        if search.category_id is not None and not search.query.strip() and not search.url:
+            max_pages = max(max_pages, CATEGORY_MIN_PAGES)
+        kwargs: dict[str, Any] = {}
+        if _accepts(source.search, "seen"):
+            kwargs["seen"] = lambda ad_id: self.db.get_listing(ad_id) is not None
+        return await source.search(search, max_pages=max_pages, **kwargs)
+
+    def _note_rate_limit(self, exc: RateBudgetExceeded, summary: RunSummary) -> None:
+        """Our own hourly page cap for a host is used up: say so once per pass."""
+        host = getattr(exc, "host", "") or "?"
+        if host in self._rate_limited:
+            return
+        self._rate_limited[host] = getattr(exc, "retry_at", None) or utcnow()
+        log.info("Hourly request budget: %s", exc)
+        summary.errors.append(f"Отложено до следующей проверки: {exc}")
+
     def _budget_for(self, summary: RunSummary) -> _Budget:
         if self._budget is None or self._budget.summary is not summary:
             self._budget = _Budget(summary, self.config.general)
@@ -512,7 +555,7 @@ class Monitor:
         only. Not from price-filtered searches — a list cut at max_price drags medians down."""
         if _price_filtered(search):
             return
-        rows = [(key, l) for l in listings if history_worthy(l) and (key := make_search_query(l.title))]
+        rows = [(key, l) for l in listings if history_worthy(l) and (key := product_query(l.title))]
         if not rows:
             return
         try:
@@ -561,7 +604,7 @@ class Monitor:
 
         known = self._reference_estimate(listing, search)
         if known is None:
-            known = self._history_estimate(listing, make_search_query(listing.title))
+            known = self._history_estimate(listing, product_query(listing.title))
         hint = known
         if known is not None:
             best = evaluate(listing, known, None, search, self.config.pricing)
@@ -604,7 +647,11 @@ class Monitor:
         # 3: ad page — full text and all photos
         if (self.config.general.fetch_details and not listing.detail_loaded
                 and budget.spend("details_fetched")):
-            listing, keep, reasons = await self._load_detail(listing, search, source)
+            try:
+                listing, keep, reasons = await self._load_detail(listing, search, source)
+            except RateBudgetExceeded:
+                budget.summary.details_fetched -= 1  # no request was sent
+                raise
             if not keep:
                 budget.summary.prefiltered += 1
                 return self._save_skip(listing, search, reasons)
@@ -668,7 +715,7 @@ class Monitor:
         A failed page is not fatal: the search-card data is used instead."""
         try:
             listing = await source.fetch_detail(listing)
-        except BlockedError:
+        except (BlockedError, RateBudgetExceeded):
             raise
         except Exception as exc:
             log.warning("Detail page of %s failed: %s", listing.ad_id, exc)
@@ -689,16 +736,18 @@ class Monitor:
         self, listing: Listing, search: SearchConfig, estimate: PriceEstimate, source: Any,
         budget: _Budget | None,
     ) -> tuple[AIVerdict, PriceEstimate]:
+        """Local AI verdict. The model sees a few comparables (never our market price — it
+        guesses its own blind) and says which of them are the same variant."""
         assert self._evaluator is not None
-        ai_cfg = self.config.ai
-        images: list[bytes] = []
-        if listing.image_urls and ai_cfg.max_images > 0:
-            images = await source.download_images(listing, max_images=ai_cfg.max_images)
+        images = await self._images(listing, source, self.config.ai.max_images)
+        shown = prompt_comparables(None, _comparables_for_ai(estimate))
         verdict = await self._evaluator.evaluate(
             listing, images, purpose=search.purpose,
             estimate=estimate if estimate.market_price is not None else None,
             target_price=search.target_price,
+            **self._comparables_kwarg(self._evaluator, shown),
         )
+        estimate = self._variant_checked(estimate, same_variant_comparables(verdict, shown) if shown else None)
         # The model often identifies the product better than the raw title does.
         if estimate.market_price is None and verdict.search_query:
             ai_estimate = await self._market_estimate(
@@ -707,6 +756,36 @@ class Monitor:
             if ai_estimate.market_price is not None:
                 estimate = ai_estimate
         return verdict, _cross_check(estimate, verdict)
+
+    async def _images(self, listing: Listing, source: Any, max_images: int) -> list[bytes]:
+        if not listing.image_urls or max_images <= 0:
+            return []
+        try:
+            return await source.download_images(listing, max_images=max_images)
+        except RateBudgetExceeded as exc:  # hourly cap: the AI works from the text alone
+            log.info("Images of %s skipped: %s", listing.ad_id, exc)
+            return []
+
+    @staticmethod
+    def _comparables_kwarg(evaluator: Any, shown: list[Comparable]) -> dict[str, Any]:
+        return {"comparables": shown} if _accepts(evaluator.evaluate, "comparables") else {}
+
+    def _variant_checked(self, estimate: PriceEstimate, matched: list[Comparable] | None) -> PriceEstimate:
+        """Use the AI's "same variant" picks: enough of them → re-estimate from exactly those;
+        none → mark the estimate (evaluate() then caps the verdict at "maybe")."""
+        if matched is None or estimate.market_price is None or estimate.source not in _COMPS_SOURCES:
+            return estimate
+        pricing = self.config.pricing
+        if len(matched) >= max(3, pricing.min_comparables):
+            exact = estimate_from_comparables(
+                matched, asking_price_discount=pricing.asking_price_discount, query=estimate.query
+            )
+            if exact.market_price is not None:
+                return exact.model_copy(update={
+                    "notes": f"ИИ подтвердил {len(matched)} точных аналогов. {exact.notes}",
+                    "ai_variant_matches": len(matched),
+                })
+        return estimate.model_copy(update={"ai_variant_matches": len(matched)})
 
     async def _maybe_second_opinion(
         self, listing: Listing, search: SearchConfig, estimate: PriceEstimate,
@@ -722,13 +801,12 @@ class Monitor:
         ):
             return evaluation
         self._second_calls += 1
-        images: list[bytes] = []
-        if listing.image_urls and so.max_images > 0:
-            images = await source.download_images(listing, max_images=so.max_images)
+        images = await self._images(listing, source, so.max_images)
         second = await self._second.evaluate(
             listing, images, purpose=search.purpose,
             estimate=estimate if estimate.market_price is not None else None,
             target_price=search.target_price,
+            **self._comparables_kwarg(self._second, prompt_comparables(None, _comparables_for_ai(estimate))),
         )
         if second.confidence <= 0:  # the call failed -> keep the local result
             return evaluation.model_copy(update={"ai_second": second})
@@ -777,7 +855,7 @@ class Monitor:
             ref = self._reference_estimate(listing, search)
             if ref is not None:
                 return ref
-        q = (query or make_search_query(listing.title)).strip()
+        q = (query or product_query(listing.title)).strip()
         if not q:
             return PriceEstimate(notes="Не удалось составить запрос для поиска аналогов")
         history = self._history_estimate(listing, q) if use_history else None
@@ -797,7 +875,14 @@ class Monitor:
                 return PriceEstimate(query=q, notes="Лимит поиска аналогов на эту проверку исчерпан")
             if not allowed:
                 return PriceEstimate(query=q, notes="Поиск аналогов выключен (general.max_comps_lookups_per_run: 0)")
-        return await self._comps_estimate(listing, q)
+        try:
+            return await self._comps_estimate(listing, q)
+        except RateBudgetExceeded as exc:  # hourly page cap: no request was sent
+            if budget is not None:
+                budget.summary.comps_lookups -= 1
+                if defer:
+                    raise
+            return PriceEstimate(query=q, notes=f"Аналоги не искал: {exc}")
 
     def _reference_estimate(self, listing: Listing, search: SearchConfig) -> PriceEstimate | None:
         if search.reference_price is not None:
@@ -842,12 +927,20 @@ class Monitor:
         """Look up comparables (eBay sold, eBay API, Kleinanzeigen), remember their prices."""
         pricing = self.config.pricing
         comps: list[Comparable] = []
+        limited: RateBudgetExceeded | None = None  # a source skipped by the hourly page cap
         if pricing.use_ebay_sold_comps and not self._ebay_blocked and self._ebay is not None:
             try:
                 comps += await self._ebay.sold_comparables(query, limit=pricing.comps_limit)
+            except RateBudgetExceeded as exc:
+                limited = exc
             except BlockedError as exc:
-                self._ebay_blocked = True  # eBay being grumpy must not stop Kleinanzeigen
-                log.warning("eBay blocked sold-comps lookup: %s", exc)
+                # eBay being grumpy must not stop Kleinanzeigen; during its cooldown the
+                # scraper fails without a request, so just stop asking for this pass
+                self._ebay_blocked = True
+                if getattr(exc, "cooling_down", False):
+                    log.info("eBay sold comps paused (cooldown after a block): %s", exc)
+                else:
+                    log.warning("eBay blocked sold-comps lookup: %s", exc)
             except Exception as exc:
                 log.warning("eBay sold comps for %r failed: %s", query, exc)
         if self._ebay_api is not None:
@@ -855,6 +948,8 @@ class Monitor:
                 comps += await self._ebay_api.comparables(
                     query, exclude_ad_id=listing.ad_id, limit=pricing.comps_limit
                 )
+            except RateBudgetExceeded as exc:
+                limited = exc
             except Exception as exc:
                 log.warning("eBay API comps for %r failed: %s", query, exc)
         if pricing.use_kleinanzeigen_comps and self._scraper is not None:
@@ -862,10 +957,14 @@ class Monitor:
                 comps += await self._scraper.comparables(
                     query, exclude_ad_id=listing.ad_id, limit=pricing.comps_limit
                 )
+            except RateBudgetExceeded as exc:
+                limited = exc
             except BlockedError:
                 raise
             except Exception as exc:
                 log.warning("Kleinanzeigen comps for %r failed: %s", query, exc)
+        if limited is not None and not comps:
+            raise limited  # nothing to go on: defer, retry next pass
 
         relevant = relevant_comparables(query, comps)
         if len(relevant) < len(comps):
@@ -879,7 +978,8 @@ class Monitor:
         estimate = estimate_from_comparables(
             relevant, asking_price_discount=pricing.asking_price_discount, query=query
         )
-        self._comps_cache[normalize(query)] = (time.monotonic(), estimate)
+        if limited is None:  # a partial lookup is used once but not cached
+            self._comps_cache[normalize(query)] = (time.monotonic(), estimate)
         return estimate
 
     # --------------------------------------------------------- notifications
@@ -958,6 +1058,40 @@ def _price_label(listing: Listing) -> str:
     return f"{listing.price:g} €" if listing.price is not None else "цена ?"
 
 
+def _comparables_for_ai(estimate: PriceEstimate) -> list[Comparable]:
+    """The comparables to show the model: the most typical ones (closest to the market
+    price), not the cheapest — those are often defects or other variants."""
+    comps = [c for c in estimate.comparables if c.source != "reference" and c.price and c.price > 0]
+    if not comps:
+        return []
+    n = MAX_PROMPT_COMPARABLES
+    if estimate.market_price:
+        market = estimate.market_price
+        chosen = sorted(comps, key=lambda c: abs(c.price - market) / market)[:n]
+    else:
+        ordered = sorted(comps, key=lambda c: c.price)
+        step = max(1, len(ordered) / n)
+        chosen = [ordered[int(i * step)] for i in range(min(n, len(ordered)))]
+    return sorted(chosen, key=lambda c: c.price)
+
+
+def _accepts(func: Any, name: str) -> bool:
+    """Does `func` take a keyword argument `name`? (Test fakes may not.)"""
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _minutes_left(exc: BaseException) -> str:
+    until = getattr(exc, "cooldown_until", None)
+    if not isinstance(until, datetime):
+        return ""
+    minutes = max(1, round((_aware(until) - utcnow()).total_seconds() / 60))
+    return f" ещё {minutes} мин"
+
+
 def _aware(dt: datetime) -> datetime:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
@@ -972,15 +1106,16 @@ def _price_filtered(search: SearchConfig) -> bool:
 
 
 def _is_model_key(key: str) -> bool:
-    """pricing.identity's opinion when installed, else: the key has a model number."""
+    """Does the key name a concrete model? pricing.identity decides when installed (it
+    recognises a product), else: the key contains a model number."""
     try:
         from .pricing import identity
     except ImportError:
         identity = None  # type: ignore[assignment]
-    check = getattr(identity, "is_model_key", None)
-    if check is not None:
+    key_of = getattr(identity, "product_key", None)
+    if key_of is not None:
         try:
-            return bool(check(key))
+            return key_of(key) is not None
         except Exception:  # noqa: BLE001
             pass
     return is_model_key(key)

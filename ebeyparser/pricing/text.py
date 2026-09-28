@@ -212,11 +212,6 @@ _OMITTED_FAMILY = frozenset({"galaxy", "geforce", "radeon", "core", "playstation
 _GLUED_RE = re.compile(r"^([a-z]{3,})(\d{2,})[a-z]*$")  # "iphone13" -> "iphone" + "13"
 
 
-def product_key(title: str) -> str:
-    """Key under which the price of an ad is remembered (same as its comparables query)."""
-    return make_search_query(title)
-
-
 def _is_model_token(tok: str) -> bool:
     return any(c.isdigit() for c in tok) and not _UNIT_TOKEN_RE.fullmatch(tok)
 

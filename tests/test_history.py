@@ -240,3 +240,44 @@ async def test_run_prunes_old_points():
     await monitor.run_once()
     assert db.count_price_points() == 1
     assert db.stats()["price_points_total"] == 1
+
+
+# ---------------------------------------------------------------------------- pricing.identity
+
+
+def _has_identity() -> bool:
+    try:
+        from ebeyparser.pricing import identity
+    except ImportError:
+        return False
+    return hasattr(identity, "product_key") and hasattr(identity, "same_product")
+
+
+needs_identity = pytest.mark.skipif(not _has_identity(), reason="pricing.identity not installed")
+
+
+@needs_identity
+def test_identity_unifies_history_keys_and_checks_variants():
+    from ebeyparser.monitor import _is_model_key
+    from ebeyparser.pricing.estimator import comparable_is_relevant, product_query
+
+    assert product_query("Apple iPhone13 128 GB Blau") == product_query("iPhone 13 128GB") == "iphone 13 128gb"
+    assert product_query("Bugaboo Kinderwagen") == "bugaboo kinderwagen"  # unknown product: title words
+    assert not comparable_is_relevant("galaxy s21", "Samsung Galaxy S21 FE 128GB")  # Fan Edition != S21
+    assert comparable_is_relevant("rtx 3080", "Gigabyte GeForce RTX 3080 Gaming OC 10G")
+    assert _is_model_key("iphone 13 128gb") and not _is_model_key("bugaboo kinderwagen")
+
+
+def test_single_item_uses_identity_kinds(monkeypatch):
+    from types import SimpleNamespace
+
+    from ebeyparser.pricing import estimator
+
+    kinds = {"iPhone 13": "item", "iPhone 13 Hülle": "accessory", "Gaming PC RTX 3080": "complete_pc",
+             "ThinkPad T480": "laptop"}
+    fake = SimpleNamespace(classify_kind=lambda title, description="": kinds[title])
+    monkeypatch.setattr(estimator, "_identity", lambda: fake)
+    assert is_single_item("iPhone 13") and is_single_item("ThinkPad T480")
+    assert not is_single_item("iPhone 13 Hülle") and not is_single_item("Gaming PC RTX 3080")
+    monkeypatch.setattr(estimator, "_identity", lambda: None)  # not installed: word list
+    assert is_single_item("iPhone 13") and not is_single_item("iPhone 13 Hülle")

@@ -203,7 +203,42 @@ def comparable_is_relevant(query: str, title: str) -> bool:
         return False
     if is_wanted_ad(title) or any(f in SEVERE_FLAGS for f in detect_red_flags(title)):
         return False
-    return True
+    return _identity_agrees(query, title)
+
+
+def _identity_agrees(query: str, title: str) -> bool:
+    """pricing.identity's check (exact variant: "3080" != "3080 ti", 128 GB != 256 GB; same
+    kind of offer) on top of the rules above. True when identity isn't installed."""
+    identity = _identity()
+    try:
+        matches = getattr(identity, "comparable_matches", None)
+        if matches is not None:
+            return bool(matches(query, title)[0])
+        key_of = getattr(identity, "product_key", None)
+        same = getattr(identity, "same_product", None)
+        if key_of is None or same is None:
+            return True
+        a, b = key_of(query), key_of(title)
+        return a is None or b is None or bool(same(a, b))
+    except Exception:  # noqa: BLE001 - a helper bug must not break pricing
+        return True
+
+
+def product_query(title: str) -> str:
+    """Comparables query and price-history key of an ad: the exact product per
+    pricing.identity when it recognises a model ('Apple iPhone13 128 GB Blau' ->
+    'iphone 13 128gb'), else the cleaned-up title words (make_search_query)."""
+    identity = _identity()
+    key_of = getattr(identity, "product_key", None)
+    if key_of is not None:
+        try:
+            key = key_of(title)
+            query = key.query().strip() if key is not None else ""
+        except Exception:  # noqa: BLE001
+            query = ""
+        if query:
+            return query
+    return make_search_query(title)
 
 
 def relevant_comparables(query: str, comps: list[Comparable]) -> list[Comparable]:
@@ -539,7 +574,11 @@ def is_single_item(title: str, description: str = "") -> bool:
     classify = getattr(identity, "classify_kind", None)
     if classify is not None:
         try:
-            return classify(title, description) == "single"
+            natural = getattr(identity, "natural_kind", None)
+            if natural is not None:  # a ThinkPad is a laptop, a Mac mini a PC: that's the item
+                hint = natural(identity.product_key(title), identity.product_category(title))
+                return classify(title, description, query_kind_hint=hint) in ("item", "single")
+            return classify(title, description) in ("item", "single", "laptop")
         except Exception:  # noqa: BLE001 - a helper bug must not break the monitor
             pass
     words = normalize(title).split()
@@ -714,6 +753,8 @@ def _market_confidence(est: PriceEstimate) -> float:
         c *= max(0.5, 1.0 - (spread - 0.25))
     if est.source == "history" and est.age_days:
         c *= 0.6 + 0.4 * 0.5 ** (est.age_days / HISTORY_HALF_LIFE_DAYS)
+    if est.ai_variant_matches == 0:  # the AI saw the comparables: none is this variant
+        c *= 0.5
     return c
 
 
@@ -1095,6 +1136,10 @@ def evaluate(
         verdict = _cap_verdict(verdict, "maybe")
         cap = min(cap, WEAK_SCORE_CAP)
         reasons.append(weak)
+    if est.ai_variant_matches == 0 and est.source in _SAMPLE_SOURCES and market is not None:
+        verdict = _cap_verdict(verdict, "maybe")
+        cap = min(cap, WEAK_SCORE_CAP)
+        reasons.append("⚠ ИИ не нашёл среди аналогов тот же вариант — рыночная цена может быть от другого товара")
     if est.source == "ai" and market is not None:
         verdict = _cap_verdict(verdict, "maybe")
         cap = min(cap, AI_ONLY_SCORE_CAP)
