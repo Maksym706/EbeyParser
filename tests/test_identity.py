@@ -9,6 +9,9 @@ from ebeyparser.pricing.identity import (
     ProductKey,
     classify_kind,
     comparable_matches,
+    history_key,
+    identify,
+    missing_parts,
     product_key,
     same_product,
 )
@@ -468,3 +471,98 @@ def test_fast_enough_for_every_ad():
         classify_kind(t, "Privatverkauf, keine Garantie oder Rücknahme bei Defekten.")
         comparable_matches("iPhone 13 Pro Max 256GB", t)
     assert time.perf_counter() - t0 < 2.0
+
+
+# --------------------------------------------------------------------------- benchmark findings
+
+
+@pytest.mark.parametrize(("query", "title"), [
+    ("Xbox Series S 512GB", "Xbox Series X 1TB"),
+    ("Xbox Series X", "Xbox Series S"),
+    ("Galaxy S23", "Galaxy S23+ 256GB"),
+    ("Apple iPhone 12 64GB", "Apple iPhone 12 64GB + Zubehörpaket"),
+    ("Xbox Series S 512GB", "Xbox Series S + 2 Controller + 5 Spiele"),
+    ("PS5 Disc Edition", "PS5 Disc Edition Controller"),
+    ("PS5 Digital Edition", "Spiele für PS5 Digital Edition (5 Stück)"),
+    ("iPhone 13", "iPhone 13 OVP leer"),
+    ("iPhone 13", "iPhone 13 OVP Originalverpackung ohne Gerät"),
+    ("RTX 3080", "RTX 3080 Backplate"),
+    ("RTX 3080", "EKWB Wasserkühler für RTX 3080 FE"),
+    ("DeWalt DCD796 P2", "DeWalt DCD796 solo"),
+    ("Makita DHP485", "Makita DHP485 nur das Grundgerät"),
+    ("Nintendo Switch OLED", "Switch OLED nur Tablet"),
+    ("Dyson V11", "Dyson V11 ohne Akku"),
+    ("MacBook Pro 14 M1 Pro", "MacBook Pro 14 M1 Pro ohne SSD/Festplatte"),
+])
+def test_benchmark_non_matches(query, title):
+    ok, reason = comparable_matches(query, title)
+    assert not ok, reason
+
+
+@pytest.mark.parametrize(("a", "b"), [
+    ("iPhone 14 Pro 256GB Graphit", "iPhone 14 Pro 256GB Gold"),
+    ("iPhone 13 Mitternacht 128GB", "iPhone 13 128GB Polarstern"),
+    ("iPhone 13 Pro Sierrablau 256GB", "iPhone 13 Pro 256GB"),
+    ("iPhone 14 Pro Max Dunkellila 1TB", "iPhone 14 Pro Max 1TB Space Schwarz"),
+    ("iPhone 15 Pro Titan Blau 256GB", "iPhone 15 Pro 256GB Titan Natur"),
+    ("Galaxy S21 Phantom Black 128GB", "Galaxy S21 128GB"),
+    ("Pixel 8 Obsidian 128GB", "Google Pixel 8 Hazel 128GB"),
+    ("Pixel 7 Lemongrass", "Pixel 7 Snow"),
+    ("Galaxy S23 Cream 256GB", "Galaxy S23 Lavender 256GB"),
+    ("iPhone 12 Rosé 64GB", "iPhone 12 Grün 64GB"),
+    ("MacBook Air M2 2022 Space Grau 256GB", "MacBook Air M2 256GB Silber"),
+    ("Samsung Galaxy S23 2023", "Galaxy S23"),
+])
+def test_colours_and_years_are_not_identity(a, b):
+    assert key_of(a) is not None and key_of(a) == key_of(b)
+
+
+@pytest.mark.parametrize("title", ["Tablet zu verkaufen", "Drohne zu verkaufen", "Handy", "iPhone", "Samsung Tablet",
+                                   "Kopfhörer Bluetooth", "Grafikkarte", "Spielekonsole"])
+def test_vague_titles_have_no_key(title):
+    assert product_key(title) is None
+    assert history_key(title) is None
+
+
+@pytest.mark.parametrize(("title", "description", "missing", "kind"), [
+    ("DeWalt DCD796 solo", "", ("akku",), "item"),
+    ("Makita DHP485 nur das Grundgerät", "", ("akku",), "item"),
+    ("Switch OLED nur Tablet", "", ("dock", "joycons"), "part"),
+    ("Nintendo Switch Lite nur Konsole", "", (), "item"),
+    ("Dyson V11 ohne Akku", "", ("akku",), "part"),
+    ("MacBook Pro 14 M1 Pro ohne SSD/Festplatte", "", ("ssd",), "part"),
+    ("MacBook Air M1 ohne Netzteil", "", ("netzteil",), "item"),
+    ("MacBook Air M1 8GB", "Netzteil fehlt leider.", ("netzteil",), "item"),
+    ("PS5 ohne Controller", "", ("controller",), "item"),
+    ("PS5 Digital ohne Laufwerk", "", (), "item"),
+    ("iPhone 13 ohne Akku", "", ("akku",), "part"),
+    ("iPhone 13 128GB", "Kein Akku-Problem, keine Kratzer, ohne Mängel.", (), "item"),
+    ("RTX 3080 ohne Kühler", "", ("kuehler",), "part"),
+    ("DJI Mini 3 ohne Fernbedienung", "", ("fernbedienung",), "part"),
+    ("AirPods Pro ohne Ladecase", "", ("ladecase",), "part"),
+    ("Lenovo ThinkPad T480", "Festplatte wurde ausgebaut", ("ssd",), "part"),
+])
+def test_missing_parts(title, description, missing, kind):
+    ident = identify(title, description)
+    assert ident.missing == missing == missing_parts(title, description)
+    assert ident.kind == kind
+
+
+@pytest.mark.parametrize(("title", "hkey"), [
+    ("iPhone 13 128GB Mitternacht", "iphone|13||128gb"),
+    ("Lenovo ThinkPad T480 Laptop", "thinkpad|t480"),
+    ("Apple Mac mini M2 Desktop Computer", "mac mini|m2"),
+    ("RTX 3080 Backplate", "accessory:rtx|3080"),
+    ("EKWB Wasserkühler für RTX 3080 FE", "accessory:rtx|3080"),
+    ("Gaming PC RTX 3080 Ryzen 7", "complete_pc:rtx|3080"),
+    ("Xbox Series S + 2 Controller + 5 Spiele", "bundle:xbox|series s"),
+    ("RTX 3080 defekt", "defect:rtx|3080"),
+    ("Switch OLED nur Tablet", "part:nintendo switch|oled"),
+    ("Suche RTX 3080", None),
+    ("Tausche PS5 gegen Xbox", None),
+    ("Leere OVP RTX 3080 Karton", None),
+    ("iPhone Display Reparatur Service", None),
+])
+def test_history_key_never_mixes_kinds(title, hkey):
+    assert history_key(title) == hkey
+    assert identify(title).priceable is (hkey is not None and ":" not in hkey)

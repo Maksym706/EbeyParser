@@ -8,7 +8,10 @@ Two questions are answered for every ad title, without any I/O:
 * *What kind of offer is it?* -> :func:`classify_kind` returns a :data:`Kind`
   ("item", "part", "accessory", "complete_pc", "laptop", "box_only", "defect", ...).
 
-:func:`comparable_matches` combines both into the comparables filter.
+:func:`comparable_matches` combines both into the comparables filter,
+:func:`missing_parts` lists components the ad says are missing ("ohne Akku", "nur Tablet"),
+and :func:`identify` / :func:`history_key` bundle everything for the pricing engine
+(history key that never files a cooler, a gaming PC or a box under the GPU's key).
 
 Core rules
 ----------
@@ -1152,8 +1155,9 @@ def _m_dyson(s: str, toks: tuple[str, ...]) -> _Hit | None:
 _BOSCH_RE = re.compile(r"\b(g[a-z]{2}) ((?:\d{1,2}v )?\d{1,3}(?: \d{1,3})?)(?: (f|c|ec|b|e|k|h|d|re|dre))?\b")
 _MAKITA_RE = re.compile(r"\b((?:d[a-z]{2}|[a-z]{2})\d{3,4})([a-z]{1,4})?\b")
 _DEWALT_RE = re.compile(r"\b(dc[a-z]\d{3,4}|dw[a-z]?\d{3,4})([a-z]{1,2}\d?[a-z]?)?\b")
-_SOLO_RE = re.compile(r"\b(?:solo|sologeraet|body only|nur (?:das )?geraet|ohne akkus?(?: und ladegeraet)?|"
-                      r"ohne akku und lader|baremetal|tool only)\b")
+_SOLO_RE = re.compile(r"\b(?:solo|sologeraet|grundgeraet|body only|nur (?:das )?(?:geraet|werkzeug|maschine)|"
+                      r"ohne (?:akkus?|ladegeraet|lader)(?: (?:und|oder|u) (?:akkus?|ladegeraet|lader))?|"
+                      r"baremetal|tool only)\b")
 
 
 def _m_tools(s: str, toks: tuple[str, ...]) -> _Hit | None:
@@ -1378,6 +1382,7 @@ def _fold(ch: str) -> str:
     return base if base.isascii() else ch
 
 
+@lru_cache(maxsize=4096)
 def _flag_tokens(text: str) -> str:
     """Lowercase words plus clause punctuation as tokens ("display gebrochen , sonst ok .")."""
     t = unicodedata.normalize("NFKC", text).lower().translate(_TRANSLIT).replace("\n", " . ")
@@ -1424,7 +1429,9 @@ _BOX_RX = _rx([
     r"schachtel|packung|originalverpackung|originalkarton|leerkarton)",
     r"leer(?:e|er|es|en)? (?:original ?)?(?:ovp|karton|verpackung|box|schachtel|originalverpackung|originalkarton)",
     r"(?:ovp|karton|verpackung|box|schachtel|originalverpackung|originalkarton) (?:ist )?leer",
-    r"leerkarton", r"(?:ovp|karton|verpackung|box) ohne (?:inhalt|geraet|handy|konsole|telefon|iphone|smartphone)",
+    r"leerkarton",
+    r"(?:ovp|karton|verpackung|box|originalverpackung|originalkarton|schachtel|packung) ohne "
+    r"(?:inhalt|geraet|handy|konsole|telefon|iphone|smartphone|ipad|tablet|laptop|karte|grafikkarte)",
     r"ohne inhalt", r"box only", r"empty box", r"only (?:the )?box",
 ])
 _BOX_POST_OK = frozenset("fehlt fehlen hat weist zeigt leicht etwas beschaedigt leider minimal eingedrueckt "
@@ -1605,7 +1612,9 @@ _AKKU_DEVICE = frozenset(
     schlagbohrschrauber kombihammer schrauberset set""".split())
 _ADDON_CONNECTORS = frozenset({"und", "mit", "inkl", "inklusive", "incl", "sowie", "samt", "zzgl", "nebst", "dazu"})
 _FOR_WORDS = frozenset({"fuer", "fuers", "for", "passend", "kompatibel"})
-_BUNDLE_WORDS = frozenset({"bundle", "konvolut", "sammlung", "paket", "lot", "aufruestkit", "aufruestset"})
+_BUNDLE_WORDS = frozenset({"bundle", "konvolut", "sammlung", "paket", "lot", "aufruestkit", "aufruestset",
+                           "zubehoerpaket", "zubehoerset", "spielepaket", "starterpaket", "starterset",
+                           "komplettpaket", "komplettset", "zubehoerbundle", "spielebundle"})
 _MOBILE_CPU_RE = re.compile(r"\b\d{4,5}(?:h|hs|hx|hk|u)\b|\blaptop gpu\b|\bmobile gpu\b|\bmax q\b")
 
 
@@ -1704,14 +1713,122 @@ def _is_bundle(toks: tuple[str, ...], hit: _Hit | None) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Missing parts ("ohne Akku", "SSD fehlt", "nur Tablet")
+# ---------------------------------------------------------------------------
+
+# component word -> canonical name
+_MISSING_VOCAB = {
+    "akku": "akku", "akkus": "akku", "batterie": "akku",
+    "netzteil": "netzteil", "ladegeraet": "netzteil", "ladekabel": "netzteil", "lader": "netzteil",
+    "netzkabel": "netzteil",
+    "ssd": "ssd", "festplatte": "ssd", "hdd": "ssd",
+    "ram": "ram", "arbeitsspeicher": "ram",
+    "controller": "controller", "controllern": "controller", "gamepad": "controller",
+    "joycons": "joycons", "joycon": "joycons",
+    "dock": "dock", "dockingstation": "dock",
+    "fernbedienung": "fernbedienung",
+    "mainboard": "mainboard", "motherboard": "mainboard", "logicboard": "mainboard",
+    "display": "display", "bildschirm": "display",
+    "cpu": "cpu", "prozessor": "cpu",
+    "grafikkarte": "gpu", "gpu": "gpu",
+    "kuehler": "kuehler", "luefter": "kuehler",
+    "tastatur": "tastatur",
+    "kabel": "kabel",
+    "ladestation": "ladestation",
+    "ladecase": "ladecase",
+}
+_MISSING_AFTER = frozenset({"fehlt", "fehlen", "ausgebaut", "entfernt"})
+_MISSING_AFTER_NICHT = frozenset({"dabei", "enthalten", "vorhanden", "inklusive", "inkl", "beiliegend"})
+_NOT_MISSING_NEXT = frozenset(
+    "problem probleme problemen schaden schaeden verschleiss tausch wechsel fehler defekt kratzer "
+    "gebrauchsspuren mangel maengel".split())
+_MISSING_SKIP = frozenset({"original", "originales", "originalen", "das", "den", "die", "der", "eigenes", "eigene",
+                           "eigenen", "passendes", "passende", "passenden"})
+# missing components that make the offer a part rather than the product, by category
+_MAJOR_MISSING: dict[str, frozenset[str]] = {
+    "phone": frozenset({"akku", "display", "mainboard"}),
+    "tablet": frozenset({"akku", "display", "mainboard"}),
+    "watch": frozenset({"akku", "display", "mainboard"}),
+    "laptop": frozenset({"ssd", "ram", "display", "mainboard", "cpu", "tastatur"}),
+    "desktop": frozenset({"ssd", "ram", "mainboard", "cpu"}),
+    "console": frozenset({"ssd", "mainboard", "dock", "joycons"}),
+    "handheld": frozenset({"ssd", "display", "mainboard"}),
+    "gpu": frozenset({"kuehler"}),
+    "vacuum": frozenset({"akku", "mainboard"}),
+    "drone": frozenset({"fernbedienung", "controller", "akku"}),
+    "audio": frozenset({"ladecase", "akku"}),
+    "other": frozenset({"mainboard", "display"}),
+}
+
+
+def _missing_in(ft: str) -> list[str]:
+    toks = ft.split()
+    out: list[str] = []
+    for i, t in enumerate(toks):
+        if t == "ohne" or (t in ("kein", "keine", "keinen") and i + 1 < len(toks)):
+            j = i + 1
+            while j < len(toks) and toks[j] in _MISSING_SKIP:
+                j += 1
+            while j < len(toks) and toks[j] in _MISSING_VOCAB:
+                if j + 1 < len(toks) and toks[j + 1] in _NOT_MISSING_NEXT:
+                    break
+                out.append(_MISSING_VOCAB[toks[j]])
+                j += 1
+                if j + 1 < len(toks) and toks[j] in ("und", "oder", "u", "bzw", "sowie") \
+                        and toks[j + 1] in _MISSING_VOCAB:
+                    j += 1
+        elif t in _MISSING_VOCAB and i + 1 < len(toks):
+            nxt = toks[i + 1]
+            nxt2 = toks[i + 2] if i + 2 < len(toks) else ""
+            if nxt in ("wurde", "ist", "sind", "wurden") and nxt2 in _MISSING_AFTER:
+                nxt = nxt2
+            if nxt in _MISSING_AFTER or (nxt == "nicht" and nxt2 in _MISSING_AFTER_NICHT):
+                if not _negated_before(toks[:i]):
+                    out.append(_MISSING_VOCAB[t])
+    return out
+
+
+def missing_parts(title: str, description: str = "") -> tuple[str, ...]:
+    """Components the ad says are missing: 'MacBook Pro ohne SSD' -> ('ssd',),
+    'Switch OLED nur Tablet' -> ('dock', 'joycons'), 'DeWalt DCD796 solo' -> ('akku',).
+    Names: akku netzteil ssd ram controller joycons dock fernbedienung mainboard display cpu
+    gpu kuehler tastatur kabel ladestation ladecase."""
+    if not title:
+        return ()
+    _, hit = _analyze(title)
+    found = _missing_in(_flag_tokens(title))
+    if description:
+        found += _missing_in(_flag_tokens(description))
+    s = " ".join(_tokens(title))
+    key = hit.key if hit else None
+    switch = key is not None and key.family == "nintendo switch"
+    if switch and key.model != "lite" and re.search(
+            r"\bnur (?:das |die )?(?:tablet|display|konsole|geraet|handheld)\b", s):
+        found += ["dock", "joycons"]  # the Switch without dock and Joy-Cons
+    elif hit and hit.category == "console" and not switch and re.search(
+            r"\bnur (?:die |das )?(?:konsole|geraet)\b", s):
+        found.append("controller")
+    if key and "solo" in key.variant:
+        found.append("akku")
+    return tuple(sorted(set(found)))
+
+
+def _major_missing(missing: tuple[str, ...], hit: _Hit | None) -> bool:
+    if not missing or hit is None:
+        return False
+    return bool(_MAJOR_MISSING.get(hit.category, frozenset()).intersection(missing))
+
+
 _ADDON = ("part", "accessory")
 
 
 def classify_kind(title: str, description: str = "", *, query_kind_hint: str | None = None) -> Kind:
     """What an ad offers. Title rules (priority order): wanted > service > box_only > swap >
-    defect > complete_pc > laptop > part/accessory > bundle > item. The description is only
-    used for strong signals (defect, box only, swap only), with negations and legal
-    disclaimers ("keine Rücknahme bei Defekten") ignored.
+    defect > complete_pc > part (major component missing, see missing_parts) > laptop >
+    part/accessory > bundle > item. The description is only used for strong signals (defect,
+    box only, swap only, missing components), with negations and legal disclaimers
+    ("keine Rücknahme bei Defekten") ignored.
 
     query_kind_hint: the kind that is normal for the product being priced ("laptop" for a
     ThinkPad, "complete_pc" for a Mac mini, "part" when the search itself is for a part).
@@ -1737,6 +1854,8 @@ def classify_kind(title: str, description: str = "", *, query_kind_hint: str | N
         kind = "defect"
     elif _is_complete_pc(s, toks) and not (hit and hit.category in ("laptop",)):
         kind = "complete_pc"
+    elif _major_missing(missing_parts(title, description), hit):
+        kind = "part"  # "MacBook Pro ohne SSD", "Dyson V11 ohne Akku", "Switch OLED nur Tablet"
     elif _is_laptop(s, toks, hit):
         kind = "laptop"
     elif (addon := _addon_kind(toks, hit)) is not None:
@@ -1819,3 +1938,46 @@ def _generic_word_match(query: str, title: str) -> tuple[bool, str]:
     if missing:
         return False, f"missing {' '.join(missing)!r}"
     return True, "generic query: all words present"
+
+
+# ---------------------------------------------------------------------------
+# One-call summary for the engine
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Identity:
+    """Everything the pricing engine needs to know about one ad."""
+
+    key: ProductKey | None
+    kind: str  # a Kind; the product's natural kind (laptop for a ThinkPad) is reported as "item"
+    category: str | None
+    missing: tuple[str, ...] = ()
+
+    @property
+    def priceable(self) -> bool:
+        """Can this ad be compared with the market price of its product?"""
+        return self.key is not None and self.kind == "item"
+
+    def history_key(self) -> str | None:
+        """Key to remember this ad's price under: the product key for plain items, a kind-prefixed
+        key for bundles/PCs/parts/defects ('accessory:rtx|3080' never pollutes 'rtx|3080'), None
+        when the ad is no price signal (wanted, swap, service, box only) or names no model."""
+        if self.key is None or self.kind in _NEVER_COMPARABLE or self.kind == "unknown":
+            return None
+        k = self.key.key()
+        return k if self.kind == "item" else f"{self.kind}:{k}"
+
+
+def identify(title: str, description: str = "") -> Identity:
+    """ProductKey + kind (natural kind folded into "item") + missing components of one ad."""
+    _, hit = _analyze(title) if title else ((), None)
+    key = hit.key if hit else None
+    category = hit.category if hit else None
+    kind = classify_kind(title, description, query_kind_hint=natural_kind(key, category))
+    return Identity(key, kind, category, missing_parts(title, description))
+
+
+def history_key(title: str, description: str = "") -> str | None:
+    """Shortcut for identify(title, description).history_key()."""
+    return identify(title, description).history_key()
