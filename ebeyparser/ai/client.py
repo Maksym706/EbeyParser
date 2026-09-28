@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 from typing import Any, Protocol
 
 import httpx
@@ -63,6 +64,51 @@ def _model_names_match(wanted: str, available: str) -> bool:
     return w in (tail, tail.removesuffix(".gguf"))
 
 
+_NOISE_TOKENS = re.compile(
+    r"(?:^|[-_.:\s])(?:instruct|it|chat|gguf|mlx|latest|hf|q\d[\w]*|\d+bit|fp16|bf16|f16)(?=$|[-_.:\s])"
+)
+
+
+def canonical_model_name(name: str) -> str:
+    """'qwen/Qwen2.5-VL-7B-Instruct-GGUF' and 'qwen2.5vl:7b' both -> 'qwen25vl7b'."""
+    tail = name.strip().lower().replace("\\", "/").rsplit("/", 1)[-1].removesuffix(".gguf")
+    previous = None
+    while previous != tail:  # tokens can be adjacent: "-instruct-q4_k_m"
+        previous, tail = tail, _NOISE_TOKENS.sub("", tail)
+    return re.sub(r"[^a-z0-9]", "", tail)
+
+
+def find_model(wanted: str, available: list[str]) -> str | None:
+    """The server's own id for the configured model: exact, then publisher/path, then fuzzy."""
+    for name in available:
+        if _model_names_match(wanted, name):
+            return name
+    key = canonical_model_name(wanted)
+    if key:
+        for name in available:
+            if canonical_model_name(name) == key:
+                return name
+    return None
+
+
+def _model_missing(body: str) -> bool:
+    low = body.lower()
+    return "model" in low and any(
+        w in low for w in ("not found", "not loaded", "no model", "does not exist", "invalid model",
+                           "unknown model", "failed to load")
+    )
+
+
+VISION_HINTS = ("vl", "vision", "llava", "gemma-3", "gemma3", "minicpm-v", "minicpmv", "pixtral",
+                "moondream", "internvl", "molmo", "multimodal", "mistral-small-3", "glm-4.1v",
+                "glm-4.5v", "kimi-vl", "qwen3-vl", "qwen2.5-omni", "llama-4")
+
+
+def looks_like_vision_model(name: str) -> bool:
+    low = name.lower()
+    return any(h in low for h in VISION_HINTS) and "embed" not in low
+
+
 class VisionLLM:
     """chat_json / health / aclose for Ollama and OpenAI-compatible servers."""
 
@@ -73,6 +119,8 @@ class VisionLLM:
             )
         self.cfg = cfg
         self.provider = cfg.provider
+        self._resolved_model: str | None = None  # the server's exact id for cfg.model
+        self._resolve_tried = False
         base = (cfg.base_url or "").strip().rstrip("/")
         if not base:
             base = "http://localhost:11434" if cfg.provider == "ollama" else "http://localhost:1234"
@@ -170,7 +218,7 @@ class VisionLLM:
         if images:
             user_msg["images"] = [_b64(img) for img in images]
         payload: dict[str, Any] = {
-            "model": self.cfg.model,
+            "model": self.model_name,
             "messages": [{"role": "system", "content": system}, user_msg],
             "stream": False,
             "format": schema or "json",
@@ -205,7 +253,7 @@ class VisionLLM:
         else:
             content = user  # plain string: some servers reject list content without images
         payload: dict[str, Any] = {
-            "model": self.cfg.model,
+            "model": self.model_name,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": content},
@@ -221,19 +269,14 @@ class VisionLLM:
                 "type": "json_schema",
                 "json_schema": {"name": "verdict", "strict": True, "schema": schema},
             })
-        url = self._chat_url()
-        for i, fmt in enumerate(formats):
-            if fmt is None:
-                payload.pop("response_format", None)
-            else:
-                payload["response_format"] = fmt
-            resp = await self._request("POST", url, payload)
-            rejected = resp.status_code in (400, 422) and any(
-                word in resp.text.lower() for word in ("response_format", "json_schema", "json_object")
-            )
-            if not rejected or i == len(formats) - 1:
-                break
-            log.info("Server rejected response_format %s, trying a simpler one", fmt and fmt["type"])
+        resp = await self._post_openai(payload, formats)
+        if resp.status_code in (400, 404, 422) and _model_missing(resp.text) and not self._resolve_tried:
+            # e.g. config says "qwen2.5-vl-7b-instruct", LM Studio calls it "qwen/qwen2.5-vl-7b"
+            await self._resolve_model()
+            if self._resolved_model and self._resolved_model != payload["model"]:
+                log.info("Using server model id %r for %r", self._resolved_model, self.cfg.model)
+                payload["model"] = self._resolved_model
+                resp = await self._post_openai(payload, formats)
         if resp.status_code >= 400:
             raise self._http_error(resp)
         data = self._json(resp)
@@ -248,10 +291,45 @@ class VisionLLM:
             )
         return content_out or ""
 
+    async def _post_openai(
+        self, payload: dict[str, Any], formats: list[dict[str, Any] | None]
+    ) -> httpx.Response:
+        url = self._chat_url()
+        for i, fmt in enumerate(formats):
+            if fmt is None:
+                payload.pop("response_format", None)
+            else:
+                payload["response_format"] = fmt
+            resp = await self._request("POST", url, payload)
+            rejected = resp.status_code in (400, 422) and any(
+                word in resp.text.lower() for word in ("response_format", "json_schema", "json_object")
+            )
+            if not rejected or i == len(formats) - 1:
+                return resp
+            log.info("Server rejected response_format %s, trying a simpler one", fmt and fmt["type"])
+        return resp
+
+    @property
+    def model_name(self) -> str:
+        """What we send as "model": the server's exact id when we found it, else the config value."""
+        return self._resolved_model or self.cfg.model
+
+    async def _resolve_model(self) -> None:
+        """Once per client: map e.g. 'qwen2.5-vl-7b-instruct' to LM Studio's 'qwen/qwen2.5-vl-7b'."""
+        if self._resolve_tried:
+            return
+        self._resolve_tried = True
+        try:
+            await self.health()
+        except Exception as exc:  # never block a chat on this
+            log.debug("Model name resolution failed: %s", exc)
+
     async def health(self) -> dict:
         """Is the server up and is the configured model installed/loaded?"""
         info: dict[str, Any] = {
             "ok": False,
+            "server_ok": False,
+            "resolved_model": None,
             "provider": self.provider,
             "base_url": self.base_url,
             "model": self.cfg.model,
@@ -267,11 +345,16 @@ class VisionLLM:
         except LLMError as exc:
             info["error"] = str(exc)
             return info
+        info["server_ok"] = True
         key, field = ("models", "name") if self.provider == "ollama" else ("data", "id")
         items = data.get(key, []) if isinstance(data, dict) else []
         names = [str(m.get(field) or m.get("model") or "") for m in items if isinstance(m, dict)]
         info["models"] = [n for n in names if n]
-        info["model_available"] = any(_model_names_match(self.cfg.model, n) for n in info["models"])
+        match = find_model(self.cfg.model, info["models"])
+        if match is not None:
+            self._resolved_model = match
+            info["resolved_model"] = match
+        info["model_available"] = match is not None
         info["ok"] = info["model_available"]
         if not info["model_available"]:
             if self.provider == "ollama":

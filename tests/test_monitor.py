@@ -271,3 +271,38 @@ def test_ad_id_from_url():
     assert ad_id_from_url("https://www.ebay.de/itm/123456789012?hash=x") == "ebay-123456789012"
     assert ad_id_from_url("https://www.ebay.de/itm/rtx-3080-gaming/123456789012") == "ebay-123456789012"
     assert ad_id_from_url("https://example.com") is None
+
+
+def test_set_ai_model_in_config_only_touches_ai_block(tmp_path):
+    from ebeyparser.cli import set_ai_model_in_config
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "general:\n  interval_minutes: 15\n"
+        "ai:\n  enabled: true\n  provider: openai\n  model: qwen2.5-vl-7b-instruct   # comment\n"
+        "  second_opinion:\n    model: claude-opus-5\n"
+        "web:\n  port: 8000\n", encoding="utf-8")
+    assert set_ai_model_in_config(cfg, "qwen/qwen2.5-vl-7b")
+    text = cfg.read_text(encoding="utf-8")
+    assert "  model: qwen/qwen2.5-vl-7b   # comment\n" in text
+    assert "    model: claude-opus-5\n" in text
+    assert not set_ai_model_in_config(tmp_path / "missing.yaml", "x")
+
+
+def test_ai_check_lists_models_and_fixes_config(tmp_path, monkeypatch, capsys):
+    from ebeyparser import cli
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("ai:\n  enabled: true\n  provider: openai\n  model: qwen2.5-vl-7b-instruct\n", encoding="utf-8")
+
+    async def fake_health(self):
+        return {"ok": False, "server_ok": True, "provider": "openai", "base_url": "http://localhost:1234/v1",
+                "model": "qwen2.5-vl-7b-instruct", "models": ["text-embedding-x", "google/gemma-3-12b"],
+                "model_available": False, "error": "not loaded"}
+
+    monkeypatch.setattr(Monitor, "ai_health", fake_health)
+    assert cli.main(["-c", str(cfg), "ai-check"]) == 1
+    out = capsys.readouterr().out
+    assert "google/gemma-3-12b   ← умеет смотреть фото" in out and "ai-check --fix" in out
+    assert cli.main(["-c", str(cfg), "ai-check", "--fix"]) == 0
+    assert "  model: google/gemma-3-12b\n" in cfg.read_text(encoding="utf-8")

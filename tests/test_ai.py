@@ -513,3 +513,47 @@ async def test_evaluator_unexpected_exception_does_not_raise():
     cfg = AIConfig()
     v = await AIEvaluator(Broken(), cfg).evaluate(make_listing(), [])  # type: ignore[arg-type]
     assert v.verdict == "maybe" and v.confidence == 0.0 and "boom" in v.reasoning
+
+
+# --------------------------------------------------------------------------- model name resolution
+
+
+def test_canonical_model_names_and_find_model():
+    from ebeyparser.ai.client import canonical_model_name, find_model, looks_like_vision_model
+
+    same = ["qwen2.5-vl-7b-instruct", "qwen/qwen2.5-vl-7b", "Qwen2.5-VL-7B-Instruct-GGUF",
+            "qwen2.5vl:7b", "lmstudio-community/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf"]
+    assert {canonical_model_name(n) for n in same} == {"qwen25vl7b"}
+    assert canonical_model_name("qwen2.5-vl-3b-instruct") != canonical_model_name("qwen2.5-vl-7b")
+    served = ["text-embedding-nomic-embed-text-v1.5", "google/gemma-3-12b", "qwen/qwen2.5-vl-7b"]
+    assert find_model("qwen2.5-vl-7b-instruct", served) == "qwen/qwen2.5-vl-7b"
+    assert find_model("gemma-3-12b-it", served) == "google/gemma-3-12b"
+    assert find_model("qwen2.5-vl-3b-instruct", served) is None
+    assert looks_like_vision_model("qwen/qwen2.5-vl-7b") and looks_like_vision_model("google/gemma-3-12b")
+    assert not looks_like_vision_model("text-embedding-nomic-embed-text-v1.5")
+    assert not looks_like_vision_model("deepseek-r1-distill-qwen-7b")
+
+
+async def test_health_resolves_lmstudio_id_and_reports_server_ok():
+    rec = Recorder(httpx.Response(200, json={"data": [{"id": "qwen/qwen2.5-vl-7b"}]}))
+    llm = make_llm(rec, provider="openai", base_url="http://localhost:1234/v1", model="qwen2.5-vl-7b-instruct")
+    info = await llm.health()
+    assert info["server_ok"] and info["ok"] and info["resolved_model"] == "qwen/qwen2.5-vl-7b"
+    assert llm.model_name == "qwen/qwen2.5-vl-7b"
+
+    rec = Recorder(httpx.Response(200, json={"data": [{"id": "google/gemma-3-12b"}]}))
+    info = await make_llm(rec, provider="openai", base_url="http://x/v1", model="qwen2.5-vl-7b").health()
+    assert info["server_ok"] and not info["ok"] and info["models"] == ["google/gemma-3-12b"]
+
+
+async def test_openai_retries_with_server_model_id_after_model_not_found():
+    rec = Recorder(
+        httpx.Response(404, json={"error": {"message": "Model qwen2.5-vl-7b-instruct not found"}}),
+        httpx.Response(200, json={"data": [{"id": "qwen/qwen2.5-vl-7b"}]}),
+        openai_reply('{"verdict": "buy"}'),
+    )
+    llm = make_llm(rec, provider="openai", base_url="http://localhost:1234/v1", model="qwen2.5-vl-7b-instruct")
+    assert await llm.chat_json("s", "u", [JPEG], VERDICT_SCHEMA) == '{"verdict": "buy"}'
+    assert rec.body(0)["model"] == "qwen2.5-vl-7b-instruct"
+    assert rec.requests[1].url.path == "/v1/models"
+    assert rec.body(2)["model"] == "qwen/qwen2.5-vl-7b"

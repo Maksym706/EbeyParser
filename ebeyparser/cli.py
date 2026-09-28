@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import re
 import shutil
 import signal
 import sys
@@ -270,30 +271,78 @@ def cmd_ebay_limits(args: argparse.Namespace) -> int:
     return 0
 
 
+def set_ai_model_in_config(path: Path, model: str) -> bool:
+    """Replace `model:` inside the top-level `ai:` block (not second_opinion), keeping comments."""
+    if not path.is_file():
+        return False
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    in_ai = False
+    for i, line in enumerate(lines):
+        if re.match(r"^ai:\s*(#.*)?$", line):
+            in_ai = True
+            continue
+        if in_ai and re.match(r"^\S", line):  # next top-level section
+            break
+        if in_ai and re.match(r"^  model:", line):
+            comment = re.search(r"\s+#.*$", line.rstrip("\n"))
+            lines[i] = f"  model: {model}{comment.group(0) if comment else ''}\n"
+            path.write_text("".join(lines), encoding="utf-8")
+            return True
+    return False
+
+
 def cmd_ai_check(args: argparse.Namespace) -> int:
+    from .ai.client import looks_like_vision_model
     from .monitor import Monitor
 
-    config = load_config(Path(args.config))
+    config_path = Path(args.config)
+    config = load_config(config_path)
     config.ai.enabled = True  # check even if not switched on yet
     monitor = Monitor(config, Database())
     health = asyncio.run(monitor.ai_health())
+    lmstudio = config.ai.provider == "openai"
     if health.get("ok") and health.get("model_available"):
-        print(f"✔ {health['provider']} на {health['base_url']} работает, модель {health['model']} найдена.")
+        resolved = health.get("resolved_model")
+        print(f"✔ {health['provider']} на {health['base_url']} работает, модель {resolved or health['model']} найдена.")
+        if resolved and resolved != health["model"]:
+            print(f"   (в конфиге «{health['model']}», на сервере она называется «{resolved}» — буду использовать её)")
         return 0
-    if health.get("ok"):
-        print(f"⚠  Сервер {health['base_url']} отвечает, но модели {health['model']} нет.")
-        if health.get("models"):
-            print(f"   Установленные модели: {', '.join(health['models'])}")
-        if config.ai.provider == "ollama":
-            print(f"   Скачай её: ollama pull {health['model']}")
+
+    if not health.get("server_ok"):
+        print(f"✖ Сервер модели недоступен: {health.get('error')}")
+        if lmstudio:
+            print("   LM Studio: вкладка Developer → Start Server (или команда `lms server start`),"
+                  " адрес по умолчанию http://localhost:1234/v1")
         else:
-            print("   LM Studio: скачай vision-модель во вкладке Discover и впиши в ai.model её "
-                  "идентификатор из списка выше (или просто загрузи её в LM Studio).")
+            print("   Ollama: запусти приложение Ollama или команду `ollama serve`")
         return 1
-    print(f"✖ Модель недоступна: {health.get('error')}")
-    if config.ai.provider == "openai":
-        print("   LM Studio: вкладка Developer → Start Server (или команда `lms server start`), "
-              "адрес по умолчанию http://localhost:1234/v1")
+
+    models = health.get("models") or []
+    print(f"⚠  Сервер {health['base_url']} работает, но модели «{health['model']}» на нём нет.")
+    if not models:
+        print("   На сервере вообще нет моделей." + (
+            " Скачай vision-модель в LM Studio (вкладка Discover), например Qwen2.5-VL-7B-Instruct."
+            if lmstudio else f" Скачай: ollama pull {health['model']}"))
+        return 1
+    print("   Модели на сервере:")
+    for name in models:
+        print(f"     • {name}{'   ← умеет смотреть фото' if looks_like_vision_model(name) else ''}")
+    vision = [m for m in models if looks_like_vision_model(m)]
+    if not vision:
+        print("   ⚠ Ни одна из них не похожа на vision-модель — а программе нужна модель, которая видит фото"
+              " (Qwen2.5-VL, Gemma 3, MiniCPM-V, LLaVA...).")
+        return 1
+    best = vision[0]
+    if args.fix:
+        if set_ai_model_in_config(config_path, best):
+            print(f"✔ Записал в {config_path}: model: {best}. Запусти ai-check ещё раз.")
+            return 0
+        print(f"✖ Не нашёл строку model: в разделе ai: файла {config_path} — впиши вручную: model: {best}")
+        return 1
+    print(f"   Впиши в {config_path} в раздел ai:   model: {best}")
+    print("   или просто выполни:  python -m ebeyparser ai-check --fix")
+    if not lmstudio:
+        print(f"   (или скачай нужную: ollama pull {health['model']})")
     return 1
 
 
@@ -328,7 +377,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("demo", help="заполнить базу демо-данными для просмотра интерфейса").set_defaults(func=cmd_demo)
     sub.add_parser("test-notify", help="отправить тестовое уведомление").set_defaults(func=cmd_test_notify)
-    sub.add_parser("ai-check", help="проверить, доступна ли локальная модель").set_defaults(func=cmd_ai_check)
+    p = sub.add_parser("ai-check", help="проверить, доступна ли локальная модель")
+    p.add_argument("--fix", action="store_true", help="сам вписать в config.yaml найденную vision-модель")
+    p.set_defaults(func=cmd_ai_check)
     p = sub.add_parser("ebay-limits", help="показать лимиты запросов твоего ключа eBay")
     p.add_argument("--all", action="store_true", help="все API, а не только Buy (Browse)")
     p.set_defaults(func=cmd_ebay_limits)
