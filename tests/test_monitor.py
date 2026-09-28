@@ -347,3 +347,28 @@ def test_once_reevaluate_clears_old_verdicts(tmp_path, monkeypatch, capsys):
     cli.main(["-c", str(cfg), "once", "--reevaluate"])
     assert "Сбросил старые оценки (1 шт.)" in capsys.readouterr().out
     assert Database(tmp_path / "data" / "ebeyparser.sqlite3").get_evaluation("9001") is None
+
+
+def test_config_missing_space_after_colon_is_tolerated(tmp_path, caplog):
+    from ebeyparser.config import load_config
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("pricing:\n  min_profit: 50\n  reference_prices:[]\nai:\n  model:qwen/qwen2.5-vl-7b\n"
+                   "  base_url: http://localhost:1234/v1\n", encoding="utf-8")
+    config = load_config(cfg)
+    assert config.pricing.reference_prices == [] and config.pricing.min_profit == 50
+    assert config.ai.model == "qwen/qwen2.5-vl-7b" and config.ai.base_url == "http://localhost:1234/v1"
+    assert "строки 3, 5" in caplog.text
+
+
+def test_broken_config_gives_readable_error(tmp_path, capsys):
+    from ebeyparser import cli
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("pricing:\n  min_profit: 50\n   bad_indent: [\n", encoding="utf-8")
+    assert cli.main(["-c", str(cfg), "once"]) == 2
+    out = capsys.readouterr().out
+    assert out.startswith("✖ Не могу прочитать") and "строка" in out
+    cfg.write_text("pricing:\n  min_profit: много\n", encoding="utf-8")
+    assert cli.main(["-c", str(cfg), "once"]) == 2
+    assert "pricing.min_profit" in capsys.readouterr().out

@@ -6,17 +6,26 @@ Secrets (SMTP password, Telegram token) can live in environment variables or a
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from .models import Purpose, Source
 
+log = logging.getLogger(__name__)
+
 DEFAULT_CONFIG_PATH = Path("config.yaml")
+# "reference_prices:[]" / "model:qwen" — a missing space after the key's colon
+_MISSING_SPACE_RE = re.compile(r"^(\s*(?:-\s+)?[A-Za-z_][\w-]*):(?=[^\s/])", re.MULTILINE)
+
+
+class ConfigError(Exception):
+    """config.yaml can't be read; the message says where and why, in plain Russian."""
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
 
@@ -242,8 +251,39 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     load_dotenv(cfg_path.parent / ".env")
     if not cfg_path.is_file():
         return AppConfig()
-    data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-    return parse_config(data)
+    data = _read_yaml(cfg_path)
+    try:
+        return parse_config(data)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in exc.errors()[:5]
+        )
+        raise ConfigError(f"В {cfg_path} неверные значения — {problems}") from exc
+
+
+def _read_yaml(cfg_path: Path) -> dict[str, Any]:
+    text = cfg_path.read_text(encoding="utf-8-sig")
+    try:
+        return yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        fixed = _MISSING_SPACE_RE.sub(r"\1: ", text)
+        if fixed != text:
+            try:
+                data = yaml.safe_load(fixed) or {}
+            except yaml.YAMLError:
+                pass
+            else:
+                lines = [n + 1 for n, (a, b) in enumerate(zip(text.splitlines(), fixed.splitlines())) if a != b]
+                log.warning("В %s после двоеточия не хватает пробела (строки %s) — прочитал как `ключ: значение`,"
+                            " но лучше поправь файл", cfg_path, ", ".join(map(str, lines)))
+                return data
+        mark = getattr(exc, "problem_mark", None)
+        where = f", строка {mark.line + 1}" if mark is not None else ""
+        problem = getattr(exc, "problem", None) or str(exc)
+        raise ConfigError(
+            f"Не могу прочитать {cfg_path}{where}: {problem}. Частые причины: нет пробела после двоеточия"
+            " (надо `ключ: значение`), сбиты отступы (только пробелы, по 2), табы вместо пробелов."
+        ) from exc
 
 
 def save_searches(path: str | Path, searches: list[SearchConfig]) -> None:

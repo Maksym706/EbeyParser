@@ -11,7 +11,7 @@ import signal
 import sys
 from pathlib import Path
 
-from .config import DEFAULT_CONFIG_PATH, AppConfig, load_config
+from .config import DEFAULT_CONFIG_PATH, AppConfig, ConfigError, load_config
 from .db import Database
 from .models import DealView
 
@@ -506,7 +506,11 @@ def main(argv: list[str] | None = None) -> int:
         if not hasattr(args, name):
             setattr(args, name, default)
     _setup_logging(args.verbose)
-    return args.func(args) or 0
+    try:
+        return args.func(args) or 0
+    except ConfigError as exc:
+        print(f"✖ {exc}")
+        return 2
 
 
 if __name__ == "__main__":
