@@ -7,6 +7,7 @@ Pure parsing functions work on HTML strings (easy to test offline);
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import math
 import re
@@ -353,8 +354,7 @@ def parse_search_results(html: str, search_name: str = "") -> list[Listing]:
 def _results_from_soup(soup: BeautifulSoup, search_name: str = "") -> list[Listing]:
     listings: list[Listing] = []
     seen: set[str] = set()
-    cards = soup.select("article.aditem") or soup.select("[data-adid]")
-    for article in cards:
+    for article in soup.select("article.aditem"):
         try:
             listing = _parse_card(article, search_name)
         except Exception:  # one odd card must not kill the whole page
@@ -364,56 +364,129 @@ def _results_from_soup(soup: BeautifulSoup, search_name: str = "") -> list[Listi
             seen.add(listing.ad_id)
             listings.append(listing)
     if not listings:
-        listings = _fallback_cards(soup, search_name)
+        listings = _generic_cards(soup, search_name)
     return listings
 
 
 _PRICE_IN_TEXT_RE = re.compile(
     r"(?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d{1,2})?\s*€(?:\s*VB)?|zu verschenken|\bVB\b", re.IGNORECASE
 )
+_POSTED_RE = re.compile(r"(?:heute|gestern)(?:,\s*\d{1,2}:\d{2})?|\d{1,2}\.\d{1,2}\.\d{4}", re.IGNORECASE)
+_TAG_WORDS = ("Versand möglich", "Nur Abholung", "Direkt kaufen", "Gesuch")
 
 
-def _fallback_cards(soup: BeautifulSoup, search_name: str = "") -> list[Listing]:
-    """The usual card markup is gone (site redesign?): rebuild ads from any
-    '/s-anzeige/<slug>/<id>-<cat>-<loc>' links and the text around them."""
-    groups: dict[str, list[Tag]] = {}
-    for a in soup.select('a[href*="/s-anzeige/"]'):
+def _ad_links(el: Tag) -> dict[str, list[Tag]]:
+    links: dict[str, list[Tag]] = {}
+    for a in el.select('a[href*="/s-anzeige/"]'):
         ad_id = _ad_id_from_url(a.get("href") or "")
         if ad_id:
-            groups.setdefault(ad_id, []).append(a)
+            links.setdefault(ad_id, []).append(a)
+    return links
+
+
+def _can_grow(box: Tag, ad_id: str) -> Tag | None:
+    parent = box.parent
+    if parent is None or parent.name in ("body", "html", "[document]", "main"):
+        return None
+    if any(other != ad_id for other in _ad_links(parent)):
+        return None  # the parent already holds a neighbouring ad
+    return parent
+
+
+def _card_box(start: Tag, ad_id: str) -> Tag:
+    """Grow from `start` (data-adid element or a link) to the whole card of `ad_id`:
+    first until it shows the ad link and a price, then up to the card root (li/article)
+    — never into a parent that also contains another ad."""
+    box = start
+    for _ in range(10):
+        if ad_id in _ad_links(box) and _PRICE_IN_TEXT_RE.search(_text(box)):
+            break
+        parent = _can_grow(box, ad_id)
+        if parent is None:
+            return box
+        box = parent
+    for _ in range(4):  # include the image / meta columns of the same card
+        if box.name in ("li", "article"):
+            break
+        parent = _can_grow(box, ad_id)
+        if parent is None:
+            break
+        box = parent
+    return box
+
+
+def _lines(el: Tag) -> list[str]:
+    return [line for raw in el.get_text("\n").split("\n") if (line := _clean(raw))]
+
+
+def _card_from_box(box: Tag, ad_id: str, search_name: str) -> Listing | None:
+    anchors = _ad_links(box).get(ad_id, [])
+    texts = [_text(a) or _clean(a.get("title")) for a in anchors]
+    title = max(texts, key=len) if any(texts) else ""
+    if not title:
+        heading = box.select_one("h2, h3")
+        img = box.select_one("img[alt]")
+        title = _text(heading) or (_clean(img.get("alt")) if img is not None else "")
+    if not title:
+        return None
+    href = anchors[0].get("href") if anchors else ""
+
+    clean_box = copy.copy(box)
+    for old in clean_box.select("s, del, strike, [class*=old-price], [class*=strike], [class*=line-through]"):
+        old.decompose()
+    price_match = _PRICE_IN_TEXT_RE.search(_text(clean_box))
+    price_text = price_match.group(0) if price_match else ""
+    price, negotiable, is_free = parse_price(price_text)
+
+    lines = _lines(box)
+    location = postal_code = posted = ""
+    distance = None
+    for line in lines:
+        if not postal_code and _POSTAL_RE.search(line) and "€" not in line:
+            cut = _POSTED_RE.search(line)
+            location, postal_code, distance = _parse_location(line[: cut.start()] if cut else line)
+        if not posted and (m := _POSTED_RE.search(line)):
+            posted = m.group(0)
+    body_lines = [ln for ln in lines if ln != title and len(ln) > 30 and "€" not in ln and not _POSTAL_RE.match(ln)]
+    description = max(body_lines, key=len) if body_lines else ""
+    full_text = " ".join(lines)
+    tags = [w for w in _TAG_WORDS if w.lower() in full_text.lower()]
+    shipping_possible, shipping_cost = _shipping_info(tags)
+    image = next((u for el in box.select("img, [data-imgsrc]")
+                  if (u := _image_from_element(el)) and _is_ad_image(u)), None)
+    return Listing(
+        ad_id=ad_id, source="kleinanzeigen",
+        url=_absolute(href) if href else f"{BASE_URL}/s-anzeige/{ad_id}",
+        title=title, price=price, price_text=price_text, negotiable=negotiable, is_free=is_free,
+        location=location, postal_code=postal_code or None, distance_km=distance,
+        posted_at_text=posted, description=description, image_urls=[image] if image else [],
+        shipping_possible=shipping_possible, shipping_cost=shipping_cost, tags=tags,
+        is_top_ad=box.select_one("[class*=topad], [class*=top-ad]") is not None,
+        search_name=search_name,
+    )
+
+
+def _generic_cards(soup: BeautifulSoup, search_name: str = "") -> list[Listing]:
+    """The classic card markup is gone (site redesign): find each ad by its data-adid
+    element or its '/s-anzeige/<slug>/<id>-<cat>-<loc>' links and read the card text."""
+    starts: dict[str, Tag] = {}
+    for el in soup.select("[data-adid]"):
+        ad_id = (el.get("data-adid") or "").strip()
+        if ad_id.isdigit():
+            starts.setdefault(ad_id, el)
+    for ad_id, anchors in _ad_links(soup).items():
+        starts.setdefault(ad_id, anchors[0])
     listings: list[Listing] = []
-    for ad_id, anchors in groups.items():
-        texts = [_text(a) or _clean(a.get("title")) for a in anchors]
-        imgs = [img for a in anchors for img in a.select("img")]
-        title = max(texts, key=len) if any(texts) else _clean(imgs[0].get("alt")) if imgs else ""
-        if not title:
+    for ad_id, start in starts.items():
+        try:
+            listing = _card_from_box(_card_box(start, ad_id), ad_id, search_name)
+        except Exception:
+            log.exception("Failed to parse a Kleinanzeigen card %s", ad_id)
             continue
-        # climb to the smallest ancestor that also shows a price
-        box: Tag | None = anchors[0]
-        price_match = None
-        for _ in range(8):
-            box = box.parent if box is not None else None
-            if box is None or box.name in ("body", "html"):
-                break
-            price_match = _PRICE_IN_TEXT_RE.search(_text(box))
-            if price_match:
-                break
-        container = box if price_match and box is not None else anchors[0]
-        price, negotiable, is_free = parse_price(price_match.group(0) if price_match else "")
-        image = next((u for el in container.select("img, [data-imgsrc]")
-                      if (u := _image_from_element(el)) and _is_ad_image(u)), None)
-        location, postal_code, distance = "", None, None
-        loc_match = re.search(r"\b\d{5}\b[^\n€]{0,40}", _text(container, "\n"))
-        if loc_match:
-            location, postal_code, distance = _parse_location(loc_match.group(0))
-        listings.append(Listing(
-            ad_id=ad_id, source="kleinanzeigen", url=_absolute(anchors[0].get("href") or ""),
-            title=title, price=price, price_text=price_match.group(0) if price_match else "",
-            negotiable=negotiable, is_free=is_free, location=location, postal_code=postal_code,
-            distance_km=distance, image_urls=[image] if image else [], search_name=search_name,
-        ))
+        if listing is not None:
+            listings.append(listing)
     if listings:
-        log.warning("Kleinanzeigen: card markup not recognised, used link fallback (%d ads)", len(listings))
+        log.debug("Kleinanzeigen: generic card parser used (%d ads)", len(listings))
     return listings
 
 
@@ -423,15 +496,18 @@ class PageLayoutError(Exception):
 
 _EMPTY_RESULT_MARKERS = (
     "es wurden leider keine anzeigen", "keine ergebnisse", "keine anzeigen gefunden",
-    "leider keine treffer", "wurden keine ergebnisse", "0 ergebnisse",
+    "leider keine treffer", "wurden keine ergebnisse",
 )
+_ZERO_RESULTS_RE = re.compile(r"(?<![\d.])0 (?:ergebnisse|anzeigen)\b")
 _CONSENT_MARKERS = ("gdpr-banner", "consent-banner", "cmp-", "didomi", "sp_message", "usercentrics",
                     "cookie-einstellungen", "datenschutzeinstellungen")
 
 
 def is_empty_results_page(html: str) -> bool:
+    """The site found nothing for the query/radius (it may still show 'similar' ads from
+    all over Germany below — those must not be treated as results)."""
     low = (html or "").lower()
-    return any(m in low for m in _EMPTY_RESULT_MARKERS)
+    return any(m in low for m in _EMPTY_RESULT_MARKERS) or bool(_ZERO_RESULTS_RE.search(low))
 
 
 def page_diagnostics(html: str) -> dict[str, object]:
@@ -501,6 +577,14 @@ def _detail_images(soup: BeautifulSoup) -> list[str]:
         if key not in seen:
             seen.add(key)
             urls.append(img)
+    if not urls:  # unknown gallery markup: any ad image on the page, in page order
+        for el in soup.select("img, [data-imgsrc], source"):
+            for img in [_image_from_element(el), *(u.strip().split(" ")[0] for u in (el.get("srcset") or "").split(","))]:
+                if img and "/prod-ads/images/" in img and _is_ad_image(img):
+                    key = img.split("?", 1)[0]
+                    if key not in seen:
+                        seen.add(key)
+                        urls.append(img)
     if not urls:
         for meta in soup.select('meta[property="og:image"]'):
             content = (meta.get("content") or "").strip()
@@ -508,6 +592,40 @@ def _detail_images(soup: BeautifulSoup) -> list[str]:
                 seen.add(content.split("?", 1)[0])
                 urls.append(content)
     return urls
+
+
+def _json_ld(soup: BeautifulSoup) -> dict[str, object]:
+    """Product data from <script type="application/ld+json"> (name, description, images, price)."""
+    found: dict[str, object] = {}
+
+    def walk(node: object) -> None:
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+        elif isinstance(node, dict):
+            kind = str(node.get("@type", "")).lower()
+            if kind in ("product", "offer", "individualproduct", "vehicle", "car") or "offers" in node:
+                for key in ("name", "description", "image", "price"):
+                    if key in node and key not in found:
+                        found[key] = node[key]
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value)
+
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:
+            walk(json.loads(script.string or script.get_text() or ""))
+        except (ValueError, TypeError):
+            continue
+    return found
+
+
+def _meta(soup: BeautifulSoup, *names: str) -> str:
+    for name in names:
+        el = soup.select_one(f'meta[property="{name}"], meta[name="{name}"]')
+        if el is not None and (el.get("content") or "").strip():
+            return _clean(el.get("content"))
+    return ""
 
 
 def _detail_title(soup: BeautifulSoup) -> tuple[str, list[str]]:
@@ -562,6 +680,10 @@ def parse_ad_detail(html: str, listing: Listing | None = None, url: str = "") ->
     """Parse an ad page and merge it into `listing` (a copy is returned, detail_loaded=True)."""
     soup = _soup(html)
     title, status_tags = _detail_title(soup)
+    ld = _json_ld(soup)
+    if not title:  # redesigned page: JSON-LD / <h1> / og:title
+        title = _clean(str(ld.get("name") or "")) or _text(soup.select_one("h1")) or re.sub(
+            r"\s*\|\s*kleinanzeigen.*$", "", _meta(soup, "og:title"), flags=re.IGNORECASE)
 
     price_text, price, negotiable, is_free = _price_from_element(
         _first(soup, "#viewad-price", ".boxedarticle--price")
@@ -576,8 +698,17 @@ def parse_ad_detail(html: str, listing: Listing | None = None, url: str = "") ->
             price = meta_price
             price_text = price_text or f"{meta_price:g} €"
 
+    if price is None and not is_free and ld.get("price") not in (None, "", "0", 0):
+        try:
+            price = float(str(ld["price"]).replace(",", "."))
+            price_text = price_text or f"{price:g} €"
+        except ValueError:
+            pass
+
     desc_el = _first(soup, "#viewad-description-text", "[itemprop=description]")
     description = _multiline_text(desc_el) if desc_el is not None else ""
+    if not description:  # redesigned page: JSON-LD, then meta description (may be shortened)
+        description = str(ld.get("description") or "").strip() or _meta(soup, "og:description", "description")
     location, postal_code, _ = _parse_location(_text(_first(soup, "#viewad-locality", "[itemprop=addressLocality]")))
 
     posted = ""
@@ -697,8 +828,11 @@ class KleinanzeigenScraper:
             visited.add(url)
             html = await self.client.get_text(url, referer=referer)
             soup = _soup(html)
+            if page == 1 and is_empty_results_page(html):
+                log.info("%s: no results for this search/radius (ignoring 'similar' ads)", search_name or start_url)
+                return []
             new = [item for item in _results_from_soup(soup, search_name) if item.ad_id not in found]
-            if not new and page == 1 and not is_empty_results_page(html):
+            if not new and page == 1:
                 saved = self.save_debug_page(html, search_name or "search")
                 raise PageLayoutError(
                     "страница поиска получена, но объявления на ней не распознаны"

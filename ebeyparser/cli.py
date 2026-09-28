@@ -322,6 +322,42 @@ def cmd_debug_search(args: argparse.Namespace) -> int:
     return asyncio.run(go())
 
 
+def cmd_debug_ad(args: argparse.Namespace) -> int:
+    """Fetch one Kleinanzeigen ad page and show what the detail parser extracts."""
+    from .scraper.http import PoliteClient
+    from .scraper.kleinanzeigen import KleinanzeigenScraper, parse_ad_detail
+
+    config = load_config(Path(args.config))
+
+    async def go() -> int:
+        client = PoliteClient.from_config(config.general)
+        scraper = KleinanzeigenScraper(client, debug_dir=config.data_path / "debug")
+        try:
+            html = await client.get_text(args.url)
+        finally:
+            await client.aclose()
+        print(f"итоговый URL: {client.last_url}  (HTTP {client.last_status}), {len(html) // 1024} КБ")
+        try:
+            ad = parse_ad_detail(html, url=args.url)
+        except ValueError as exc:
+            print(f"✖ {exc}")
+            ad = None
+        if ad is not None:
+            print(f"id:          {ad.ad_id}")
+            print(f"заголовок:   {ad.title}")
+            print(f"цена:        {ad.price_text!r} -> {ad.price} (торг: {ad.negotiable}, бесплатно: {ad.is_free})")
+            print(f"место:       {ad.location}")
+            print(f"фото:        {len(ad.image_urls)}")
+            print(f"параметры:   {ad.attributes}")
+            print(f"продавец:    {ad.seller_name} ({ad.seller_type})")
+            print(f"доставка:    {ad.shipping_possible} {ad.shipping_cost or ''}")
+            print(f"описание:    {len(ad.description)} символов: {ad.description[:150]!r}")
+        print(f"HTML сохранён: {scraper.save_debug_page(html, 'ad')}")
+        return 0 if ad is not None and ad.description and ad.image_urls else 1
+
+    return asyncio.run(go())
+
+
 def set_ai_model_in_config(path: Path, model: str) -> bool:
     """Replace `model:` inside the top-level `ai:` block (not second_opinion), keeping comments."""
     if not path.is_file():
@@ -434,6 +470,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("debug-search", help="показать, что парсер видит на странице поиска Kleinanzeigen")
     p.add_argument("--name", help="только поиск с этим именем")
     p.set_defaults(func=cmd_debug_search)
+
+    p = sub.add_parser("debug-ad", help="показать, что парсер видит на странице объявления Kleinanzeigen")
+    p.add_argument("url")
+    p.set_defaults(func=cmd_debug_ad)
 
     p = sub.add_parser("ebay-limits", help="показать лимиты запросов твоего ключа eBay")
     p.add_argument("--all", action="store_true", help="все API, а не только Buy (Browse)")

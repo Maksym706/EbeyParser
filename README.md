@@ -122,6 +122,7 @@ python -m ebeyparser run --no-monitor
 | `python -m ebeyparser test-notify` | отправить тестовое уведомление на почту / в Telegram |
 | `python -m ebeyparser ai-check [--fix]` | проверить локальную модель (`--fix` сам впишет найденную vision-модель в конфиг) |
 | `python -m ebeyparser debug-search` | показать, что парсер видит на странице поиска Kleinanzeigen (если находит 0 объявлений) |
+| `python -m ebeyparser debug-ad <ссылка>` | показать, что парсер вытаскивает со страницы объявления (описание, фото, параметры) |
 | `python -m ebeyparser ebay-limits` | сколько запросов к eBay API осталось на твоём ключе и сколько их тратят твои настройки |
 | `python -m ebeyparser demo` | демо-данные для просмотра интерфейса |
 
