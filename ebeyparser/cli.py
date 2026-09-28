@@ -271,6 +271,57 @@ def cmd_ebay_limits(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_debug_search(args: argparse.Namespace) -> int:
+    """Fetch page 1 of each Kleinanzeigen search and show what the parser sees."""
+    from .scraper.http import BlockedError, PoliteClient
+    from .scraper.kleinanzeigen import KleinanzeigenScraper, build_search_url, page_diagnostics
+
+    config = load_config(Path(args.config))
+    searches = [s for s in config.searches if s.source == "kleinanzeigen" and (s.enabled or args.name)]
+    if args.name:
+        searches = [s for s in searches if s.name == args.name]
+    if not searches:
+        print("✖ Нет поисков Kleinanzeigen" + (f" с именем «{args.name}»" if args.name else ""))
+        return 2
+
+    async def go() -> int:
+        client = PoliteClient.from_config(config.general)
+        scraper = KleinanzeigenScraper(client, debug_dir=config.data_path / "debug")
+        problems = 0
+        try:
+            for search in searches:
+                url = build_search_url(search, 1)
+                print(f"\n=== {search.name}")
+                print(f"запрос:      {url}")
+                try:
+                    html = await client.get_text(url)
+                except BlockedError as exc:
+                    problems += 1
+                    print(f"✖ БЛОКИРОВКА: {exc}")
+                    continue
+                except Exception as exc:
+                    problems += 1
+                    print(f"✖ Ошибка: {type(exc).__name__}: {exc}")
+                    continue
+                print(f"итоговый URL: {client.last_url}  (HTTP {client.last_status})")
+                info = page_diagnostics(html)
+                for key, value in info.items():
+                    if key != "sample":
+                        print(f"{key + ':':<22} {value}")
+                for ad_id, title, price, location in info["sample"]:  # type: ignore[union-attr]
+                    print(f"   • {ad_id} | {title} | {price} | {location}")
+                saved = scraper.save_debug_page(html, search.name)
+                print(f"HTML сохранён: {saved}")
+                if not info["parsed_ads"]:
+                    problems += 1
+        finally:
+            await client.aclose()
+        print("\nПришли этот вывод целиком — по нему видно, что отдаёт сайт.")
+        return 1 if problems else 0
+
+    return asyncio.run(go())
+
+
 def set_ai_model_in_config(path: Path, model: str) -> bool:
     """Replace `model:` inside the top-level `ai:` block (not second_opinion), keeping comments."""
     if not path.is_file():
@@ -380,6 +431,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("ai-check", help="проверить, доступна ли локальная модель")
     p.add_argument("--fix", action="store_true", help="сам вписать в config.yaml найденную vision-модель")
     p.set_defaults(func=cmd_ai_check)
+    p = sub.add_parser("debug-search", help="показать, что парсер видит на странице поиска Kleinanzeigen")
+    p.add_argument("--name", help="только поиск с этим именем")
+    p.set_defaults(func=cmd_debug_search)
+
     p = sub.add_parser("ebay-limits", help="показать лимиты запросов твоего ключа eBay")
     p.add_argument("--all", action="store_true", help="все API, а не только Buy (Browse)")
     p.set_defaults(func=cmd_ebay_limits)

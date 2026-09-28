@@ -120,7 +120,8 @@ python -m ebeyparser run --no-monitor
 | `python -m ebeyparser check <ссылка>` | «брать или нет?» — оценить одно объявление Kleinanzeigen или eBay |
 | `python -m ebeyparser check <ссылка> --purpose personal --target 300` | то же, но для себя с бюджетом |
 | `python -m ebeyparser test-notify` | отправить тестовое уведомление на почту / в Telegram |
-| `python -m ebeyparser ai-check` | проверить локальную модель |
+| `python -m ebeyparser ai-check [--fix]` | проверить локальную модель (`--fix` сам впишет найденную vision-модель в конфиг) |
+| `python -m ebeyparser debug-search` | показать, что парсер видит на странице поиска Kleinanzeigen (если находит 0 объявлений) |
 | `python -m ebeyparser ebay-limits` | сколько запросов к eBay API осталось на твоём ключе и сколько их тратят твои настройки |
 | `python -m ebeyparser demo` | демо-данные для просмотра интерфейса |
 

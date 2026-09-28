@@ -35,7 +35,7 @@ from .pricing.text import make_search_query, normalize
 from .scraper.ebay_api import EbayAPIError, EbayBrowseClient
 from .scraper.ebay_sold import EbaySoldScraper
 from .scraper.http import BlockedError, PoliteClient
-from .scraper.kleinanzeigen import KleinanzeigenScraper
+from .scraper.kleinanzeigen import KleinanzeigenScraper, PageLayoutError
 
 log = logging.getLogger(__name__)
 
@@ -122,7 +122,7 @@ class Monitor:
         if self._client is None and not (self._injected["scraper"] and self._injected["ebay"]):
             self._client = PoliteClient.from_config(self.config.general)
         if self._scraper is None:
-            self._scraper = KleinanzeigenScraper(self._client)
+            self._scraper = KleinanzeigenScraper(self._client, debug_dir=self.config.data_path / "debug")
         if self._ebay is None:
             self._ebay = EbaySoldScraper(self._client)
         if self._ebay_api is None and self.config.ebay.configured:
@@ -220,7 +220,8 @@ class Monitor:
                     )
                     log.warning("Blocked by Kleinanzeigen: %s", exc)
                     break
-                except EbayAPIError as exc:
+                except (EbayAPIError, PageLayoutError) as exc:
+                    log.warning("Search %r: %s", search.name, exc)
                     summary.errors.append(f"{search.name}: {exc}")
                     continue
                 except httpx.HTTPError as exc:

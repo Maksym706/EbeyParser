@@ -144,6 +144,8 @@ class PoliteClient:
         self.user_agent = user_agent or DEFAULT_USER_AGENT
         self._locks: dict[str, asyncio.Lock] = {}
         self._last_request: dict[str, float] = {}  # host -> monotonic time of last response
+        self.last_url: str | None = None
+        self.last_status: int | None = None
         self._client = httpx.AsyncClient(
             http2=False,
             follow_redirects=True,
@@ -166,6 +168,7 @@ class PoliteClient:
     async def get_text(self, url: str, *, referer: str | None = None) -> str:
         """GET an HTML page. Raises BlockedError on bot protection."""
         response = await self._request(url, referer=referer, kind="document")
+        self.last_url, self.last_status = str(response.url), response.status_code  # for diagnostics
         text = response.text
         if _blocked_url(response.url) or looks_blocked(text):
             raise BlockedError(

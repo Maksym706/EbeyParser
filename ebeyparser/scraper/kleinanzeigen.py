@@ -10,6 +10,8 @@ import copy
 import logging
 import math
 import re
+from datetime import datetime
+from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
@@ -351,7 +353,8 @@ def parse_search_results(html: str, search_name: str = "") -> list[Listing]:
 def _results_from_soup(soup: BeautifulSoup, search_name: str = "") -> list[Listing]:
     listings: list[Listing] = []
     seen: set[str] = set()
-    for article in soup.select("article.aditem"):
+    cards = soup.select("article.aditem") or soup.select("[data-adid]")
+    for article in cards:
         try:
             listing = _parse_card(article, search_name)
         except Exception:  # one odd card must not kill the whole page
@@ -360,7 +363,104 @@ def _results_from_soup(soup: BeautifulSoup, search_name: str = "") -> list[Listi
         if listing is not None and listing.ad_id not in seen:
             seen.add(listing.ad_id)
             listings.append(listing)
+    if not listings:
+        listings = _fallback_cards(soup, search_name)
     return listings
+
+
+_PRICE_IN_TEXT_RE = re.compile(
+    r"(?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d{1,2})?\s*€(?:\s*VB)?|zu verschenken|\bVB\b", re.IGNORECASE
+)
+
+
+def _fallback_cards(soup: BeautifulSoup, search_name: str = "") -> list[Listing]:
+    """The usual card markup is gone (site redesign?): rebuild ads from any
+    '/s-anzeige/<slug>/<id>-<cat>-<loc>' links and the text around them."""
+    groups: dict[str, list[Tag]] = {}
+    for a in soup.select('a[href*="/s-anzeige/"]'):
+        ad_id = _ad_id_from_url(a.get("href") or "")
+        if ad_id:
+            groups.setdefault(ad_id, []).append(a)
+    listings: list[Listing] = []
+    for ad_id, anchors in groups.items():
+        texts = [_text(a) or _clean(a.get("title")) for a in anchors]
+        imgs = [img for a in anchors for img in a.select("img")]
+        title = max(texts, key=len) if any(texts) else _clean(imgs[0].get("alt")) if imgs else ""
+        if not title:
+            continue
+        # climb to the smallest ancestor that also shows a price
+        box: Tag | None = anchors[0]
+        price_match = None
+        for _ in range(8):
+            box = box.parent if box is not None else None
+            if box is None or box.name in ("body", "html"):
+                break
+            price_match = _PRICE_IN_TEXT_RE.search(_text(box))
+            if price_match:
+                break
+        container = box if price_match and box is not None else anchors[0]
+        price, negotiable, is_free = parse_price(price_match.group(0) if price_match else "")
+        image = next((u for el in container.select("img, [data-imgsrc]")
+                      if (u := _image_from_element(el)) and _is_ad_image(u)), None)
+        location, postal_code, distance = "", None, None
+        loc_match = re.search(r"\b\d{5}\b[^\n€]{0,40}", _text(container, "\n"))
+        if loc_match:
+            location, postal_code, distance = _parse_location(loc_match.group(0))
+        listings.append(Listing(
+            ad_id=ad_id, source="kleinanzeigen", url=_absolute(anchors[0].get("href") or ""),
+            title=title, price=price, price_text=price_match.group(0) if price_match else "",
+            negotiable=negotiable, is_free=is_free, location=location, postal_code=postal_code,
+            distance_km=distance, image_urls=[image] if image else [], search_name=search_name,
+        ))
+    if listings:
+        log.warning("Kleinanzeigen: card markup not recognised, used link fallback (%d ads)", len(listings))
+    return listings
+
+
+class PageLayoutError(Exception):
+    """The page downloaded fine, but no ads could be recognised in it."""
+
+
+_EMPTY_RESULT_MARKERS = (
+    "es wurden leider keine anzeigen", "keine ergebnisse", "keine anzeigen gefunden",
+    "leider keine treffer", "wurden keine ergebnisse", "0 ergebnisse",
+)
+_CONSENT_MARKERS = ("gdpr-banner", "consent-banner", "cmp-", "didomi", "sp_message", "usercentrics",
+                    "cookie-einstellungen", "datenschutzeinstellungen")
+
+
+def is_empty_results_page(html: str) -> bool:
+    low = (html or "").lower()
+    return any(m in low for m in _EMPTY_RESULT_MARKERS)
+
+
+def page_diagnostics(html: str) -> dict[str, object]:
+    """What the search page looks like to the parser — for `ebeyparser debug-search`."""
+    from .http import looks_blocked
+
+    soup = _soup(html)
+    low = (html or "").lower()
+    title = _text(soup.title) if soup.title else ""
+    listings = _results_from_soup(soup)
+    classes: dict[str, int] = {}
+    for a in soup.select('a[href*="/s-anzeige/"]')[:5]:
+        for parent in list(a.parents)[:4]:
+            for cls in parent.get("class") or []:
+                classes[cls] = classes.get(cls, 0) + 1
+    return {
+        "title": title,
+        "size_kb": round(len(html or "") / 1024, 1),
+        "article.aditem": len(soup.select("article.aditem")),
+        "[data-adid]": len(soup.select("[data-adid]")),
+        "li.ad-listitem": len(soup.select("li.ad-listitem")),
+        "links /s-anzeige/": len(soup.select('a[href*="/s-anzeige/"]')),
+        "parsed_ads": len(listings),
+        "empty_results_text": is_empty_results_page(html),
+        "blocked_markers": looks_blocked(html),
+        "consent_markers": [m for m in _CONSENT_MARKERS if m in low],
+        "link_parent_classes": sorted(classes, key=classes.get, reverse=True)[:12],  # type: ignore[arg-type]
+        "sample": [(item.ad_id, item.title[:60], item.price_text, item.location) for item in listings[:3]],
+    }
 
 
 def next_page_url(html: str) -> str | None:
@@ -572,8 +672,18 @@ def parse_ad_detail(html: str, listing: Listing | None = None, url: str = "") ->
 class KleinanzeigenScraper:
     """Fetches and parses Kleinanzeigen pages through a PoliteClient."""
 
-    def __init__(self, client: PoliteClient) -> None:
+    def __init__(self, client: PoliteClient, *, debug_dir: str | Path | None = None) -> None:
         self.client = client
+        self.debug_dir = Path(debug_dir) if debug_dir else None
+
+    def save_debug_page(self, html: str, name: str) -> Path | None:
+        if self.debug_dir is None:
+            return None
+        self.debug_dir.mkdir(parents=True, exist_ok=True)
+        slug = re.sub(r"[^\w-]+", "-", name, flags=re.UNICODE).strip("-")[:40] or "page"
+        path = self.debug_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{slug}.html"
+        path.write_text(html, encoding="utf-8")
+        return path
 
     async def _crawl(self, start_url: str, max_pages: int, search_name: str) -> list[Listing]:
         """Follow result pages; stop at max_pages, the last page or a page without new ads."""
@@ -588,6 +698,13 @@ class KleinanzeigenScraper:
             html = await self.client.get_text(url, referer=referer)
             soup = _soup(html)
             new = [item for item in _results_from_soup(soup, search_name) if item.ad_id not in found]
+            if not new and page == 1 and not is_empty_results_page(html):
+                saved = self.save_debug_page(html, search_name or "search")
+                raise PageLayoutError(
+                    "страница поиска получена, но объявления на ней не распознаны"
+                    + (f" (HTML сохранён: {saved})" if saved else "")
+                    + ". Запусти `python -m ebeyparser debug-search` и пришли вывод."
+                )
             if not new:
                 break
             for item in new:
