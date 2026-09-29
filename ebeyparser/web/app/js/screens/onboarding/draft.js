@@ -1,6 +1,6 @@
 // Onboarding answers: kept in localStorage (ebp.onboarding.v1) and on the server
 // (PUT /onboarding/draft), so a reload or switching to the phone keeps the progress.
-// Nothing is written to config.yaml until «Запустить» (POST /setup); integrations
+// Nothing is written to the settings file until «Запустить» (POST /setup); integrations
 // (AI, Telegram, eBay, e-mail) store their secrets as soon as they are verified.
 import { api } from "../../lib/api.js";
 import { createStore } from "../../lib/store.js";
@@ -106,7 +106,10 @@ export async function clearDraft() {
   await api.del("/onboarding/draft").catch(() => {});
 }
 
-/** The body for POST /setup and POST /searches/preview. */
+/**
+ * The body for POST /setup and POST /searches/preview. Existing searches are kept (merge) unless
+ * the person chose «Заменить» on the last step: pass `{ replace: true }` in `extra` (P0-1).
+ */
 export function setupBody(d, extra = {}) {
   const wishlist = d.purpose === "resale" ? [] : (d.wishlist || []).filter((w) => w.item && w.item.trim()).map((w) => ({ item: w.item.trim(), max_price: w.max_price || null, haggle: w.haggle !== false }));
   return {
@@ -120,7 +123,7 @@ export function setupBody(d, extra = {}) {
     pricing: d.strategy === "custom" ? d.pricing : undefined,
     min_profit: d.pricing ? d.pricing.min_profit : undefined,
     wishlist,
-    replace: true,
+    replace: false,
     ...extra,
   };
 }

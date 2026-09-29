@@ -21,7 +21,9 @@ from ...config import EbayConfig, EmailConfig, NotificationsConfig, TelegramConf
 from ...models import DealView, Listing, utcnow
 from ..localai import LMSTUDIO_URL, OLLAMA_URL, detect_local_ai, probe_json
 from .context import ApiContext, get_ctx, mask
-from .errors import ApiError, validation_error
+from ...errors_ru import ai_problem, humanize, status_message
+from .errors import ApiError, from_exception, validation_error
+from ...timefmt import when_label
 from .presenters import CONDITION_LABELS, rnd
 from .schemas import ERRORS, AiTestIn, EbayTestIn, EmailTestIn, NotifyTestIn, TelegramTestIn, TelegramTokenIn
 
@@ -29,10 +31,21 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 TELEGRAM_API = "https://api.telegram.org"
+CHANNEL_LABELS = {"telegram": "Telegram", "email": "почта"}
+EMAIL_RE = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$")
+EMAIL_MISSING_RU = {
+    "smtp_host": "Укажи почтовый сервер (например, smtp.gmail.com)",
+    "smtp_port": "Укажи порт: обычно 587",
+    "username": "Укажи свой адрес почты",
+    "password": "Вставь пароль приложения",
+    "from_addr": "Укажи адрес отправителя",
+    "to_addrs": "Укажи, куда слать письма",
+}
 TELEGRAM_TIMEOUT = 15.0
 LINK_KEY = "telegram:link"
 LINK_TTL = timedelta(minutes=15)
 SLOW_AI_SECONDS = 90.0
+EMAIL_TEST_TIMEOUT = 15.0  # the check must not hang for half a minute on a dead network
 GPU_PRESETS = [
     {"key": "10-12", "label_ru": "10–12 ГБ", "model_ru": "Qwen2.5-VL-7B", "lmstudio": "Qwen2.5-VL-7B-Instruct",
      "ollama": "qwen2.5vl:7b", "note_ru": "лучшее качество, понимает немецкий; на 8 ГБ — 2 фото", "recommended": True},
@@ -69,11 +82,16 @@ async def ai_detect(ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
             "model_ids": list(server.models),
         })
     vision = [s for s in out if s["vision_models"]]
+    ai = ctx.config.ai
     if vision:
         variant, text = "found", f"Нашёл {vision[0]['name']} · модель видит фото"
     elif out:
         variant = "no_vision"
         text = f"{out[0]['name']} работает, но нет модели, которая понимает фото — скачай Qwen2.5-VL-7B-Instruct"
+    elif ai.enabled and ai.model and ai.provider in ("openai", "ollama"):
+        # already set up, the server is just closed: not the install guide
+        variant = "not_running"
+        text = ai_problem(ai.provider, ai.base_url, ai.model, "", server_ok=False)
     else:
         variant, text = "none", "LM Studio и Ollama не найдены — установи LM Studio и запусти сервер"
     best = vision[0] if vision else (out[0] if out else None)
@@ -176,7 +194,9 @@ async def ai_test(body: AiTestIn | None = None, ctx: ApiContext = Depends(get_ct
     try:
         llm = _llm(ctx, settings)
     except Exception as exc:  # noqa: BLE001 - e.g. the anthropic package is missing
-        result["error_ru"] = result["message_ru"] = f"Не удалось подключиться: {exc}"
+        human = humanize(exc, "ai", host=base_url)
+        result["error_ru"] = result["message_ru"] = human.message_ru
+        result["details"] = human.details
         return result
     try:
         started = time.monotonic()
@@ -191,11 +211,13 @@ async def ai_test(body: AiTestIn | None = None, ctx: ApiContext = Depends(get_ct
             "resolved_model": health.get("resolved_model"),
             "models": list(health.get("models") or []),
         })
-        if not result["server_ok"]:
-            result["error_ru"] = result["message_ru"] = str(health.get("error") or "Сервер нейросети не отвечает")
-            return result
-        if not result["model_available"]:
-            result["error_ru"] = result["message_ru"] = str(health.get("error") or f"Модели «{model}» нет на сервере")
+        if not result["server_ok"] or not result["model_available"]:
+            error = str(health.get("error") or ("" if result["server_ok"] else "сервер не отвечает")
+                        or f"Модель «{model}» не найдена")
+            result["error_ru"] = result["message_ru"] = ai_problem(provider, base_url, model, error,
+                                                                   server_ok=result["server_ok"])
+            if health.get("error"):
+                result["details"] = str(health["error"])
             return result
         if not body.sample:
             result["ok"] = True
@@ -224,7 +246,14 @@ async def _sample_check(llm: Any, settings: Any, result: dict[str, Any]) -> None
     seconds = time.monotonic() - started
     result["seconds"] = rnd(seconds, 1)
     if verdict.confidence <= 0:
-        result["error_ru"] = result["message_ru"] = verdict.reasoning or "Модель не ответила"
+        reason = verdict.reasoning or ""
+        if "разобрать" in reason:  # the model answered, but not in the expected form
+            message = ("Модель ответила, но не так, как нужно. В LM Studio поставь Context Length 8192 и выбери "
+                       "модель, которая понимает фото (Qwen2.5-VL)")
+        else:
+            message = ai_problem(settings.provider, settings.base_url, settings.model, reason, server_ok=None)
+        result["error_ru"] = result["message_ru"] = message
+        result["details"] = reason
         return
     product = verdict.product or ""
     result["verdict"] = {
@@ -259,27 +288,24 @@ async def tg_call(ctx: ApiContext, token: str, method: str, params: dict[str, An
         async with httpx.AsyncClient(transport=ctx.http_transport, timeout=TELEGRAM_TIMEOUT) as client:
             resp = await client.post(f"{TELEGRAM_API}/bot{token}/{method}", json=params or {})
     except httpx.HTTPError as exc:
-        raise ApiError(502, "network", f"Нет связи с Telegram ({exc.__class__.__name__}) — проверь интернет") from None
+        err = from_exception(exc, "telegram", status=502)
+        err.details = (err.details or "").replace(token, "***")
+        raise err from None
     try:
         data = resp.json()
+        json_answer = isinstance(data, dict) and "ok" in data  # Telegram's own answer, not a proxy page
     except ValueError:
-        data = {}
+        data, json_answer = {}, False
     if not isinstance(data, dict):
         data = {}
     if resp.status_code == 200 and data.get("ok"):
         return data.get("result")
     code = int(data.get("error_code") or resp.status_code)
     desc = str(data.get("description") or resp.reason_phrase or "").replace(token, "***")
-    if code in (401, 404):
-        raise ApiError(400, "telegram_token_invalid", "Telegram не узнал этот ключ — скопируй его у BotFather ещё раз")
-    if code == 409:
-        raise ApiError(409, "telegram_webhook", "У бота включён webhook, поэтому я не вижу сообщения. "
-                                                "Нажми «Сбросить webhook бота» и попробуй снова")
-    if code == 403:
-        raise ApiError(400, "telegram_blocked", "Бот не может писать в этот чат — открой бота и нажми Start")
-    if code == 400 and "chat not found" in desc.lower():
-        raise ApiError(400, "telegram_chat_not_found", "Чат не найден — открой бота и нажми Start")
-    raise ApiError(502, "upstream", f"Telegram: ошибка {code}: {desc}")
+    kind, message = status_message(code, "telegram", method=method, description=desc, json_answer=json_answer)
+    status = {"telegram_token_invalid": 400, "telegram_webhook": 409, "telegram_blocked": 400,
+              "telegram_chat_not_found": 400, "telegram_forbidden": 400}.get(kind, 502)
+    raise ApiError(status, kind, message, details=f"Telegram {method}: HTTP {resp.status_code} {desc}".strip())
 
 
 def _token(ctx: ApiContext, supplied: str | None) -> str:
@@ -422,9 +448,12 @@ async def _deliver(notifier: Any, *, with_deal: bool, ctx: ApiContext) -> None:
         else:
             await asyncio.wait_for(notifier.send_text("✅ EbeyParser: тестовое сообщение. Всё настроено!"), 60)
     except asyncio.TimeoutError:
-        raise ApiError(504, "timeout", "Нет ответа за 60 с — проверь интернет") from None
+        service = str(getattr(notifier, "name", "") or "")
+        raise ApiError(504, "timeout", humanize(TimeoutError(), service).message_ru,
+                       details="нет ответа за 60 с") from None
     except NotifyError as exc:
-        raise ApiError(502, "delivery_failed", str(exc)) from None
+        human = humanize(exc, str(getattr(notifier, "name", "") or ""))
+        raise ApiError(502, "delivery_failed", human.message_ru, details=human.details, action=human.action) from None
 
 
 @router.post("/telegram/test", responses=ERRORS, summary="Тестовое сообщение в Telegram (пример сделки с фото)")
@@ -465,13 +494,20 @@ async def email_test(body: EmailTestIn | None = None, ctx: ApiContext = Depends(
 
     body = body or EmailTestIn()
     cfg = _email_config(ctx, body)
+    fields: dict[str, str] = {}
+    if body.username and "@" not in body.username:
+        fields["username"] = "Это не похоже на адрес почты — например, me@gmail.com"
+    supplied_to = [a for a in (cfg.to_addrs or []) if a.strip()]
+    if body.to_addrs and any(not EMAIL_RE.match(a.strip()) for a in supplied_to):
+        fields["to_addrs"] = "Это не похоже на адрес почты — например, me@gmail.com"
     missing = missing_settings(NotificationsConfig(email=cfg)).get("email") or []
-    if missing:
-        labels = {"smtp_host": "SMTP-сервер", "smtp_port": "порт", "username": "адрес почты",
-                  "password": "пароль приложения", "from_addr": "отправитель", "to_addrs": "куда слать"}
-        raise validation_error({m: f"не заполнено: {labels.get(m, m)}" for m in missing}, "Заполни почту")
+    for name in missing:
+        fields.setdefault(name, EMAIL_MISSING_RU.get(name, "Заполни это поле"))
+    if fields:
+        first = next(iter(fields.values()))
+        raise ApiError(422, "validation", f"Проверь почту: {first[:1].lower()}{first[1:]}", fields=fields)
     kwargs = {"smtp_factory": ctx.smtp_factory} if ctx.smtp_factory is not None else {}
-    notifier = EmailNotifier(cfg, web_base_url=ctx.web_base_url(), **kwargs)
+    notifier = EmailNotifier(cfg, web_base_url=ctx.web_base_url(), timeout=EMAIL_TEST_TIMEOUT, **kwargs)
     await _deliver(notifier, with_deal=False, ctx=ctx)
     saved = False
     if body.save:
@@ -513,25 +549,28 @@ async def ebay_test(body: EbayTestIn | None = None, ctx: ApiContext = Depends(ge
                                "Нужны ключи eBay")
     client = EbayBrowseClient(cfg, transport=ctx.http_transport, timeout=20.0)
     limits: list[dict[str, Any]] = []
-    warning = ""
+    warning = warning_details = ""
     try:
         try:
             await client._get_token(force=bool(cfg.client_id))
         except EbayAPIError as exc:
             text = str(exc)
-            if "invalid_client" in text or "401" in text:
-                message = ("eBay не принял ключи — проверь, что это Production, а не Sandbox, и что ключи активированы"
-                           " (вопрос про Marketplace Account Deletion)")
-            else:
-                message = f"eBay: {text[:200]}"
-            raise ApiError(400, "ebay_keys_invalid", message) from None
+            human = humanize(exc, "ebay")
+            if "invalid_client" in text or getattr(exc, "status_code", None) in (400, 401) or " 401" in text:
+                message = ("eBay не принял ключи — проверь, что это ключи Production (не Sandbox) и что они "
+                           "активированы (вопрос про Marketplace Account Deletion)")
+                raise ApiError(400, "ebay_keys_invalid", message, details=text[:300]) from None
+            raise ApiError(502, human.code if human.code != "error" else "upstream", human.message_ru,
+                           details=text[:300]) from None
         except httpx.HTTPError as exc:
-            raise ApiError(502, "network", f"Нет связи с eBay ({exc.__class__.__name__})") from None
+            raise from_exception(exc, "ebay", status=502) from None
         try:
             rows = await client.rate_limits("buy")
-            limits = [{**r, "reset": r["reset"].isoformat() if r.get("reset") else None} for r in rows]
+            limits = [{**r, "reset": r["reset"].isoformat() if r.get("reset") else None,
+                       "reset_label": when_label(r["reset"]) if r.get("reset") else ""} for r in rows]
         except (EbayAPIError, httpx.HTTPError) as exc:
-            warning = f"Ключи работают, но лимиты прочитать не удалось ({str(exc)[:120]})"
+            warning = "Ключи работают, но дневной лимит запросов eBay сейчас прочитать не удалось — это не страшно"
+            warning_details = str(exc)[:300]
     finally:
         await client.aclose()
     browse = next((r for r in limits if "browse" in r["api"].lower() and r.get("limit")), None) or \
@@ -545,8 +584,11 @@ async def ebay_test(body: EbayTestIn | None = None, ctx: ApiContext = Depends(ge
                            "ebay_oauth_token": body.oauth_token})
         ctx.mark_done("ebay")
         saved = True
-    return {"ok": True, "token_ok": True, "limits": limits, "browse_limit": browse, "warning_ru": warning,
-            "saved": saved, "message_ru": message}
+    out = {"ok": True, "token_ok": True, "limits": limits, "browse_limit": browse, "warning_ru": warning,
+           "saved": saved, "message_ru": message}
+    if warning_details:
+        out["details"] = warning_details
+    return out
 
 
 @router.post("/ebay/validate", responses=ERRORS, include_in_schema=False)
@@ -570,7 +612,8 @@ async def notify_test(channel: str | None = Query(None, pattern="^(telegram|emai
         try:
             notifiers = list(ctx.app.state.notifiers_factory() or [])
         except Exception as exc:  # noqa: BLE001
-            raise ApiError(500, "internal", f"Не удалось создать каналы уведомлений: {exc}") from exc
+            raise ApiError(500, "internal", "Не получилось подготовить уведомления — проверь настройки Telegram и почты",
+                           details=f"{type(exc).__name__}: {exc}") from exc
     else:
         wanted = [channel] if channel else ["telegram", "email"]
         probe = NotificationsConfig(email=cfg.email.model_copy(update={"enabled": True}),
@@ -582,8 +625,10 @@ async def notify_test(channel: str | None = Query(None, pattern="^(telegram|emai
                 continue
             if missing.get(name):
                 if channel:
-                    raise ApiError(400, "not_configured", f"{'Telegram' if name == 'telegram' else 'Почта'} не настроен(а):"
-                                                          f" не хватает {', '.join(missing[name])}")
+                    raise ApiError(400, "not_configured",
+                                   "Telegram не подключён — привяжи бота" if name == "telegram"
+                                   else "Почта не настроена до конца — заполни адрес и пароль приложения",
+                                   action={"label_ru": "Настроить уведомления", "href": "/settings/notifications"})
                 continue
             if name == "telegram":
                 notifiers.append(TelegramNotifier(cfg.telegram, web_base_url=ctx.web_base_url(),
@@ -596,17 +641,22 @@ async def notify_test(channel: str | None = Query(None, pattern="^(telegram|emai
     results: dict[str, dict[str, Any]] = {}
     for notifier in notifiers:
         name = str(getattr(notifier, "name", "") or type(notifier).__name__)
+        label = CHANNEL_LABELS.get(name, name)
         try:
             await _deliver(notifier, with_deal=True, ctx=ctx)
-            results[name] = {"ok": True, "message_ru": "Отправлено"}
+            results[name] = {"ok": True, "label_ru": label, "message_ru": "Отправлено"}
         except ApiError as exc:
-            results[name] = {"ok": False, "message_ru": exc.message_ru}
+            results[name] = {"ok": False, "label_ru": label, "message_ru": exc.message_ru, "details": exc.details or ""}
         except Exception as exc:  # noqa: BLE001
-            results[name] = {"ok": False, "message_ru": str(exc) or type(exc).__name__}
+            human = humanize(exc, name)
+            results[name] = {"ok": False, "label_ru": label, "message_ru": human.message_ru, "details": human.details}
     ok = all(r["ok"] for r in results.values())
     if channel and not ok:
-        raise ApiError(502, "delivery_failed", results[next(iter(results))]["message_ru"])
-    return {"ok": ok, "results": results}
+        first = results[next(iter(results))]
+        raise ApiError(502, "delivery_failed", first["message_ru"], details=first.get("details") or None)
+    sent = [r["label_ru"] for r in results.values() if r["ok"]]
+    return {"ok": ok, "results": results,
+            "message_ru": ("Отправлено: " + ", ".join(sent)) if sent else "Ничего не отправлено"}
 
 
 @router.get("/notify/preview", summary="Сколько уведомлений пришло бы за N дней при таком пороге (?min_score=70&verdicts=buy,maybe)")
@@ -618,7 +668,8 @@ async def notify_preview(
 ) -> dict[str, Any]:
     from datetime import datetime
 
-    from .presenters import LOCAL_TZ, aware
+    from ...timefmt import local_tz
+    from .presenters import aware
 
     cfg = ctx.config.notifications
     score = cfg.min_score if min_score is None else min_score
@@ -630,7 +681,7 @@ async def notify_preview(
     current = ctx.db.notify_candidates(since, min_score=cfg.min_score, verdicts=list(cfg.verdicts))
     per_day: dict[str, int] = {}
     for raw in stamps:
-        day = aware(datetime.fromisoformat(raw)).astimezone(LOCAL_TZ).date().isoformat()
+        day = aware(datetime.fromisoformat(raw)).astimezone(local_tz()).date().isoformat()
         per_day[day] = per_day.get(day, 0) + 1
     total = len(stamps)
     return {

@@ -5,9 +5,9 @@
 import { html, render, useState } from "../lib/html.js";
 import { api, ApiError } from "../lib/api.js";
 import { emit } from "../lib/events.js";
-import { money } from "../lib/format.js";
+import { money, berlinDay } from "../lib/format.js";
 import { Modal, Button, Field, NumberInput, Input, toast } from "../ui/index.js";
-import { normalizeCard, STATUS, humanOffer } from "./deal-model.js";
+import { normalizeCard, STATUS, humanOffer, HIDE_REASONS } from "./deal-model.js";
 import { copyText, openAd, quickMessage } from "./messages.js";
 
 const enc = encodeURIComponent;
@@ -114,7 +114,7 @@ const snapshot = (c) => ({
  * Move a deal to `status` right away (optimistic), save it, show a toast with «Отменить».
  *   setStatus(card, "starred", { message: "Добавлено в избранное" })
  */
-export async function setStatus(card, status, { extra = {}, message, undo = true, silent = false } = {}) {
+export async function setStatus(card, status, { extra = {}, message, undo = true, silent = false, action2 = null } = {}) {
   const before = snapshot(card);
   const patch = { status, ...extra };
   publishDeal(card.id, localPatch(patch));
@@ -134,6 +134,7 @@ export async function setStatus(card, status, { extra = {}, message, undo = true
       icon: (STATUS[status] || {}).icon,
       title: message || `Статус: ${(STATUS[status] || {}).label || status}`,
       duration: undo ? 6000 : 4000,
+      action2,
       action: undo
         ? {
             label: "Отменить",
@@ -170,7 +171,42 @@ export function toggleStar(card) {
 }
 
 export function hideDeal(card, reason) {
-  return setStatus(card, "ignored", { extra: reason ? { hidden_reason: reason } : {}, message: "Скрыто" });
+  return setStatus(card, "ignored", {
+    extra: reason ? { hidden_reason: reason } : {},
+    message: "Скрыто",
+    // brief §4.2.5: «Скрыто · Отменить · Почему?» — the reason teaches what doesn't fit
+    action2: reason ? null : { label: "Почему?", onClick: () => askHideReason(card) },
+  });
+}
+
+/** «Почему скрыл?» — one tap on a reason, saved as hidden_reason. */
+function HideReasonDialog({ deal, onDone }) {
+  const [open, setOpen] = useState(true);
+  const close = (reason) => {
+    setOpen(false);
+    setTimeout(() => onDone(reason), 220);
+  };
+  return html`<${Modal} open=${open} onClose=${() => close(null)} size="sm" icon="eye-off" title="Почему скрываешь?" subtitle="Так я лучше пойму, что тебе не подходит">
+    <div class="chips-row">
+      ${HIDE_REASONS.map((r) => html`<button type="button" class="chip" onClick=${() => close(r.key)}>${r.label}</button>`)}
+    </div>
+  <//>`;
+}
+
+function askHideReason(deal) {
+  const host = document.createElement("div");
+  document.body.appendChild(host);
+  const done = (reason) => {
+    render(null, host);
+    host.remove();
+    if (!reason) return;
+    publishDeal(deal.id, { hidden_reason: reason });
+    dealsApi
+      .patch(deal.id, { status: "ignored", hidden_reason: reason }, deal)
+      .then(() => toast.success("Спасибо — учту"))
+      .catch((e) => toast.error(`Не получилось сохранить: ${e.message}`, { details: e.details }));
+  };
+  render(html`<${HideReasonDialog} deal=${deal} onDone=${done} />`, host);
 }
 
 export function unhideDeal(card) {
@@ -206,7 +242,8 @@ function PriceDialog({ kind, deal, onDone }) {
       : deal.bought_price ?? deal.price;
   const [open, setOpen] = useState(true);
   const [price, setPrice] = useState(suggested ?? null);
-  const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
+  const today = berlinDay(); // the Berlin calendar day, not the UTC one (00:00–02:00 edge)
+  const [date, setDate] = useState(today);
   const [extra, setExtra] = useState(0);
   const [error, setError] = useState(null);
   const close = (result) => {
@@ -216,12 +253,15 @@ function PriceDialog({ kind, deal, onDone }) {
   const paid = deal.bought_price ?? deal.buy_price ?? deal.price;
   const real = !bought && price != null && paid != null ? price - paid - (extra || 0) : null;
   const expected = deal.profit;
+  const free = Boolean(deal.is_free);
   const submit = (e) => {
     e && e.preventDefault();
-    if (price == null || !(price >= 0)) {
-      setError("Введи сумму в евро, например 290");
-      return;
-    }
+    if (price == null || Number.isNaN(price)) return setError("Введи сумму в евро, например 290");
+    if (price < 0) return setError("Сумма не может быть меньше 0 €");
+    if (price === 0 && !free) return setError(bought ? "0 € — это даром? Введи, сколько заплатил" : "0 € — введи, за сколько продал");
+    if (price > 100000) return setError("Слишком большая сумма — проверь, нет ли лишнего нуля");
+    if (extra != null && extra < 0) return setError("Расходы не могут быть меньше 0 €");
+    if (date && date > today) return setError("Дата не может быть в будущем");
     close({ price, date, extra: extra || 0 });
   };
   return html`<${Modal}
@@ -246,14 +286,14 @@ function PriceDialog({ kind, deal, onDone }) {
             ? `Рынок ~${money(deal.market_price)}`
             : ""}
       >
-        ${(id) => html`<${NumberInput} id=${id} value=${price} onChange=${(v) => (setPrice(v), setError(null))} suffix="€" size="lg" min=${0} data-autofocus />`}
+        ${(id) => html`<${NumberInput} id=${id} value=${price} onChange=${(v) => (setPrice(v), setError(null))} suffix="€" size="lg" min=${0} max=${100000} invalid=${Boolean(error)} data-autofocus />`}
       <//>
       ${!bought &&
       html`<${Field} label="Расходы на продажу" help="Комиссии, доставка, упаковка — вычту из прибыли" optional>
-        ${(id) => html`<${NumberInput} id=${id} value=${extra} onChange=${(v) => setExtra(v || 0)} suffix="€" min=${0} />`}
+        ${(id) => html`<${NumberInput} id=${id} value=${extra} onChange=${(v) => (setExtra(v ?? 0), setError(null))} suffix="€" min=${0} max=${100000} />`}
       <//>`}
       <${Field} label=${bought ? "Когда купил" : "Когда продал"}>
-        ${(id) => html`<${Input} id=${id} type="date" value=${date} onChange=${setDate} max=${new Date().toISOString().slice(0, 10)} />`}
+        ${(id) => html`<${Input} id=${id} type="date" value=${date} onChange=${(v) => (setDate(v), setError(null))} max=${today} />`}
       <//>
       ${real != null &&
       html`<div class=${"price-dialog__result " + (real >= 0 ? "is-profit" : "is-loss")}>
@@ -304,8 +344,7 @@ export async function markSold(card) {
 
 function toIso(day) {
   if (!day) return new Date().toISOString();
-  const today = new Date().toISOString().slice(0, 10);
-  return day === today ? new Date().toISOString() : new Date(`${day}T12:00:00`).toISOString();
+  return day === berlinDay() ? new Date().toISOString() : new Date(`${day}T12:00:00Z`).toISOString();
 }
 
 /** Move by pipeline key, asking for prices where needed. */

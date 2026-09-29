@@ -58,6 +58,8 @@ export function RegionSection({ form }) {
           value=${interval}
           steps=${steps}
           bubble="always"
+          tone="green"
+          label="Как часто проверять"
           format=${(v, short) => (short ? String(v) : everyLabel(v))}
           onChange=${(v) => form.set("general.interval_minutes", v)}
         />
@@ -70,7 +72,7 @@ export function RegionSection({ form }) {
           max=${est.cap_per_hour || 150}
           marker=${0.4}
           tone=${tone}
-          valueText=${`~${number(est.pages_per_hour)} из ${number(est.cap_per_hour)} стр. в час`}
+          valueText=${`~${number(est.pages_per_hour)} из ${number(est.cap_per_hour)} страниц в час`}
           hint=${tone === "green" ? "Безопасно — блокировки маловероятны" : est.suggested_interval ? `Слишком часто: лучше ${everyLabel(est.suggested_interval)}, чтобы оставались запросы на оценку объявлений` : "Слишком часто — есть риск блокировки"}
         />
       </div>`}
@@ -78,33 +80,33 @@ export function RegionSection({ form }) {
         ${(id) => html`<${Toggle} id=${id} checked=${d.general.baseline_first_run} onChange=${(v) => form.set("general.baseline_first_run", v)} />`}
       <//>
       <${SettingRow} label="Не смотреть объявления дешевле" help="Отсекает кабели, чехлы и мусор. Бесплатные объявления всё равно проверяются." error=${form.err("general.min_listing_price")}>
-        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("general.min_listing_price")} suffix="€" min=${0} />`}
+        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("general.min_listing_price")} suffix="€" min=${0} max=${10000} />`}
       <//>
     <//>
 
     <${Group} title="Защита от блокировки" description="Сколько запросов делать к Kleinanzeigen. Трогай, только если понимаешь, зачем." icon="shield">
       <${Advanced}>
-        <${SettingRow} label="Страниц выдачи на поиск" tip=${html`<${Reset} form=${form} path="general.max_pages" value=${1} />`}>
+        <${SettingRow} label="Страниц выдачи на поиск" tip=${html`<${Reset} form=${form} path="general.max_pages" value=${1} / error=${form.err("general.max_pages")}>`}>
           ${(id) => html`<${NumberInput} id=${id} ...${form.bind("general.max_pages")} min=${1} max=${20} />`}
         <//>
         <${SettingRow} label="Пауза между запросами" help="Случайная пауза от и до, в секундах" tip=${html`<${Reset} form=${form} path="general.request_delay_seconds" value=${[3, 7]} />`} error=${form.err("general.request_delay_seconds")}>
           <div class="pair">
-            <${NumberInput} value=${d.general.request_delay_seconds[0]} onChange=${(v) => form.set("general.request_delay_seconds", [v ?? 0, d.general.request_delay_seconds[1]])} suffix="с" aria-label="от" />
+            <${NumberInput} value=${d.general.request_delay_seconds[0]} onChange=${(v) => form.set("general.request_delay_seconds", [v ?? 0, d.general.request_delay_seconds[1]])} suffix="с" min=${0} max=${120} aria-label="Пауза от, секунд" />
             <span>—</span>
-            <${NumberInput} value=${d.general.request_delay_seconds[1]} onChange=${(v) => form.set("general.request_delay_seconds", [d.general.request_delay_seconds[0], v ?? 0])} suffix="с" aria-label="до" />
+            <${NumberInput} value=${d.general.request_delay_seconds[1]} onChange=${(v) => form.set("general.request_delay_seconds", [d.general.request_delay_seconds[0], v ?? 0])} suffix="с" min=${0} max=${120} aria-label="Пауза до, секунд" />
           </div>
         <//>
-        <${SettingRow} label="Открывать объявлений за проверку" tip=${html`<${Reset} form=${form} path="general.max_details_per_run" value=${40} />`}>
-          ${(id) => html`<${NumberInput} id=${id} ...${form.bind("general.max_details_per_run")} min=${0} />`}
+        <${SettingRow} label="Открывать объявлений за проверку" tip=${html`<${Reset} form=${form} path="general.max_details_per_run" value=${40} / error=${form.err("general.max_details_per_run")}>`}>
+          ${(id) => html`<${NumberInput} id=${id} ...${form.bind("general.max_details_per_run")} min=${0} max=${500} />`}
         <//>
-        <${SettingRow} label="Поисков цен аналогов за проверку" tip=${html`<${Reset} form=${form} path="general.max_comps_lookups_per_run" value=${40} />`}>
-          ${(id) => html`<${NumberInput} id=${id} ...${form.bind("general.max_comps_lookups_per_run")} min=${0} />`}
+        <${SettingRow} label="Поисков цен аналогов за проверку" tip=${html`<${Reset} form=${form} path="general.max_comps_lookups_per_run" value=${40} / error=${form.err("general.max_comps_lookups_per_run")}>`}>
+          ${(id) => html`<${NumberInput} id=${id} ...${form.bind("general.max_comps_lookups_per_run")} min=${0} max=${500} />`}
         <//>
-        <${SettingRow} label="Проверок нейросетью за раз" tip=${html`<${Reset} form=${form} path="general.max_ai_per_run" value=${30} />`}>
-          ${(id) => html`<${NumberInput} id=${id} ...${form.bind("general.max_ai_per_run")} min=${0} />`}
+        <${SettingRow} label="Проверок нейросетью за раз" tip=${html`<${Reset} form=${form} path="general.max_ai_per_run" value=${30} / error=${form.err("general.max_ai_per_run")}>`}>
+          ${(id) => html`<${NumberInput} id=${id} ...${form.bind("general.max_ai_per_run")} min=${0} max=${500} />`}
         <//>
         <${SettingRow} label="Не больше запросов в час" help="Жёсткий потолок на один сайт" tip=${html`<${Reset} form=${form} path="general.max_requests_per_hour" value=${150} />`} error=${form.err("general.max_requests_per_hour")}>
-          ${(id) => html`<${NumberInput} id=${id} ...${form.bind("general.max_requests_per_hour")} min=${0} />`}
+          ${(id) => html`<${NumberInput} id=${id} ...${form.bind("general.max_requests_per_hour")} min=${10} max=${1000} />`}
         <//>
         <${SettingRow} label="Паузы после блокировки" help="Часы для 1-й, 2-й, 3-й… блокировки подряд" tip=${html`<${Reset} form=${form} path="general.block_cooldown_hours" value=${[1, 2, 4, 12]} />`} error=${form.err("general.block_cooldown_hours")}>
           <${ChipInput}
@@ -133,16 +135,16 @@ export function MoneySection({ form }) {
       <${StrategyCards} value=${strategy} onChange=${setStrategy} />
       <div class="setting-rows">
         <${SettingRow} label="Минимальная прибыль" help="Столько евро должно остаться после продажи" error=${form.err("pricing.min_profit")}>
-          ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.min_profit")} suffix="€" min=${0} />`}
+          ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.min_profit")} suffix="€" min=${0} max=${10000} />`}
         <//>
         <${SettingRow} label="Минимальный ROI" tip=${html`<${HelpTip} title="ROI">Сколько заработаешь на каждый вложенный евро: 25 % — купил за 100 €, заработал 25 €.<//>`} error=${form.err("pricing.min_roi")}>
-          ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.min_roi", { scale: 100 })} suffix="%" min=${0} />`}
+          ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.min_roi", { scale: 100 })} suffix="%" min=${0} max=${1000} />`}
         <//>
-        <${SettingRow} label="Запас на торг и риск" help="Насколько ниже рынка считать цену продажи" error=${form.err("pricing.safety_margin_percent")}>
-          ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.safety_margin_percent")} suffix="%" min=${0} max=${90} />`}
+        <${SettingRow} label="Запас на торг и риск" help=${p.safety_margin_percent > 30 && p.safety_margin_percent <= 50 ? "Больше 30 % — очень осторожно: находок будет мало" : "Насколько ниже рынка считать цену продажи"} error=${form.err("pricing.safety_margin_percent")}>
+          ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.safety_margin_percent")} suffix="%" min=${0} max=${50} />`}
         <//>
         <${SettingRow} label="Максимум на одну вещь" help="Никогда не советовать покупку дороже. Пусто — без ограничения." error=${form.err("pricing.max_capital")}>
-          ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.max_capital")} suffix="€" placeholder="без ограничения" />`}
+          ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.max_capital")} suffix="€" placeholder="без ограничения" min=${0} max=${100000} />`}
         <//>
       </div>
       <${ExampleBox} pricing=${p} />
@@ -150,24 +152,24 @@ export function MoneySection({ form }) {
 
     <${Group} title="Комиссии и доставка" description="Частные продавцы на eBay.de и Kleinanzeigen комиссий не платят." icon="receipt">
       <${SettingRow} label="Комиссия площадки при продаже" error=${form.err("pricing.selling_fee_percent")}>
-        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.selling_fee_percent")} suffix="%" min=${0} />`}
+        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.selling_fee_percent")} suffix="%" min=${0} max=${50} />`}
       <//>
       <${SettingRow} label="Комиссия за оплату" help="Например, 2,49 % за PayPal «Waren & Dienstleistungen»" error=${form.err("pricing.payment_fee_percent")}>
-        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.payment_fee_percent")} suffix="%" min=${0} />`}
+        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.payment_fee_percent")} suffix="%" min=${0} max=${20} />`}
       <//>
-      <${SettingRow} label="Фиксированная часть комиссии PayPal">
-        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.paypal_fixed_fee")} suffix="€" min=${0} />`}
+      <${SettingRow} label="Фиксированная часть комиссии PayPal" error=${form.err("pricing.paypal_fixed_fee")}>
+        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.paypal_fixed_fee")} suffix="€" min=${0} max=${10} />`}
       <//>
-      <${SettingRow} label="Моя доставка покупателю" help="Сколько тратишь на отправку, когда перепродаёшь">
-        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.default_shipping_cost")} suffix="€" min=${0} />`}
+      <${SettingRow} label="Моя доставка покупателю" help="Сколько тратишь на отправку, когда перепродаёшь" error=${form.err("pricing.default_shipping_cost")}>
+        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.default_shipping_cost")} suffix="€" min=${0} max=${100} />`}
       <//>
     <//>
 
     <${Group} title="Оценка рынка" icon="chart-line">
-      <${SettingRow} label="Скидка при «VB»" help="Объявления с торгом обычно уходят примерно на столько дешевле">
-        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.vb_expected_discount", { scale: 100 })} suffix="%" min=${0} max=${90} />`}
+      <${SettingRow} label="Скидка при «VB»" help="Объявления с торгом обычно уходят примерно на столько дешевле" error=${form.err("pricing.vb_expected_discount")}>
+        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.vb_expected_discount", { scale: 100 })} suffix="%" min=${0} max=${50} />`}
       <//>
-      <${SettingRow} label="Сравнений для уверенной оценки" help="Меньше похожих объявлений — самое большее «Подумай»">
+      <${SettingRow} label="Сравнений для уверенной оценки" help="Меньше похожих объявлений — самое большее «Подумай»" error=${form.err("pricing.min_comparables")}>
         ${(id) => html`<${NumberInput} id=${id} ...${form.bind("pricing.min_comparables")} min=${1} max=${100} />`}
       <//>
       <${SettingRow} kind="switch" label="Учиться на истории цен" help="Каждое объявление пополняет историю — оценки без лишних запросов">
@@ -205,7 +207,7 @@ function ReferencePrices({ form }) {
           </div>
           <div class="ref-row__price">
             <span class="mini-field__label">Цена</span>
-            <${NumberInput} value=${r.price} onChange=${(v) => update(i, { price: v })} suffix="€" />
+            <${NumberInput} value=${r.price} onChange=${(v) => update(i, { price: v })} suffix="€" min=${1} max=${100000} aria-label="Цена" />
           </div>
           <${IconButton} icon="trash" label="Удалить строку" onClick=${() => setRows(rows.filter((_, j) => j !== i))} />
         </div>`,
@@ -242,7 +244,7 @@ export function AiSection({ form }) {
       <p class="muted-line">
         Сейчас: ${ai.enabled ? html`<b>включена</b> · ${ai.provider === "ollama" ? "Ollama" : ai.provider === "anthropic" ? "Claude" : "LM Studio"} · <code>${ai.model}</code>` : html`<b>выключена</b> — уведомления приходят с пометкой ⚠ «фото не проверены»`}
       </p>
-      <${AiConnect} save=${true} current=${{ model: ai.model }} onDone=${() => form.reload()} />
+      <${AiConnect} save=${true} current=${{ model: ai.model, enabled: form.settings && form.settings.ai && form.settings.ai.enabled }} onDone=${() => form.reload()} />
     <//>
 
     <${Group} title="Как проверять" icon="sliders-horizontal">
@@ -261,10 +263,10 @@ export function AiSection({ form }) {
         />
       <//>
       <${SettingRow} label="Ждать ответ до" help="Медленный ПК — ставь больше" error=${form.err("ai.timeout_seconds")}>
-        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("ai.timeout_seconds")} suffix="с" min=${5} />`}
+        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("ai.timeout_seconds")} suffix="с" min=${5} max=${600} />`}
       <//>
       <${SettingRow} label="Уменьшать фото до" help="Меньше — быстрее" error=${form.err("ai.image_max_side")}>
-        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("ai.image_max_side")} suffix="px" min=${128} />`}
+        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("ai.image_max_side")} suffix="px" min=${128} max=${4096} />`}
       <//>
       <${Advanced} title="Другой сервер">
         <${SettingRow} label="Сервер">
@@ -303,10 +305,10 @@ export function AiSection({ form }) {
       <//>
       ${keyState && html`<${TestResult} state=${keyState.state} title=${keyState.title} />`}
       <${SettingRow} label="Проверять, если балл от" wide>
-        <${Slider} value=${so.min_score} min=${0} max=${100} step=${5} format=${(v) => `${v} из 100`} onChange=${(v) => form.set("ai.second_opinion.min_score", v)} tone="violet" />
+        <${Slider} value=${so.min_score} min=${0} max=${100} step=${5} bubble="always" label="Проверять, если балл от" format=${(v) => `${v} из 100`} onChange=${(v) => form.set("ai.second_opinion.min_score", v)} tone="violet" />
       <//>
-      <${SettingRow} label="Не больше за проверку" help="Потолок платных запросов за один проход">
-        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("ai.second_opinion.max_per_run")} min=${0} />`}
+      <${SettingRow} label="Не больше за проверку" help="Потолок платных запросов за один проход" error=${form.err("ai.second_opinion.max_per_run")}>
+        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("ai.second_opinion.max_per_run")} min=${0} max=${100} />`}
       <//>
     <//>
   `;

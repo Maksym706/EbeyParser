@@ -103,7 +103,7 @@ const TOGGLE_CHIPS = [
   { key: "personal", label: "Для себя", icon: "piggy-bank" },
   { key: "near", label: "Рядом ≤ 10 км", icon: "map-pin" },
   { key: "ship", label: "С доставкой", icon: "truck" },
-  { key: "noflags", label: "Без ⚠", icon: "shield-check" },
+  { key: "noflags", label: "Без рисков", icon: "shield-check", tip: "Скрыть объявления с тревожными признаками: предоплата, блокировка, чужие фото…" },
   { key: "unseen", label: "Не смотрел", icon: "eye" },
 ];
 
@@ -115,8 +115,8 @@ export const SORTS = [
   { value: "ending", label: "Скоро конец", auction: true },
 ];
 
-function FChip({ on, icon, children, onClick, count }) {
-  return html`<button type="button" class=${cx("fchip", on && "is-on")} aria-pressed=${on} onClick=${onClick}>
+function FChip({ on, icon, children, onClick, count, tip }) {
+  return html`<button type="button" class=${cx("fchip", on && "is-on")} aria-pressed=${on} onClick=${onClick} title=${tip}>
     <${Icon} name=${on ? "check" : icon} size=${14} stroke=${on ? 2.75 : 2} />
     <span>${children}</span>
     ${count != null && count > 0 && html`<span class="fchip__count num">${count}</span>`}
@@ -149,7 +149,7 @@ export function FilterBar({ f, set, view, setView, total, reset, facets, search 
       )}
       <span class="fbar__sep" aria-hidden="true"></span>
       ${TOGGLE_CHIPS.map(
-        (c) => html`<${FChip} on=${f[c.key]} icon=${c.icon} count=${!f[c.key] && c.key === "unseen" ? countOf(c.key) : null} onClick=${() => set({ [c.key]: !f[c.key] })}>${c.label}<//>`,
+        (c) => html`<${FChip} on=${f[c.key]} icon=${c.icon} tip=${c.tip} count=${!f[c.key] && c.key === "unseen" ? countOf(c.key) : null} onClick=${() => set({ [c.key]: !f[c.key] })}>${c.label}<//>`,
       )}
       <button type="button" class=${cx("fchip fchip--more", extra > 0 && "is-on")} onClick=${() => setMore(true)}>
         <${Icon} name="sliders-horizontal" size=${14} /><span>Ещё</span>${extra > 0 && html`<span class="fchip__count num">${extra}</span>`}

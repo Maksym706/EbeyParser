@@ -75,7 +75,7 @@ export function NotificationsSection({ form }) {
       const res = await api.post("/notify/test", { channel }, { timeout: 70000, params: { channel } });
       setTest({ [channel]: { state: "ok", title: channel === "telegram" ? "Тест отправлен — проверь Telegram" : (res.results && Object.values(res.results)[0] && Object.values(res.results)[0].message_ru) || "Письмо отправлено" } });
     } catch (e) {
-      setTest({ [channel]: { state: "fail", title: e.message } });
+      setTest({ [channel]: { state: "fail", title: e.message, details: e.details } });
     }
   };
   const disable = async (channel) => {
@@ -99,24 +99,24 @@ export function NotificationsSection({ form }) {
         <${Button} size="sm" variant=${tgOn ? "ghost" : "primary"} onClick=${() => setFlow("telegram")}>${tgOn ? "Переподключить" : "Подключить"}<//>
         ${tgOn && html`<${Button} size="sm" variant="danger-ghost" onClick=${() => disable("telegram")}>Отключить<//>`}
       <//>
-      ${test.telegram && test.telegram.state !== "loading" && html`<${TestResult} state=${test.telegram.state} title=${test.telegram.title} />`}
+      ${test.telegram && test.telegram.state !== "loading" && html`<${TestResult} state=${test.telegram.state} title=${test.telegram.title} details=${test.telegram.details} />`}
       <${ChannelCard} icon="mail" title="Почта" connected=${mailOn} detail=${secrets.notify_email && secrets.notify_email.set ? `На ${secrets.notify_email.masked}` : "Письмо с фото и ценой"}>
         ${mailOn && html`<${Button} size="sm" icon="mail" loading=${test.email && test.email.state === "loading"} onClick=${() => sendTest("email")}>Тест<//>`}
         <${Button} size="sm" variant=${mailOn ? "ghost" : "secondary"} onClick=${() => setFlow("email")}>${mailOn ? "Изменить" : "Подключить"}<//>
         ${mailOn && html`<${Button} size="sm" variant="danger-ghost" onClick=${() => disable("email")}>Отключить<//>`}
       <//>
-      ${test.email && test.email.state !== "loading" && html`<${TestResult} state=${test.email.state} title=${test.email.title} />`}
+      ${test.email && test.email.state !== "loading" && html`<${TestResult} state=${test.email.state} title=${test.email.title} details=${test.email.details} />`}
     <//>
 
     <${Group} title="Что присылать" icon="list-filter">
-      <${SettingRow} label="Какие находки" help="«Подумать» — больше уведомлений, но и больше лишних" error=${form.err("notifications.verdicts")}>
+      <${SettingRow} label="Какие находки" help="«Подумай» — больше уведомлений, но и больше лишних" error=${form.err("notifications.verdicts")}>
         <div class="row" style=${{ "--gap": "6px" }}>
-          <${Chip} selected=${(n.verdicts || []).includes("buy")} onClick=${() => toggleVerdict("buy")}>Покупать<//>
-          <${Chip} selected=${(n.verdicts || []).includes("maybe")} onClick=${() => toggleVerdict("maybe")}>Подумать<//>
+          <${Chip} selected=${(n.verdicts || []).includes("buy")} onClick=${() => toggleVerdict("buy")}>Покупай<//>
+          <${Chip} selected=${(n.verdicts || []).includes("maybe")} onClick=${() => toggleVerdict("maybe")}>Подумай<//>
         </div>
       <//>
       <${SettingRow} label="Минимальный балл" wide help=${preview ? preview.message_ru : "Чем выше — тем меньше, но точнее уведомления"}>
-        <${Slider} value=${n.min_score} min=${0} max=${100} step=${5} format=${(v) => `${v} из 100`} onChange=${(v) => form.set("notifications.min_score", v)} />
+        <${Slider} value=${n.min_score} min=${0} max=${100} step=${5} bubble="always" tone="green" label="Минимальный балл" format=${(v) => `${v} из 100`} onChange=${(v) => form.set("notifications.min_score", v)} />
       <//>
       <${SettingRow} label="Как присылать">
         <${Segmented}
@@ -130,7 +130,7 @@ export function NotificationsSection({ form }) {
         />
       <//>
       <${SettingRow} label="Не больше в час" help="Остальное придёт одним сообщением-сводкой" error=${form.err("notifications.max_alerts_per_hour")}>
-        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("notifications.max_alerts_per_hour")} min=${0} />`}
+        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("notifications.max_alerts_per_hour")} min=${0} max=${100} />`}
       <//>
       <${SettingRow} kind="switch" label="Присылать, даже если фото не проверены" help="Когда нейросеть недоступна — с пометкой ⚠">
         ${(id) => html`<${Toggle} id=${id} checked=${n.unchecked_deals} onChange=${(v) => form.set("notifications.unchecked_deals", v)} />`}
@@ -230,7 +230,7 @@ export function AccessSection() {
   useEffect(() => {
     load();
   }, []);
-  if (error) return html`<${Banner} tone="red">${error.message}<//>`;
+  if (error) return html`<${Banner} tone="red" details=${error.details}>${error.message}<//>`;
   if (!access) return html`<div class="sgroup"><${Skeleton} h=${120} radius="16px" /></div>`;
 
   const changeMode = async (mode) => {
@@ -384,13 +384,13 @@ export function DataSection() {
     }
   };
   const rerun = async () => {
-    const ok = await confirm({ title: "Запустить мастер настройки заново?", message: "Текущие поиски останутся, пока ты не сохранишь новые ответы.", confirmLabel: "Открыть мастер", icon: "wand-sparkles" });
+    const ok = await confirm({ title: "Запустить мастер настройки заново?", message: "Твои поиски и находки останутся. В конце мастер спросит, заменить поиски новыми или добавить к текущим.", confirmLabel: "Открыть мастер", icon: "wand-sparkles" });
     if (!ok) return;
     await api.post("/onboarding/complete", { completed: false }).catch(() => {});
     await loadApp().catch(() => {});
     navigate("/welcome");
   };
-  if (error && !data) return html`<${Banner} tone="red">${error.message}<//>`;
+  if (error && !data) return html`<${Banner} tone="red" details=${error.details}>${error.message}<//>`;
   const c = (data && data.counts) || {};
   const demoCount = (data && data.demo && data.demo.count) || (app && app.demo && app.demo.count) || 0;
   return html`
@@ -433,10 +433,9 @@ export function DataSection() {
       <div class="guide__body">
         <${KeyValue}
           rows=${[
-            ["Файл настроек", html`<code>${data.config_path || "—"}</code>`],
-            ["Ключи (.env)", html`<code>${data.env_path || "—"}</code>`],
+            ["Папка программы", html`<code>${folderOf(data.config_path || data.db_path)}</code>`],
             ["База", html`<code>${data.db_path}</code>`],
-            ["Лог", html`<code>${data.log_path}</code>`],
+            ["Журнал", html`<code>${data.log_path}</code>`],
             ["Версия", data.version],
           ]}
         />
@@ -463,6 +462,13 @@ export function DataSection() {
   `;
 }
 
+/** "/home/me/ebp/settings-file" → "/home/me/ebp": the UI shows the folder, never the settings file name (§2.1). */
+function folderOf(path) {
+  const p = String(path || "");
+  const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+  return i > 0 ? p.slice(0, i) : p || "—";
+}
+
 // ============================================================ 8. О программе
 export function AboutSection() {
   const app = useStore(appStore, (s) => s.app);
@@ -483,12 +489,13 @@ export function AboutSection() {
       <//>
     <//>
     <${Group} title="EbeyParser" icon="info">
-      <${KeyValue}
-        rows=${[
-          ["Версия", app && app.version ? app.version : "—"],
-          ["Классический вид", html`<a href="/classic" data-native>Открыть</a>`],
-        ]}
-      />
+      <${KeyValue} rows=${[["Версия", app && app.version ? app.version : "—"]]} />
+      <details class="guide">
+        <summary>Для продвинутых</summary>
+        <div class="guide__body">
+          <${KeyValue} rows=${[["Старый интерфейс", html`<a href="/classic" data-native>Открыть классический вид</a>`]]} />
+        </div>
+      </details>
     <//>
     <${Group} title="Открытые библиотеки" description="Всё встроено в программу и работает без интернета." icon="book-open">
       <ul class="licenses">

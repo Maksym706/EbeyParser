@@ -59,7 +59,9 @@ def file_logging(log_dir: Path) -> Iterator[Path | None]:
         handler = None
     root = logging.getLogger()
     if handler is not None:
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+        from .timefmt import LocalFormatter
+
+        handler.setFormatter(LocalFormatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
         root.addHandler(handler)
     try:
         yield path if handler is not None else None

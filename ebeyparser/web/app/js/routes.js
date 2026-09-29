@@ -9,7 +9,8 @@
 
 export const routes = [
   { path: "/", nav: "feed", title: "Лента", load: () => import("./screens/feed.js") },
-  { path: "/deal/:id", nav: "feed", title: "Сделка", load: () => import("./screens/deal.js") },
+  // focus: on phones the deal is a full-screen page — its own top bar and action bar, no app bar / tab bar
+  { path: "/deal/:id", nav: "feed", title: "Сделка", focus: true, load: () => import("./screens/deal.js") },
   { path: "/deals/:column?", nav: "deals", title: "Мои сделки", load: () => import("./screens/pipeline.js") },
   { path: "/searches/*", nav: "searches", title: "Поиски", load: () => import("./screens/searches.js") },
   { path: "/health/*", nav: "health", title: "Состояние", load: () => import("./screens/health.js") },

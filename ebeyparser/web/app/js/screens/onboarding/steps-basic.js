@@ -1,11 +1,11 @@
 // Onboarding steps 0–4: Welcome, Где, Что, Деньги, Для себя (brief §4.1.1–4.1.5).
 import { html, cx, useEffect, useState } from "../../lib/html.js";
-import { api } from "../../lib/api.js";
+import { api, humanize } from "../../lib/api.js";
 import { navigate } from "../../lib/router.js";
 import { loadApp } from "../../lib/app.js";
 import { money, count } from "../../lib/format.js";
-import { useStore } from "../../lib/store.js";
-import { Icon, Button, Field, Input, NumberInput, Toggle, IconButton, Chip, Banner, ChoiceCards, toast } from "../../ui/index.js";
+import { useStore, appStore } from "../../lib/store.js";
+import { Icon, Button, Field, Input, NumberInput, Toggle, IconButton, Chip, Banner, ChoiceCards, HelpTip, toast } from "../../ui/index.js";
 import { Logo } from "../../shell/shell.js";
 import { LocationPicker, RadiusSlider, RadiusDisc } from "../../setup/where.js";
 import { useCategories, CategoryGrid, LoadMeter } from "../../setup/what.js";
@@ -15,6 +15,24 @@ import { draftStore, updateDraft, pick } from "./draft.js";
 // ------------------------------------------------------------------ 0. Welcome
 export function WelcomeStep({ draft, onNext }) {
   const [demo, setDemo] = useState(false);
+  const [leaving, setLeaving] = useState(false);
+  const app = useStore(appStore, (s) => s.app) || {};
+  // a re-run from Настройки: the person already has searches — offer the way back, not the demo (P2-29)
+  const existing = Boolean(app.onboarding && app.onboarding.completed_at) || ((app.counts && app.counts.searches) || 0) > 0;
+  const demoLoaded = Boolean(app.demo && app.demo.loaded);
+  const backToFeed = async () => {
+    setLeaving(true);
+    try {
+      // re-run by someone who is set up: going back restores the finished state (demo-only: just look)
+      if (!app.onboarded && existing) await api.post("/onboarding/complete", { completed: true });
+      await loadApp();
+      navigate("/");
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      setLeaving(false);
+    }
+  };
   const resume = draft && draft.last_step && draft.last_step !== "welcome";
   const loadDemo = async () => {
     setDemo(true);
@@ -32,7 +50,7 @@ export function WelcomeStep({ draft, onNext }) {
   const benefits = [
     { icon: "radar", tone: "green", text: "Смотрю все новые объявления в твоём районе 24/7" },
     { icon: "scan-eye", tone: "blue", text: "Проверяю фото и описание локальной нейросетью — бесплатно и приватно" },
-    { icon: "send", tone: "amber", text: "Присылаю в Telegram только то, что правда выгодно, и сколько предложить" },
+    { icon: "send", tone: "neutral", text: "Присылаю в Telegram только то, что правда выгодно, и сколько предложить" },
   ];
   return html`<div class="welcome">
     <div class="welcome__logo"><${Logo} size=${48} withText=${false} /></div>
@@ -50,7 +68,9 @@ export function WelcomeStep({ draft, onNext }) {
       <${Button} variant="primary" size="lg" iconRight="arrow-right" onClick=${() => (resume ? navigate(`/welcome/${draft.last_step}`) : onNext())}>
         ${resume ? "Продолжить настройку" : "Начать"}
       <//>
-      <${Button} variant="ghost" icon="flask-conical" loading=${demo} onClick=${loadDemo}>Сначала посмотреть на примере<//>
+      ${existing || demoLoaded
+        ? html`<${Button} variant="ghost" icon="arrow-left" loading=${leaving} onClick=${backToFeed}>Вернуться в ленту<//>`
+        : html`<${Button} variant="ghost" icon="flask-conical" loading=${demo} onClick=${loadDemo}>Сначала посмотреть на примере<//>`}
     </div>
     <p class="welcome__privacy"><${Icon} name="lock" size=${14} />Данные остаются только на твоём компьютере</p>
   </div>`;
@@ -113,7 +133,7 @@ export function WhatStep({ draft }) {
         <//>
       </div>
     </div>
-    ${cats.error && cats.source !== "live" && cats.refreshing === false && cats.live === false && cats.error && html`<${Banner} tone="amber">Не получилось сверить с сайтом: ${cats.error}. Показываю встроенный список — он тоже подходит.<//>`}
+    ${cats.error && cats.source !== "live" && cats.refreshing === false && cats.live === false && cats.error && html`<${Banner} tone="amber" details=${humanize(cats.error).details}>Не получилось сверить с сайтом (${humanize(cats.error).message.replace(/[.!]$/, "")}). Показываю встроенный список — он тоже подходит.<//>`}
     <${CategoryGrid} items=${cats.items} selected=${selected} onToggle=${toggle} loading=${cats.loading} counting=${cats.refreshing} />
     ${!selected.length &&
     html`<p class="what__hint"><${Icon} name="info" size=${16} />${wishes ? `Будут только поиски «для себя» (${count(wishes, "вещь", "вещи", "вещей")}).` : "Выбери хотя бы одну категорию — или добавь, что ищешь для себя, на следующем шаге."}</p>`}
@@ -129,8 +149,8 @@ export function MoneyStep({ draft }) {
   const presets = (options && options.presets) || DEFAULT_PRESETS;
   const budgetRange = (options && options.budget_range) || { min: 50, max: 1500, step: 10 };
   const [manual, setManual] = useState(draft.strategy === "custom");
-  const [budget, setBudget] = useState(draft.max_price || 400);
-  useEffect(() => setBudget(draft.max_price || 400), [draft.max_price]);
+  const [budget, setBudget] = useState(draft.max_price ?? 400);
+  useEffect(() => setBudget(draft.max_price ?? 400), [draft.max_price]);
   const setStrategy = (key) => updateDraft({ strategy: key, pricing: pick(presets[key]) });
   return html`<div class="money-step">
     <section class="onb-section">
@@ -169,8 +189,9 @@ export function MoneyStep({ draft }) {
       />`}
       <${ExampleBox} pricing=${draft.pricing} />
       <p class="fees-line">
-        <${Icon} name="receipt" size=${14} />Комиссии при продаже: 0 % (частные продавцы не платят) ·
-        <a href="/settings/money">Изменить</a>
+        <${Icon} name="receipt" size=${14} />
+        <span>Комиссии при продаже: 0 % — частные продавцы не платят</span>
+        <${HelpTip} title="Комиссии">Если продаёшь как магазин или через платную доставку eBay — укажешь комиссию потом в «Настройки → Деньги». Сейчас ничего менять не нужно.<//>
       </p>
     </section>`}
   </div>`;
@@ -199,7 +220,7 @@ export function WishlistStep({ draft }) {
               <${Input} value=${r.item} onChange=${(v) => update(i, { item: v })} placeholder="Что ищешь, например RTX 3090" aria-label="Что ищешь" icon="search" />
             </div>
             <div class="wish-row__price">
-              <${NumberInput} value=${r.max_price} onChange=${(v) => update(i, { max_price: v })} prefix="до" suffix="€" placeholder="550" aria-label="Максимальная цена" />
+              <${NumberInput} value=${r.max_price} onChange=${(v) => update(i, { max_price: v })} prefix="до" suffix="€" placeholder="550" min=${1} max=${100000} aria-label="Максимальная цена" />
             </div>
             <${IconButton} icon="x" label="Убрать" onClick=${() => remove(i)} />
           </div>
@@ -211,6 +232,7 @@ export function WishlistStep({ draft }) {
     ${suggestions.length > 0 &&
     html`<div class="wish-suggest">
       <div class="t-overline">Популярное</div>
+      <p class="wish-suggest__hint">Ищу по-немецки — так пишут продавцы на Kleinanzeigen.</p>
       <div class="row" style=${{ "--gap": "6px" }}>
         ${suggestions
           .filter((s) => !used.has(s.item.toLowerCase()))
@@ -223,7 +245,8 @@ export function WishlistStep({ draft }) {
                 if (empty >= 0) update(empty, { item: s.item, max_price: s.max_price });
                 else add(s.item, s.max_price);
               }}
-              >${s.item} · ${money(s.max_price)}<//
+              title=${s.hint_ru || undefined}
+              >${s.item}${s.hint_ru ? html` <span class="chip__hint">${s.hint_ru}</span>` : ""} · ${money(s.max_price)}<//
             >`,
           )}
       </div>

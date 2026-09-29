@@ -94,6 +94,8 @@ class GeneralConfig(BaseModel):
     max_requests_per_hour: int = 150
     block_cooldown_hours: list[float] = Field(default_factory=lambda: [1.0, 2.0, 4.0, 12.0])
     baseline_first_run: bool = True  # first pass of a NEW search only learns prices, no alerts
+    # the user's time zone: every time in messages / the web UI / the log ("пауза до 21:34")
+    timezone: str = "Europe/Berlin"
 
     @field_validator("request_delay_seconds", mode="before")
     @classmethod

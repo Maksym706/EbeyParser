@@ -20,7 +20,9 @@ from ... import __version__
 from ...models import utcnow
 from .context import DEMO_RUNS_KEY, ApiContext, get_ctx
 from .errors import ApiError
-from .presenters import LOCAL_TZ, iso
+from ...errors_ru import AI_DOWN_RU, ai_problem, humanize_text
+from ...timefmt import local_tz, when_label
+from .presenters import iso
 from .routes_app import demo_count, demo_ids
 from .schemas import ERRORS, ConfirmIn
 
@@ -34,30 +36,46 @@ _LOG_RE = re.compile(r"^(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:,(?P<ms>
 
 
 # ------------------------------------------------------------------- health
+AI_STATE_OK = "Работает"
+AI_STATE_DOWN = "Не отвечает"
+AI_STATE_OFF = "Нейросеть выключена — фото никто не проверяет"
+
+
 async def ai_health(ctx: ApiContext) -> dict[str, Any]:
+    """AI status for /health (and the Состояние tile): the same texts as the AI test."""
     ai = ctx.config.ai
     base = {"enabled": ai.enabled, "provider": ai.provider, "base_url": ai.base_url, "model": ai.model}
     if not ai.enabled:
-        return {**base, "ok": None, "state_ru": "Нейросеть выключена — фото никто не проверяет"}
+        return {**base, "ok": None, "state_ru": AI_STATE_OFF, "error_ru": "", "latency_ms": None}
     fn = getattr(ctx.monitor, "ai_health", None)
     if fn is None:
-        return {**base, "ok": None, "state_ru": "Монитор не подключён — проверить нейросеть нельзя"}
+        return {**base, "ok": None, "state_ru": "Проверить нейросеть сейчас нельзя — фоновые проверки выключены",
+                "error_ru": "", "latency_ms": None}
     started = time.monotonic()
     try:
         result = await asyncio.wait_for(fn(), timeout=AI_HEALTH_TIMEOUT)
     except asyncio.TimeoutError:
-        return {**base, "ok": False, "error_ru": f"Сервер нейросети не ответил за {AI_HEALTH_TIMEOUT:g} с",
-                "state_ru": "Нейросеть не отвечает"}
+        return {**base, "ok": False, "server_ok": False, "state_ru": AI_STATE_DOWN, "latency_ms": None,
+                "error_ru": ai_problem(ai.provider, ai.base_url, ai.model, "не ответил за 8 с", server_ok=False),
+                "details": f"Сервер нейросети не ответил за {AI_HEALTH_TIMEOUT:g} с"}
     except Exception as exc:  # noqa: BLE001
-        return {**base, "ok": False, "error_ru": str(exc) or type(exc).__name__, "state_ru": "Нейросеть не отвечает"}
+        return {**base, "ok": False, "server_ok": False, "state_ru": AI_STATE_DOWN, "latency_ms": None,
+                "error_ru": ai_problem(ai.provider, ai.base_url, ai.model, str(exc), server_ok=False),
+                "details": f"{type(exc).__name__}: {exc}"}
     result = result if isinstance(result, dict) else {}
     ok = bool(result.get("ok"))
-    return {
-        **base, "ok": ok, "server_ok": result.get("server_ok", ok), "model_available": result.get("model_available"),
-        "resolved_model": result.get("resolved_model"), "error_ru": result.get("error") or "",
-        "latency_ms": int((time.monotonic() - started) * 1000),
-        "state_ru": "Работает" if ok else (result.get("error") or "Нейросеть не отвечает"),
+    server_ok = result.get("server_ok", ok)
+    error = str(result.get("error") or "")
+    out = {
+        **base, "ok": ok, "server_ok": server_ok, "model_available": result.get("model_available"),
+        "resolved_model": result.get("resolved_model"),
+        "error_ru": "" if ok else ai_problem(ai.provider, ai.base_url, ai.model, error, server_ok=server_ok),
+        "latency_ms": int((time.monotonic() - started) * 1000) if ok else None,  # no "1 мс" next to "не отвечает"
+        "state_ru": AI_STATE_OK if ok else (AI_STATE_DOWN if server_ok is False else "Модель не найдена"),
     }
+    if error and not ok:
+        out["details"] = error
+    return out
 
 
 def _size(path: Path) -> int:
@@ -103,50 +121,92 @@ def channels_view(ctx: ApiContext) -> dict[str, Any]:
     channels = []
     for name, label in (("telegram", "Telegram"), ("email", "Почта")):
         problem = problems.get(name)
+        raw_error = problem["last_error"] if problem else ""
         channels.append({
             "name": name, "label": label, "enabled": getattr(cfg, name).enabled,
             "configured": not missing.get(name), "missing": missing.get(name, []),
-            "last_delivery_at": iso(last.get(name)), "failed_24h": problem["failed"] if problem else 0,
-            "last_error": problem["last_error"] if problem else "",
+            "last_delivery_at": iso(last.get(name)), "last_delivery_at_label": when_label(last.get(name)),
+            "failed_24h": problem["failed"] if problem else 0,
+            "last_error": humanize_text(raw_error, name).message_ru if raw_error else "",
+            "last_error_details": raw_error,
         })
     try:
         queued = len(ctx.db.queued_alerts())
     except Exception:  # noqa: BLE001
         queued = 0
+    ready = any(c["enabled"] and c["configured"] for c in channels)
     return {"channels": channels, "queued": queued, "health_alerts": cfg.health_alerts,
-            "heartbeat_hour": cfg.heartbeat_hour}
+            "heartbeat_hour": cfg.heartbeat_hour,
+            # the daily "жив" report only goes out through a working channel: don't promise it otherwise
+            "heartbeat_active": cfg.heartbeat_hour is not None and ready, "any_channel": ready}
 
 
-@router.get("/health", summary="Состояние: итоговый баннер, монитор, нейросеть, сайты, уведомления, диск, последняя ошибка")
+NOTIFY_ACTION = {"label_ru": "Настроить уведомления", "href": "/settings/notifications"}
+LEVEL_ORDER = {"error": 0, "warn": 1}
+
+
+@router.get("/health", summary="Состояние: итоговый баннер (+ action), монитор, нейросеть, сайты, уведомления, диск")
 async def health(ai: bool = Query(True, description="проверять нейросеть (до 8 с)"),
                  ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
-    from .routes_monitor import http_hosts, monitor_view, run_view
+    """level: ok | warn | error. Never "ok" while automatic checks are stopped, paused or a
+    site asked for a pause, or while a notification channel is on but not set up.
+    banner_ru: the most important problem in plain Russian; action: {label_ru, href} (an
+    SPA path) or null. problems: [{level, text_ru, action?, details?}]."""
+    from .routes_monitor import monitor_view, real_runs, run_view, site_label
 
-    mon = await monitor_view(ctx, with_hosts=False)
-    sites = await http_hosts(ctx)
+    mon = await monitor_view(ctx, with_hosts=True)
+    sites = mon["http"]
     ai_info = await ai_health(ctx) if ai else None
     notif = channels_view(ctx)
-    runs = ctx.db.list_runs(limit=48)
-    last_error = next(({"run_id": r.id, "at": iso(r.started_at), "errors": list(r.errors)} for r in runs if r.errors), None)
-    problems: list[tuple[str, str]] = []  # (level, text)
+    runs = real_runs(ctx, 48)
+    last_error = next(({"run_id": r.id, "at": iso(r.started_at), "at_label": when_label(r.started_at),
+                        **{k: run_view(r)[k] for k in ("errors", "error_details")}} for r in runs if r.errors), None)
+    problems: list[dict[str, Any]] = []
+
+    def add(level: str, text: str, action: dict[str, str] | None = None, details: str = "") -> None:
+        item: dict[str, Any] = {"level": level, "text_ru": text, "action": action}
+        if details:
+            item["details"] = details
+        problems.append(item)
+
     if ai_info and ai_info.get("ok") is False:
-        problems.append(("error", f"Нейросеть не отвечает — уведомления идут с пометкой «фото не проверены». "
-                                  f"{ai_info.get('error_ru') or ''}".strip()))
-    for site in sites:
-        if site["blocked"]:
-            problems.append(("error", f"{site['host']} ограничил запросы — пауза до {site['cooldown_until'] or '…'}"))
-        elif site["exhausted"]:
-            problems.append(("warn", f"{site['host']}: лимит запросов в час исчерпан — продолжу позже"))
-    for channel in notif["channels"]:
-        if channel["enabled"] and channel["failed_24h"]:
-            problems.append(("warn", f"{channel['label']}: не доставлено {channel['failed_24h']} — {channel['last_error']}"))
+        add("error", f"{AI_DOWN_RU}. {ai_info.get('error_ru') or ''}".strip(),
+            {"label_ru": "Настройки нейросети", "href": "/settings/ai"}, str(ai_info.get("details") or ""))
+    if not mon["available"]:
+        restart = callable(getattr(ctx.app.state, "restart_callback", None))
+        add("warn", "Фоновые проверки выключены — перезапусти программу, и они включатся сами",
+            {"label_ru": "Перезапустить", "href": "/settings/data"} if restart else None)
+    elif mon["state"] == "stopped":
+        add("warn", "Автопроверка выключена — новые объявления смотрю только по кнопке «Проверить сейчас»",
+            {"label_ru": "Проверить сейчас", "href": "/health"})
     if mon["paused"]:
-        problems.append(("warn", "Проверки на паузе"))
+        add("warn", "Проверки на паузе — новые объявления сейчас не смотрю", {"label_ru": "Продолжить", "href": "/health"})
+    if not any(s.enabled for s in ctx.config.searches):
+        add("warn", "Нет ни одного включённого поиска — мне нечего проверять. Добавь, что искать",
+            {"label_ru": "Поиски", "href": "/searches"})
+    cooldown = mon.get("cooldown")
+    if cooldown:
+        add("warn", f"{cooldown['text_ru']}. Ничего делать не нужно — это защита от блокировки",
+            {"label_ru": "Снизить нагрузку", "href": "/settings/region"})
+    for site in sites:
+        if site["exhausted"] and not site["blocked"]:
+            add("warn", f"{site_label(site['host'])}: лимит запросов на этот час исчерпан — продолжу сам позже",
+                {"label_ru": "Снизить нагрузку", "href": "/settings/region"})
+    for channel in notif["channels"]:
+        if channel["enabled"] and not channel["configured"]:
+            add("warn", f"{channel['label']} включен(а), но не настроен(а) — уведомления туда не уходят",
+                NOTIFY_ACTION)
+        elif channel["enabled"] and channel["failed_24h"]:
+            add("warn", f"{channel['label']}: не доставлено {channel['failed_24h']} — {channel['last_error']}",
+                NOTIFY_ACTION, channel["last_error_details"])
     if runs and runs[0].errors:
-        problems.append(("warn", f"В последней проверке ошибок: {len(runs[0].errors)}"))
-    level = "error" if any(p[0] == "error" for p in problems) else ("warn" if problems else "ok")
+        add("warn", f"В последней проверке ошибок: {len(runs[0].errors)} — подробности ниже, в «Проверки»",
+            {"label_ru": "Подробнее", "href": "/health"})
+    problems.sort(key=lambda p: LEVEL_ORDER.get(p["level"], 2))
+    level = "error" if any(p["level"] == "error" for p in problems) else ("warn" if problems else "ok")
+    action = problems[0]["action"] if problems else None
     if problems:
-        banner = problems[0][1]
+        banner = problems[0]["text_ru"]
     elif mon["last_summary"]:
         last = mon["last_summary"]
         banner = (f"Всё работает. Последняя проверка: {last.get('new_listings', 0)} новых, "
@@ -157,12 +217,14 @@ async def health(ai: bool = Query(True, description="проверять нейр
         "ok": level == "ok",
         "level": level,
         "banner_ru": banner,
-        "problems": [{"level": lvl, "text_ru": text} for lvl, text in problems],
+        "action": action,
+        "problems": problems,
         "version": __version__,
         "uptime_seconds": int((utcnow() - ctx.started_at).total_seconds()),
-        "monitor": mon,
+        "monitor": {k: v for k, v in mon.items() if k != "http"},
         "ai": ai_info,
         "sites": sites,
+        "cooldown": cooldown,
         "ebay": {"configured": ctx.config.ebay.configured, "marketplace_id": ctx.config.ebay.marketplace_id},
         "notifications": notif,
         "backlog": mon["backlog"],
@@ -246,7 +308,7 @@ async def logs_download(ctx: ApiContext = Depends(get_ctx)) -> FileResponse:
     path = log_path(ctx)
     if not path.is_file():
         raise ApiError(404, "not_found", "Лога ещё нет — он появляется после запуска проверок")
-    stamp = utcnow().astimezone(LOCAL_TZ).strftime("%Y-%m-%d_%H-%M")
+    stamp = utcnow().astimezone(local_tz()).strftime("%Y-%m-%d_%H-%M")
     return FileResponse(path, media_type="text/plain; charset=utf-8", filename=f"ebeyparser-{stamp}.log")
 
 
@@ -346,7 +408,7 @@ async def data_info(ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
 @router.get("/backup", summary="Резервная копия (zip): база + config.yaml (+ .env с ключами, если include_secrets=1)")
 async def backup(include_secrets: bool = Query(False), ctx: ApiContext = Depends(get_ctx)) -> FileResponse:
     workdir = Path(tempfile.mkdtemp(prefix="ebeyparser-backup-"))
-    stamp = utcnow().astimezone(LOCAL_TZ).strftime("%Y-%m-%d_%H-%M")
+    stamp = utcnow().astimezone(local_tz()).strftime("%Y-%m-%d_%H-%M")
     archive = workdir / f"ebeyparser-backup-{stamp}.zip"
 
     def build() -> None:
@@ -373,7 +435,8 @@ async def backup(include_secrets: bool = Query(False), ctx: ApiContext = Depends
         await asyncio.to_thread(build)
     except Exception as exc:  # noqa: BLE001
         shutil.rmtree(workdir, ignore_errors=True)
-        raise ApiError(500, "backup_failed", f"Не удалось создать копию: {exc}") from exc
+        raise ApiError(500, "backup_failed", "Не получилось создать резервную копию — проверь, что на диске есть "
+                       "место, и попробуй ещё раз", details=f"{type(exc).__name__}: {exc}") from exc
     return FileResponse(archive, media_type="application/zip", filename=archive.name,
                         background=BackgroundTask(shutil.rmtree, workdir, True))
 

@@ -22,6 +22,7 @@ from urllib.parse import unquote, urljoin, urlsplit
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 from ..config import GeneralConfig, SearchConfig
+from ..timefmt import at_label, until_label
 
 if TYPE_CHECKING:  # duck-typed at runtime: anything with `async get_text(url)` works
     from .http import PoliteClient
@@ -306,22 +307,30 @@ def discovery_url(location: str, radius_km: int, category_id: int | None = None)
 
 
 def describe_error(exc: BaseException) -> str:
-    """Short Russian reason for the fallback notice."""
+    """Short plain-Russian reason (no host names, no exception classes; times in the user's
+    time zone). Used by the category fallback notice and the CLI diagnostics."""
+    import httpx
+
     kind = type(exc).__name__
     until = getattr(exc, "cooldown_until", None) or getattr(exc, "retry_at", None)
-    when = f" до {until.astimezone():%H:%M}" if isinstance(until, datetime) else ""
     if kind == "RateBudgetExceeded":
-        return f"исчерпан лимит запросов к сайту в этот час — попробуй{when or ' позже'}"
+        when = f" {at_label(until)}" if isinstance(until, datetime) else " позже"
+        return f"Лимит запросов к сайту на этот час исчерпан — продолжу{when}"
     if kind == "BlockedError":
         if getattr(exc, "cooling_down", False):
+            when = f" {until_label(until)}" if isinstance(until, datetime) else ""
             return f"Kleinanzeigen на паузе после блокировки{when}"
         return "Kleinanzeigen временно не пускает (защита от ботов) — попробуй позже"
-    status = getattr(exc, "status_code", None)
-    if status:
-        return f"сайт ответил HTTP {status}"
-    if isinstance(exc, TimeoutError):
-        return "kleinanzeigen.de не ответил вовремя"
-    return f"нет связи с kleinanzeigen.de ({(str(exc) or kind)[:160]})"
+    if isinstance(exc, httpx.ProxyError):
+        return "Kleinanzeigen недоступен из этой сети — проверь интернет или VPN"
+    if isinstance(exc, httpx.HTTPStatusError):
+        return "Kleinanzeigen не ответил на проверку — попробуй позже"
+    if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+        return "Kleinanzeigen не ответил вовремя"
+    return "Нет связи с Kleinanzeigen — проверь интернет"
+
+
+FALLBACK_NOTE = " — пока показываю обычный список категорий, он тоже подходит"
 
 
 def discovery_client(general: GeneralConfig | None = None, **kwargs: Any) -> PoliteClient:
@@ -332,6 +341,7 @@ def discovery_client(general: GeneralConfig | None = None, **kwargs: Any) -> Pol
     client = PoliteClient.from_config(general or GeneralConfig(), **kwargs)
     client.delay_range = (1.0, 2.5)
     client.max_retries = 1
+    client.soft_403 = True  # an optional check: only a real block page counts as a block
     return client
 
 
@@ -354,9 +364,10 @@ async def discover_categories(
         links = parse_category_links(html)
     except Exception as exc:  # network, block page, parser surprise: fall back
         log.warning("Category discovery for %s failed: %s", location, exc)
-        return CategoryList(builtin_categories(), error=describe_error(exc), url=url)
+        return CategoryList(builtin_categories(), error=describe_error(exc) + FALLBACK_NOTE, url=url)
     if not links:
-        return CategoryList(builtin_categories(), error="на странице сайта не нашлось списка категорий", url=url)
+        return CategoryList(builtin_categories(), error="Сайт не прислал список категорий — показываю обычный",
+                            url=url)
     final_url = getattr(client, "last_url", None) or url
     known = {link.id for link in links}
     for parent_id in expand:
@@ -496,6 +507,8 @@ class RequestEstimate:
         return bool(self.cap_per_hour) and self.pages_per_hour > self.cap_per_hour / 2
 
     def describe(self) -> str:
+        if not self.searches:
+            return "Поисков пока нет — запросов к сайту не будет."
         parts = []
         if self.category_scans:
             parts.append(f"{self.category_scans} {_plural(self.category_scans, 'категория', 'категории', 'категорий')}"
@@ -564,8 +577,11 @@ def estimate_requests(
 
 # ------------------------------------------------------------ search builders
 def scan_name(category_name: str, location: str, radius_km: int | None) -> str:
-    """'Handy & Telefon · Berlin 30 км'."""
-    where = location.strip() or "вся Германия"
+    """'Handy & Telefon · Berlin 30 км'; a district picked by its postal code shows its name
+    ('Notebooks · Neukölln 50 км', not '12043')."""
+    from ..web.api.locations import place_label  # plain data, no web dependencies
+
+    where = place_label(location) or "вся Германия"
     if radius_km:
         where = f"{where} {radius_km} км"
     return f"{category_name} · {where}"
@@ -727,18 +743,40 @@ def searches_from_answers(
     )
 
 
+def search_key(name: str) -> str:
+    """Names that only differ in case / punctuation / spaces are the same search
+    ("Для себя: RTX 3090" == "для себя rtx-3090")."""
+    return re.sub(r"[\W_]+", "", (name or "").casefold())
+
+
 def merge_searches(
     existing: Iterable[SearchConfig], generated: Iterable[SearchConfig], *, replace_all: bool
 ) -> list[SearchConfig]:
-    """replace_all: only the generated ones. Otherwise same-name searches are updated in
-    place, other existing ones kept, new ones appended."""
+    """replace_all: only the generated ones. Otherwise searches with the same name (see
+    search_key) are updated in place, other existing ones kept, new ones appended — an
+    existing search is never dropped."""
     generated = list(generated)
     if replace_all:
         return generated
-    pending = {s.name: s for s in generated}
-    out = [pending.pop(s.name, s) for s in existing]
-    out.extend(s for s in generated if s.name in pending)
+    pending = {search_key(s.name): s for s in generated}
+    out = [pending.pop(search_key(s.name), s) for s in existing]
+    out.extend(s for s in generated if search_key(s.name) in pending)
     return out
+
+
+def merge_plan(existing: Iterable[SearchConfig], generated: Iterable[SearchConfig], *,
+               replace_all: bool) -> dict[str, list[str]]:
+    """What merge_searches will do, by name: created / updated / kept / replaced (removed)."""
+    existing, generated = list(existing), list(generated)
+    new_keys = {search_key(s.name) for s in generated}
+    old_keys = {search_key(s.name) for s in existing}
+    others = [s.name for s in existing if search_key(s.name) not in new_keys]
+    return {
+        "created": [s.name for s in generated if search_key(s.name) not in old_keys],
+        "updated": [s.name for s in generated if search_key(s.name) in old_keys],
+        "kept": [] if replace_all else others,
+        "replaced": others if replace_all else [],
+    }
 
 
 def snap_radius(radius_km: int) -> int:
@@ -771,7 +809,9 @@ __all__ = [
     "is_category_scan",
     "load_cached_categories",
     "merge_categories",
+    "merge_plan",
     "merge_searches",
+    "search_key",
     "parse_category_links",
     "save_cached_categories",
     "scan_name",

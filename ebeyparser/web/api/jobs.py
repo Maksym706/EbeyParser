@@ -32,7 +32,7 @@ class Job:
     finished_at: datetime | None = None
     ad_id: str | None = None
     result: dict[str, Any] | None = None
-    error: dict[str, str] | None = None  # {"code", "message_ru"}
+    error: dict[str, Any] | None = None  # {"code", "message_ru", "details"?, "action"?}
     stage: str = ""  # current step, e.g. "fetch" / "market" / "ai"
     stage_ru: str = ""
     stages: list[dict[str, Any]] = field(default_factory=list)  # [{"stage", "text_ru", "at"}]
@@ -75,7 +75,7 @@ class Job:
         return out
 
 
-ErrorMapper = Callable[[BaseException], tuple[str, str]]
+ErrorMapper = Callable[[BaseException], "dict[str, Any] | tuple[str, str]"]
 
 
 class JobRegistry:
@@ -83,7 +83,7 @@ class JobRegistry:
         self.hub = hub
         self.keep = keep
         self._jobs: OrderedDict[str, Job] = OrderedDict()
-        self._error_mapper = error_mapper or (lambda exc: ("failed", str(exc) or type(exc).__name__))
+        self._error_mapper = error_mapper or (lambda exc: {"code": "failed", "message_ru": str(exc) or type(exc).__name__})
 
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
@@ -121,13 +121,14 @@ class JobRegistry:
             job.status = "error"
             job.error = {"code": "timeout", "message_ru": f"Не уложились в {JOB_TIMEOUT / 60:g} мин — попробуй ещё раз"}
         except Exception as exc:  # noqa: BLE001 - becomes a readable job error
-            code, message = self._error_mapper(exc)
-            if code == "internal":
+            mapped = self._error_mapper(exc)
+            error = dict(mapped) if isinstance(mapped, dict) else {"code": mapped[0], "message_ru": mapped[1]}
+            if error.get("code") == "internal":
                 log.exception("Job %s (%s) failed", job.id, job.kind)
             else:
-                log.info("Job %s (%s) failed: %s", job.id, job.kind, message)
+                log.info("Job %s (%s) failed: %s (%s)", job.id, job.kind, error.get("message_ru"), exc)
             job.status = "error"
-            job.error = {"code": code, "message_ru": message}
+            job.error = error
         finally:
             job.finished_at = utcnow()
             try:

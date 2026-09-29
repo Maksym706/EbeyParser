@@ -3,7 +3,7 @@
 // All controls are controlled components: pass `value` + `onChange(newValue)`.
 import { html, cx, useState, useRef, useEffect, useId } from "../lib/html.js";
 import { Icon } from "./icons.js";
-import { Spinner } from "./core.js";
+import { Spinner, Details } from "./core.js";
 
 /** Label + control + help/error text. Children get the generated id via render prop or `id`. */
 export function Field({ label, help, error, optional, id, inline = false, class: cls = "", children, aside }) {
@@ -58,33 +58,77 @@ export function Input({
   </div>`;
 }
 
-/** Number input returning numbers (or null when empty). */
-export function NumberInput({ value, onChange, min, max, step = 1, ...rest }) {
+const fmtNum = (v) => new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 }).format(v);
+
+/**
+ * Before saving: if a number field inside `root` is out of range, reveal the messages, focus the
+ * first bad field and return true (= don't save).
+ */
+export function showFieldErrors(root = document) {
+  const bad = root.querySelector("input[data-range-error]");
+  if (!bad) return false;
+  window.dispatchEvent(new CustomEvent("ebp:show-field-errors"));
+  bad.focus({ preventScroll: true });
+  bad.scrollIntoView({ block: "center" });
+  return true;
+}
+
+/**
+ * "Не меньше 0 €" / "Можно от 0 до 90 %" when `v` is outside [min, max], else null.
+ * Forms use it for their own save-time checks; NumberInput shows it under the field.
+ */
+export function rangeError(v, min, max, suffix) {
+  if (v == null || typeof v !== "number" || Number.isNaN(v)) return null;
+  const u = typeof suffix === "string" && suffix ? ` ${suffix}` : "";
+  const low = min != null && v < min;
+  const high = max != null && v > max;
+  if (!low && !high) return null;
+  if (min != null && max != null && max - min <= 2000) return `Можно от ${fmtNum(min)} до ${fmtNum(max)}${u}`;
+  return low ? `Не меньше ${fmtNum(min)}${u}` : `Не больше ${fmtNum(max)}${u}`;
+}
+
+/**
+ * Number input returning numbers (or null when empty). Out-of-range values are never clamped
+ * silently (brief §2.2): the field turns red with «Можно от 0 до 90 %» under it after leaving it,
+ * and the value is passed on as typed so the form can refuse to save. Pass `invalid` when the
+ * parent shows its own message for this field.
+ */
+export function NumberInput({ value, onChange, min, max, step = 1, invalid, onBlur, ...rest }) {
   const [text, setText] = useState(value ?? "");
+  const [touched, setTouched] = useState(false);
   useEffect(() => {
-    if (Number(String(text).replace(",", ".")) !== value) setText(value ?? "");
+    if (Number(String(text).replace(/\s/g, "").replace(",", ".")) !== value) setText(value ?? "");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value]);
-  return html`<${Input}
-    ...${rest}
-    inputmode="decimal"
-    value=${text}
-    onChange=${(raw) => {
-      setText(raw);
-      const cleaned = raw.replace(/\s/g, "").replace(",", ".");
-      if (cleaned === "") return onChange(null);
-      const n = Number(cleaned);
-      if (!Number.isNaN(n)) onChange(n);
-    }}
-    onBlur=${() => {
-      if (value == null) return;
-      let n = value;
-      if (min != null && n < min) n = min;
-      if (max != null && n > max) n = max;
-      if (n !== value) onChange(n);
-      setText(n);
-    }}
-  />`;
+  // a form that refuses to save asks every field to show its message: showFieldErrors()
+  useEffect(() => {
+    const on = () => setTouched(true);
+    window.addEventListener("ebp:show-field-errors", on);
+    return () => window.removeEventListener("ebp:show-field-errors", on);
+  }, []);
+  const out = rangeError(value, min, max, rest.suffix);
+  const bad = Boolean(invalid) || (touched && Boolean(out));
+  return html`<span class="numfield">
+    <${Input}
+      ...${rest}
+      inputmode="decimal"
+      value=${text}
+      invalid=${bad}
+      data-range-error=${out ? "1" : undefined}
+      onChange=${(raw) => {
+        setText(raw);
+        const cleaned = raw.replace(/\s/g, "").replace(",", ".");
+        if (cleaned === "") return onChange(null);
+        const n = Number(cleaned);
+        if (!Number.isNaN(n)) onChange(n);
+      }}
+      onBlur=${(e) => {
+        setTouched(true);
+        onBlur && onBlur(e);
+      }}
+    />
+    ${touched && out && !invalid && html`<span class="numfield__error" role="alert"><${Icon} name="circle-alert" size=${14} />${out}</span>`}
+  </span>`;
 }
 
 /** Password-style input with a show/hide eye. Shows "•••• сохранён" when a secret already exists. */
@@ -363,7 +407,7 @@ export function Autocomplete({ value, onInput, options = [], onSelect, loading, 
  * Result line of an inline "Проверить" button.
  *   state: idle | loading | ok | fail | warn
  */
-export function TestResult({ state = "idle", title, detail, children }) {
+export function TestResult({ state = "idle", title, detail, details, children }) {
   if (state === "idle") return null;
   const icon = { loading: null, ok: "circle-check", fail: "circle-x", warn: "triangle-alert" }[state];
   return html`<div class=${cx("test-result", `test-result--${state}`)} role="status" aria-live="polite">
@@ -372,6 +416,7 @@ export function TestResult({ state = "idle", title, detail, children }) {
       <div class="test-result__title">${title}</div>
       ${detail && html`<div class="test-result__detail">${detail}</div>`}
       ${children}
+      <${Details} text=${details} />
     </div>
   </div>`;
 }

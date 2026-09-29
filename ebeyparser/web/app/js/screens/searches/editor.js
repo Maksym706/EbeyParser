@@ -1,8 +1,9 @@
 // Search editor (brief §4.5): chooser «Новый поиск» + side panel with Что / Где / Цена /
 // Фильтры / Порог выгоды / eBay. Saves with POST /searches or PATCH /searches/{id}.
-import { html, cx, useState, useEffect, useLayoutEffect } from "../../lib/html.js";
+import { html, cx, useState, useEffect, useLayoutEffect, useRef } from "../../lib/html.js";
 import { useAsync, useDebounced } from "../../lib/hooks.js";
 import { api } from "../../lib/api.js";
+import { addNavigationGuard, navigate } from "../../lib/router.js";
 import {
   Icon,
   Button,
@@ -81,6 +82,30 @@ function autoName(f, kind) {
 }
 
 const num = (v) => (v === "" || v === undefined ? null : v);
+const MAX_EUR = 100000;
+
+/** Client-side guards (P1-9/P1-10): never clamp silently, say what is wrong next to the field. */
+function validate(f, kind, personal) {
+  const e = {};
+  const money = (k, label) => {
+    const v = f[k];
+    if (v == null) return;
+    if (v < 0) e[k] = "Не может быть меньше 0 €";
+    else if (v > MAX_EUR) e[k] = `Слишком большая сумма — не больше ${MAX_EUR.toLocaleString("ru-RU")} €`;
+    else if (label && v === 0 && k !== "min_price") e[k] = `${label}: 0 € — так я ничего не найду`;
+  };
+  money("min_price");
+  money("max_price", personal ? "Показывать до" : "Цена до");
+  money("target_price", "Готов заплатить");
+  money("min_profit");
+  if (personal && f.target_price != null && f.max_price != null && f.max_price < f.target_price && !e.max_price)
+    e.max_price = `Должно быть не меньше, чем «Готов заплатить» (${f.target_price} €)`;
+  if (!personal && f.min_price != null && f.max_price != null && f.max_price < f.min_price && !e.max_price)
+    e.max_price = "«Цена до» должна быть больше, чем «Цена от»";
+  if (f.min_roi != null && (f.min_roi < 0 || f.min_roi > 10)) e.min_roi = "От 0 до 1000 %";
+  if (kind === "ebay" && f.ending_within_hours != null && (f.ending_within_hours < 1 || f.ending_within_hours > 240)) e.ending_within_hours = "От 1 до 240 часов";
+  return e;
+}
 
 /**
  * <SearchEditor open search={view|null} kind="category" base={defaults} onClose onSaved />
@@ -93,16 +118,52 @@ export function SearchEditor({ open, search, kind: newKind, base = {}, categorie
   const [errors, setErrors] = useState({});
   const [saving, setSaving] = useState(false);
   const [ownLimits, setOwnLimits] = useState(Boolean(editing && (search.config.min_profit != null || search.config.min_roi != null)));
+  const initial = useRef(null); // snapshot to tell whether there is something to lose
+  const bodyRef = useRef(null);
 
   // layout effect: reset before the first paint, so typing can never land in the old form
   useLayoutEffect(() => {
     if (!open) return;
-    setF(editing ? { ...search.config } : blank(kind, base));
+    const start = editing ? { ...search.config } : blank(kind, base);
+    setF(start);
+    initial.current = JSON.stringify(start);
     setNamed(editing);
     setErrors({});
     setOwnLimits(Boolean(editing && (search.config.min_profit != null || search.config.min_roi != null)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, search && search.id, newKind]);
+
+  const dirty = open && initial.current != null && JSON.stringify(f) !== initial.current;
+  const dirtyRef = useRef(false);
+  dirtyRef.current = dirty;
+
+  // «Закрыть без сохранения?» for Esc, the scrim, ×, «Отмена» and links elsewhere (P1-11)
+  const askDiscard = () =>
+    confirm({
+      title: "Закрыть без сохранения?",
+      message: "Изменения в этом поиске пропадут.",
+      confirmLabel: "Не сохранять",
+      cancelLabel: "Вернуться к поиску",
+      tone: "danger",
+    });
+  const requestClose = async () => {
+    if (dirtyRef.current && !(await askDiscard())) return;
+    initial.current = null;
+    onClose && onClose();
+  };
+  useEffect(() => {
+    if (!open) return undefined;
+    return addNavigationGuard((url) => {
+      if (!dirtyRef.current || url.pathname.startsWith("/searches")) return true;
+      askDiscard().then((ok) => {
+        if (!ok) return;
+        dirtyRef.current = false;
+        initial.current = null;
+        setTimeout(() => navigate(url.pathname + url.search + url.hash), 0);
+      });
+      return false;
+    });
+  }, [open]);
 
   const set = (patch) => {
     setF((prev) => {
@@ -117,19 +178,29 @@ export function SearchEditor({ open, search, kind: newKind, base = {}, categorie
     });
   };
 
+  const showErrors = (errs) => {
+    setErrors(errs);
+    // bring the first problem into view (the footer «Сохранить» stays where it is)
+    setTimeout(() => {
+      const el = bodyRef.current && bodyRef.current.querySelector(".has-error, .field__error");
+      if (el) el.scrollIntoView({ block: "center", behavior: "auto" });
+    }, 0);
+  };
+
   const save = async () => {
-    const payload = { ...f, name: (f.name || autoName(f, kind) || "").trim() };
+    // the name is optional: I make one up from what is being searched (P1-25)
+    const payload = { ...f, name: (f.name || autoName(f, kind) || "").trim() || (kind === "url" ? "Поиск по ссылке" : "Мой поиск") };
     if (!ownLimits) {
       payload.min_profit = null;
       payload.min_roi = null;
     }
-    const local = {};
-    if (!payload.name) local.name = "Придумай название";
+    const personal = kind === "wishlist" || f.purpose === "personal";
+    const local = validate(payload, kind, personal);
     if (kind === "url" && !payload.url) local.url = "Вставь ссылку со страницы поиска Kleinanzeigen";
-    if ((kind === "keyword" || kind === "wishlist" || kind === "ebay") && !payload.query) local.query = "Напиши, что искать";
+    if ((kind === "keyword" || kind === "wishlist" || kind === "ebay") && !(payload.query || "").trim()) local.query = "Напиши, что искать";
     if (kind === "category" && !payload.category_id) local.category_id = "Выбери категорию";
     if (Object.keys(local).length) {
-      setErrors(local);
+      showErrors(local);
       return;
     }
     setSaving(true);
@@ -138,12 +209,17 @@ export function SearchEditor({ open, search, kind: newKind, base = {}, categorie
       toast.success(editing ? "Поиск сохранён" : "Поиск сохранён · первая проверка — обучение", {
         message: editing ? "" : "Сначала изучу цены, уведомления придут со следующей проверки.",
       });
+      initial.current = null;
+      dirtyRef.current = false;
       onSaved && onSaved(res);
     } catch (e) {
-      const fields = e.data && e.data.error && e.data.error.fields;
-      if (fields && typeof fields === "object" && !Array.isArray(fields)) setErrors(fields);
-      else if (Array.isArray(fields)) setErrors(Object.fromEntries(fields.map((x) => [x.field, x.message_ru])));
-      toast.error(`Не получилось сохранить: ${e.message}`);
+      const fields = e.fields && Object.keys(e.fields).length ? e.fields : null;
+      if (fields) {
+        // 422: the reasons go next to the fields, not into a toast over the form (P0-7)
+        const byKey = {};
+        for (const [k, v] of Object.entries(fields)) byKey[k.split(".").pop()] = v;
+        showErrors(byKey);
+      } else toast.error(`Не получилось сохранить: ${e.message}`, { details: e.details });
     }
     setSaving(false);
   };
@@ -153,19 +229,22 @@ export function SearchEditor({ open, search, kind: newKind, base = {}, categorie
     ${editing &&
     html`<${Button} variant="danger-ghost" icon="trash-2" onClick=${() => onDelete && onDelete(search)} disabled=${readonly}>Удалить<//>`}
     <span class="grow"></span>
-    <${Button} variant="ghost" onClick=${onClose}>Отмена<//>
+    <${Button} variant="ghost" onClick=${requestClose}>Отмена<//>
     <${Button} variant="primary" icon="check" loading=${saving} onClick=${save} disabled=${readonly}>Сохранить<//>
   `;
+  const personalPrice = kind === "wishlist" || f.purpose === "personal";
   return html`<${Drawer}
     open=${open}
-    onClose=${onClose}
+    onClose=${requestClose}
     width=${520}
     class="search-drawer"
     title=${editing ? "Изменить поиск" : k.label}
     subtitle=${editing ? search.name : k.line}
     footer=${footer}
   >
-    <div class="sedit">
+    <div class="sedit" ref=${bodyRef}>
+      ${Object.keys(errors).filter((k) => k !== "general" && errors[k]).length > 0 &&
+      html`<${Banner} tone="danger" icon="circle-alert">Проверь отмеченные поля — ниже написано, что поправить.<//>`}
       ${readonly && html`<${Banner} tone="haggle">Не могу сохранить: нет доступа к файлу настроек.<//>`}
       <section class="sedit__sec">
         <h3 class="sedit__h"><span>1</span>Что</h3>
@@ -173,7 +252,7 @@ export function SearchEditor({ open, search, kind: newKind, base = {}, categorie
         ${kind === "category" && html`<${CategoryPicker} value=${f.category_id} categories=${categories} error=${errors.category_id || errors.query} onPick=${(c) => set({ category_id: c.id, category_name: c.name_de || c.label })} />`}
         ${(kind === "keyword" || kind === "wishlist" || kind === "ebay") &&
         html`<${Field} label=${kind === "wishlist" ? "Что ищешь" : "Слова для поиска"} error=${errors.query} help=${kind === "ebay" ? "Как в поиске eBay: rtx 3080, steam deck 512" : "Например: rtx 3080 или steam deck"}>
-          ${(id) => html`<${Input} id=${id} value=${f.query} onChange=${(v) => set({ query: v })} placeholder=${kind === "wishlist" ? "RTX 3090" : "steam deck"} icon="search" data-autofocus />`}
+          ${(id) => html`<${Input} id=${id} value=${f.query} onChange=${(v) => set({ query: v })} placeholder=${kind === "wishlist" ? "например, RTX 3090" : "например, steam deck"} icon="search" invalid=${Boolean(errors.query)} data-autofocus />`}
         <//>`}
         ${(kind === "category" || kind === "keyword") &&
         html`<${Field} label="Зачем">
@@ -187,8 +266,8 @@ export function SearchEditor({ open, search, kind: newKind, base = {}, categorie
             ]}
           />
         <//>`}
-        <${Field} label="Название" error=${errors.name} help="Как поиск будет подписан в ленте и уведомлениях">
-          ${(id) => html`<${Input} id=${id} value=${f.name} onChange=${(v) => (setNamed(true), set({ name: v }))} placeholder="Придумаю сам" />`}
+        <${Field} label="Название" optional error=${errors.name} help="Как поиск подписан в ленте и уведомлениях. Оставь пустым — придумаю сам.">
+          ${(id) => html`<${Input} id=${id} value=${f.name} onChange=${(v) => (setNamed(Boolean(v.trim())), set({ name: v }))} placeholder=${autoName(f, kind) || "Придумаю сам"} />`}
         <//>
       </section>
 
@@ -200,21 +279,21 @@ export function SearchEditor({ open, search, kind: newKind, base = {}, categorie
 
       <section class="sedit__sec">
         <h3 class="sedit__h"><span>${kind === "url" ? 2 : 3}</span>Цена</h3>
-        ${kind === "wishlist" || f.purpose === "personal"
+        ${personalPrice
           ? html`<div class="sedit__two">
               <${Field} label="Готов заплатить" error=${errors.target_price} help="Твоя цель">
-                ${(id) => html`<${NumberInput} id=${id} value=${f.target_price} onChange=${(v) => set({ target_price: num(v), max_price: v != null && (f.max_price == null || f.max_price < v) ? Math.round(v * 1.2) : f.max_price })} suffix="€" min=${0} />`}
+                ${(id) => html`<${NumberInput} id=${id} value=${f.target_price} onChange=${(v) => set({ target_price: num(v), max_price: v != null && v > 0 && (f.max_price == null || f.max_price < v) ? Math.round(v * 1.2) : f.max_price })} suffix="€" min=${0} max=${MAX_EUR} invalid=${Boolean(errors.target_price)} />`}
               <//>
               <${Field} label="Показывать до" error=${errors.max_price} help="Чуть дороже — для торга">
-                ${(id) => html`<${NumberInput} id=${id} value=${f.max_price} onChange=${(v) => set({ max_price: num(v) })} suffix="€" min=${0} />`}
+                ${(id) => html`<${NumberInput} id=${id} value=${f.max_price} onChange=${(v) => set({ max_price: num(v) })} suffix="€" min=${0} max=${MAX_EUR} invalid=${Boolean(errors.max_price)} />`}
               <//>
             </div>`
           : html`<div class="sedit__two">
               <${Field} label="Цена от" error=${errors.min_price}>
-                ${(id) => html`<${NumberInput} id=${id} value=${f.min_price} onChange=${(v) => set({ min_price: num(v) })} suffix="€" min=${0} />`}
+                ${(id) => html`<${NumberInput} id=${id} value=${f.min_price} onChange=${(v) => set({ min_price: num(v) })} suffix="€" min=${0} max=${MAX_EUR} invalid=${Boolean(errors.min_price)} />`}
               <//>
               <${Field} label="Цена до" error=${errors.max_price} help="Сколько готов вложить в одну вещь">
-                ${(id) => html`<${NumberInput} id=${id} value=${f.max_price} onChange=${(v) => set({ max_price: num(v) })} suffix="€" min=${0} />`}
+                ${(id) => html`<${NumberInput} id=${id} value=${f.max_price} onChange=${(v) => set({ max_price: num(v) })} suffix="€" min=${0} max=${MAX_EUR} invalid=${Boolean(errors.max_price)} />`}
               <//>
             </div>`}
       </section>
@@ -243,10 +322,10 @@ export function SearchEditor({ open, search, kind: newKind, base = {}, categorie
         ${ownLimits &&
         html`<div class="sedit__two">
           <${Field} label="Мин. прибыль" error=${errors.min_profit}>
-            ${(id) => html`<${NumberInput} id=${id} value=${f.min_profit} onChange=${(v) => set({ min_profit: num(v) })} suffix="€" min=${0} />`}
+            ${(id) => html`<${NumberInput} id=${id} value=${f.min_profit} onChange=${(v) => set({ min_profit: num(v) })} suffix="€" min=${0} max=${MAX_EUR} invalid=${Boolean(errors.min_profit)} />`}
           <//>
           <${Field} label="Мин. ROI" error=${errors.min_roi} help="25 % = заработать четверть вложенного">
-            ${(id) => html`<${NumberInput} id=${id} value=${f.min_roi != null ? Math.round(f.min_roi * 100) : null} onChange=${(v) => set({ min_roi: v == null ? null : v / 100 })} suffix="%" min=${0} />`}
+            ${(id) => html`<${NumberInput} id=${id} value=${f.min_roi != null ? Math.round(f.min_roi * 100) : null} onChange=${(v) => set({ min_roi: v == null ? null : v / 100 })} suffix="%" min=${0} max=${1000} invalid=${Boolean(errors.min_roi)} />`}
           <//>
         </div>`}
       </section>`}
@@ -259,8 +338,15 @@ function UrlField({ f, set, error, setNamed }) {
   const [parsed, setParsed] = useState(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
-  const parse = async (url) => {
-    if (!url || !/kleinanzeigen\.de/i.test(url)) return;
+  const parse = async (raw) => {
+    const url = String(raw || "").trim();
+    if (!url) return;
+    if (!/^https?:\/\//i.test(url) || !/kleinanzeigen\.de/i.test(url)) {
+      // say why nothing happened (P1-12)
+      setParsed(null);
+      setErr(/ebay\./i.test(url) ? "Это ссылка eBay — для eBay выбери «Новый поиск → eBay»" : "Это не ссылка Kleinanzeigen — открой поиск на kleinanzeigen.de и скопируй адрес из строки браузера");
+      return;
+    }
     setBusy(true);
     setErr(null);
     try {
@@ -280,7 +366,7 @@ function UrlField({ f, set, error, setNamed }) {
       setNamed(false);
     } catch (e) {
       setParsed(null);
-      setErr((e.data && e.data.error && e.data.error.fields && e.data.error.fields.url) || e.message);
+      setErr(e.field("url") || e.message || "Не получилось разобрать ссылку — проверь, что это страница поиска");
     }
     setBusy(false);
   };
@@ -296,7 +382,7 @@ function UrlField({ f, set, error, setNamed }) {
         icon="link"
         placeholder="https://www.kleinanzeigen.de/s-berlin/…"
         inputmode="url"
-        onChange=${(v) => set({ url: v })}
+        onChange=${(v) => (setErr(null), set({ url: v }))}
         onBlur=${() => parse(f.url)}
         onPaste=${(e) => {
           const t = (e.clipboardData || window.clipboardData).getData("text");
@@ -371,7 +457,7 @@ function WhereFields({ f, set, errors, ebay }) {
           value=${f.radius_km ?? 0}
           steps=${RADII}
           onChange=${(v) => set({ radius_km: v || null })}
-          format=${(v, short) => (short ? `${v}` : v ? `${v} км` : "город")}
+          format=${(v, short) => (short ? (v ? `${v}` : "город") : v ? `${v} км` : "только город")}
           label="Радиус"
           bubble="none"
         />

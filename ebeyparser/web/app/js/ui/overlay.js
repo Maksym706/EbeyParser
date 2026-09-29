@@ -58,30 +58,50 @@ function lockScroll(on) {
 
 const FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
 
-/** Focus trap + Escape + scroll lock + focus restore for a dialog element. */
-function useDialog(ref, open, onClose) {
+/**
+ * Focus trap + Escape + scroll lock + focus restore for a dialog element.
+ * The element mounts a frame after `open` flips (usePresence + Portal), so it is looked up lazily.
+ * `restoreFocus(prev)` may return an element to focus on close (e.g. the card that opened a drawer).
+ */
+function useDialog(ref, open, onClose, restoreFocus, modal = true) {
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
+  const restoreRef = useRef(restoreFocus);
+  restoreRef.current = restoreFocus;
   useEffect(() => {
     if (!open) return undefined;
     const prev = document.activeElement;
-    lockScroll(true);
-    const el = ref.current;
-    const t = setTimeout(() => {
-      if (!el) return;
+    if (modal) lockScroll(true);
+    let tries = 0;
+    let t = null;
+    const focusIn = () => {
+      const el = ref.current;
+      if (!el) {
+        if (tries++ < 20) t = setTimeout(focusIn, 25);
+        return;
+      }
+      if (el.contains(document.activeElement)) return;
       const auto = el.querySelector("[autofocus],[data-autofocus]");
       (auto || el).focus({ preventScroll: true });
-    }, 30);
+    };
+    t = setTimeout(focusIn, 30);
     const onKey = (e) => {
+      const el = ref.current;
+      // only the top-most dialog reacts (a confirm() above a drawer)
+      const all = document.querySelectorAll(".overlay:not(.is-leaving) [role=dialog]");
+      if (el && all.length && all[all.length - 1] !== el) return;
       if (e.key === "Escape") {
         e.stopPropagation();
         onCloseRef.current && onCloseRef.current();
-      } else if (e.key === "Tab" && el) {
+      } else if (e.key === "Tab" && el && modal) {
         const items = [...el.querySelectorAll(FOCUSABLE)].filter((n) => n.offsetParent !== null);
         if (!items.length) return;
         const first = items[0];
         const last = items[items.length - 1];
-        if (e.shiftKey && document.activeElement === first) {
+        if (!el.contains(document.activeElement)) {
+          e.preventDefault();
+          (e.shiftKey ? last : first).focus();
+        } else if (e.shiftKey && (document.activeElement === first || document.activeElement === el)) {
           e.preventDefault();
           last.focus();
         } else if (!e.shiftKey && document.activeElement === last) {
@@ -93,11 +113,12 @@ function useDialog(ref, open, onClose) {
     document.addEventListener("keydown", onKey, true);
     return () => {
       clearTimeout(t);
-      lockScroll(false);
+      if (modal) lockScroll(false);
       document.removeEventListener("keydown", onKey, true);
-      if (prev && prev.focus) prev.focus({ preventScroll: true });
+      const target = (restoreRef.current && restoreRef.current(prev)) || prev;
+      if (target && target.focus && target !== document.body) target.focus({ preventScroll: true });
     };
-  }, [open]);
+  }, [open, modal]);
 }
 
 /** Centered dialog. size: sm | md | lg. On phones it becomes a bottom sheet. */
@@ -126,12 +147,13 @@ export function Modal({ open, onClose, title, subtitle, icon, size = "md", foote
 }
 
 /** Side drawer (desktop) / bottom sheet (phone). width in px for desktop. */
-export function Drawer({ open, onClose, title, subtitle, header, footer, width = 520, class: cls = "", children }) {
+export function Drawer({ open, onClose, title, subtitle, header, footer, width = 520, class: cls = "", restoreFocus, modal = true, children }) {
   const { mounted, leaving } = usePresence(open, 240);
   const ref = useRef(null);
   const [drag, setDrag] = useState(0);
   const start = useRef(null);
-  useDialog(ref, open, onClose);
+  // modal=false: a side panel next to the page (wide screens) — no scrim, the page stays usable
+  useDialog(ref, open, onClose, restoreFocus, modal);
   if (!mounted) return null;
   const onPointerDown = (e) => {
     start.current = e.clientY;
@@ -147,11 +169,11 @@ export function Drawer({ open, onClose, title, subtitle, header, footer, width =
     setDrag(0);
   };
   return html`<${Portal}>
-    <div class=${cx("overlay overlay--drawer", leaving && "is-leaving")} onPointerDown=${(e) => e.target === e.currentTarget && onClose && onClose()}>
+    <div class=${cx("overlay overlay--drawer", !modal && "overlay--panel", leaving && "is-leaving")} onPointerDown=${(e) => modal && e.target === e.currentTarget && onClose && onClose()}>
       <aside
         class=${cx("drawer", cls, drag > 0 && "is-dragging")}
         role="dialog"
-        aria-modal="true"
+        aria-modal=${modal ? "true" : "false"}
         aria-label=${title}
         tabindex="-1"
         ref=${ref}

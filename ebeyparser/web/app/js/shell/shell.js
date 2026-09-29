@@ -52,7 +52,7 @@ function Sidebar({ nav, collapsed, onToggle }) {
     </div>
     <nav class="sidebar__nav">
       ${NAV.map(
-        (item) => html`<a key=${item.id} href=${item.href} class=${cx("side-link", nav === item.id && "is-active")} aria-current=${nav === item.id ? "page" : undefined} title=${item.label}>
+        (item) => html`<a key=${item.id} href=${item.href} class=${cx("side-link", nav === item.id && "is-active")} aria-current=${nav === item.id ? "page" : undefined} data-tip=${collapsed ? item.label : undefined} aria-label=${item.label}>
           <span class="side-link__icon"><${Icon} name=${item.icon} size=${20} /><${NavBadge} value=${badges[item.id]} /></span>
           <span class="side-link__label">${item.label}</span>
         </a>`,
@@ -113,17 +113,17 @@ function TopBar({ title, onCheck, phone }) {
     ${slot.search && html`<${TopSearch} search=${slot.search} />`}
     <div class="topbar__spacer"></div>
     ${slot.actions && html`<div class="topbar__actions">${slot.actions}</div>`}
-    <${Button} variant="secondary" icon="scan-search" class="topbar__check" onClick=${() => onCheck("")} title="Вставь ссылку на объявление — посчитаю выгоду (Ctrl+K)">
+    <${Button} variant="secondary" icon="scan-search" class="topbar__check" onClick=${() => onCheck("")} aria-label="Проверить объявление" title="Вставь ссылку на объявление — посчитаю выгоду (Ctrl+K)">
       <span class="hide-md">Проверить объявление</span>
     <//>
-    <${Tooltip} text=${newDeals ? `Новых находок: ${newDeals}` : "Новых находок нет"} placement="bottom-end">
+    <${Tooltip} text=${newDeals ? `Новых находок: ${newDeals} — показать` : "Показать находки, которые ещё не смотрел"} placement="bottom-end">
       <${IconButton}
         icon="bell"
-        label="Новые находки"
+        label="Непросмотренные находки"
         badge=${newDeals}
         onClick=${() => {
           appStore.set({ newDeals: 0 });
-          navigate("/");
+          navigate("/?unseen=1");
         }}
       />
     <//>
@@ -153,7 +153,7 @@ export function OfflineBanner() {
 }
 
 /** Page frame around a routed screen. */
-export function Shell({ nav, title, children }) {
+export function Shell({ nav, title, focus = false, children }) {
   const phone = useMediaQuery("(max-width: 599px)");
   const rail = useMediaQuery("(min-width: 600px) and (max-width: 1023px)");
   const [collapsedPref, setCollapsed] = useLocalState("ebp-sidebar-collapsed", false);
@@ -187,14 +187,16 @@ export function Shell({ nav, title, children }) {
       document.removeEventListener("paste", onPaste);
     };
   }, []);
-  return html`<div class=${cx("shell", collapsed && "shell--rail", phone && "shell--phone")}>
+  // phone + focus route (the deal page): the screen brings its own bars (brief §3.1, P1-14)
+  const bare = phone && focus;
+  return html`<div class=${cx("shell", collapsed && "shell--rail", phone && "shell--phone", bare && "shell--focus")}>
     ${!phone && html`<${Sidebar} nav=${nav} collapsed=${collapsed} onToggle=${() => setCollapsed(!collapsedPref)} />`}
     <div class="shell__main">
       <${OfflineBanner} />
-      <${TopBar} title=${title} onCheck=${openCheck} phone=${phone} />
+      ${!bare && html`<${TopBar} title=${title} onCheck=${openCheck} phone=${phone} />`}
       <main class="content" id="main">${children}</main>
     </div>
-    ${phone && html`<${TabBar} nav=${nav} />`}
+    ${phone && !bare && html`<${TabBar} nav=${nav} />`}
     <${CheckLinkModal} open=${check.open} initialUrl=${check.url} onClose=${() => setCheck({ open: false, url: "" })} />
   </div>`;
 }

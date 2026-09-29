@@ -5,7 +5,8 @@ import { loadApp, isOnboarded } from "./lib/app.js";
 import { appStore, useStore } from "./lib/store.js";
 import { useRoute, matchPath, navigate } from "./lib/router.js";
 import { connectEvents, onEvent } from "./lib/events.js";
-import { money } from "./lib/format.js";
+import { money, localizeText } from "./lib/format.js";
+import { humanize } from "./lib/api.js";
 import { useInterval } from "./lib/hooks.js";
 import { routes, redirects } from "./routes.js";
 import { Shell, Logo, OfflineBanner } from "./shell/shell.js";
@@ -129,7 +130,9 @@ function App() {
       onEvent("searches_changed", () => loadApp().catch(() => {})),
       onEvent("health_alert", (a) => {
         appStore.set({ badges: { ...(appStore.get().badges || {}), health: "dot-red" } });
-        if (a && a.text) toast.warning(a.text, { action: { label: "Состояние", href: "/health" } });
+        // the toast has its own warning icon: drop a leading ⚠ from the text; times in Berlin
+        const text = a && a.text ? humanize(localizeText(String(a.text).replace(/^[\s⚠️❗‼️🚫⛔]+/u, ""))) : null;
+        if (text && text.message) toast.warning(text.message, { details: text.details, action: { label: "Состояние", href: "/health" } });
       }),
       onEvent("connected", () => refreshMonitor()),
     ];
@@ -180,7 +183,7 @@ function App() {
 
   const chrome = found && found.route.fullscreen
     ? html`<div class="fullscreen"><${OfflineBanner} />${body}</div>`
-    : html`<${Shell} nav=${found && found.route.nav} title=${title}>${body}<//>`;
+    : html`<${Shell} nav=${found && found.route.nav} title=${title} focus=${Boolean(found && found.route.focus)}>${body}<//>`;
 
   return html`${chrome}<${Toaster} /><${DialogHost} />`;
 }

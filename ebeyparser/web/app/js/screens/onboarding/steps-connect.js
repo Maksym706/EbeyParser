@@ -26,14 +26,20 @@ export function AiStep({ draft }) {
     html`<${TestResult} state="ok" title=${`Нейросеть подключена${draft.ai.model ? ` · ${draft.ai.model}` : ""}`} detail="Можно проверить ещё раз или сменить модель ниже." />`}
     <${AiConnect}
       save=${true}
-      onDone=${(r) => updateDraft({ ai: { ...draft.ai, done: true, skipped: false, model: r.resolved_model || r.model, seconds: r.seconds } })}
+      onDone=${(r) => updateDraft((d) => ({ ai: { ...d.ai, done: true, skipped: false, model: r.resolved_model || r.model, seconds: r.seconds } }))}
+      onChoice=${(found) =>
+        updateDraft((d) => (JSON.stringify(d.ai.found || null) === JSON.stringify(found || null) ? {} : { ai: { ...d.ai, found } }))}
     />
   </div>`;
 }
 
 export function TelegramStep({ draft }) {
   const secrets = useSecrets();
-  const [mode, setMode] = useState(draft.email && draft.email.done && !draft.telegram.linked ? "email" : "telegram");
+  const [mode, setModeState] = useState(draft.notify_channel === "email" || (draft.email && draft.email.done && !draft.telegram.linked) ? "email" : "telegram");
+  const setMode = (m) => {
+    setModeState(m);
+    updateDraft({ notify_channel: m });
+  };
   if (!secrets) return html`<div class="ai-card ai-card--loading"><span class="spinner" style=${{ width: 18, height: 18 }}></span></div>`;
   const tg = draft.telegram;
   return html`<div class="stack" style=${{ "--gap": "16px" }}>

@@ -1,8 +1,11 @@
 """One error shape for the whole /api/v1: {"error": {"code": "...", "message_ru": "..."}}.
 
 `code` is a stable machine word (the UI switches on it), `message_ru` can be shown to the
-user as is; validation errors also carry `fields`: {"general.interval_minutes": "message"}
-(dotted field path -> Russian message, for inline errors next to the inputs).
+user as is (plain Russian with a next step: never a CLI command, a config file name or an
+exception class); validation errors also carry `fields`: {"general.interval_minutes": "message"}
+(dotted field path -> Russian message, for inline errors next to the inputs). Optional:
+`details` (the technical text, shown collapsed under «Подробнее») and `action`
+({"label_ru", "href"}: a button to the screen that fixes it).
 """
 
 from __future__ import annotations
@@ -42,7 +45,7 @@ STATUS_MESSAGES_RU: dict[int, str] = {
     403: "Доступ запрещён",
     404: "Нет такого адреса API",
     405: "Этот метод здесь не поддерживается",
-    500: "Внутренняя ошибка сервера — подробности в логе",
+    500: "Что-то пошло не так внутри программы — попробуй ещё раз. Подробности — в «Состояние» → «Журнал»",
 }
 
 FIELD_LABELS_RU: dict[str, str] = {
@@ -62,7 +65,45 @@ FIELD_LABELS_RU: dict[str, str] = {
     "sold_price": "Цена продажи",
     "model": "Модель",
     "base_url": "Адрес сервера",
-    "provider": "Сервер нейросети",
+    "target_price": "Готов заплатить",
+    "extra_costs": "Доп. расходы",
+    "to_addrs": "Куда слать",
+    "from_addr": "Отправитель",
+    "username": "Адрес почты",
+    "password": "Пароль приложения",
+    "smtp_host": "Почтовый сервер",
+    "smtp_port": "Порт",
+    "token": "Ключ бота",
+    "chat_id": "Чат",
+    "client_id": "App ID",
+    "client_secret": "Cert ID",
+    "host": "Адрес",
+    "confirm": "Подтверждение",
+    "category_ids": "Категории",
+    "wishlist": "Желания",
+    "safety_margin_percent": "Запас на торг и риск",
+    "min_comparables": "Минимум аналогов",
+    "notify_min_score": "Минимальный балл",
+    "selling_fee_percent": "Комиссия площадки",
+    "payment_fee_percent": "Комиссия оплаты",
+    "default_shipping_cost": "Твоя доставка",
+    "max_capital": "Бюджет",
+    "min_score": "Минимальный балл",
+    "timezone": "Часовой пояс",
+}
+# full dotted path -> label (wins over the last part: "provider" is the AI's only under ai.*)
+FIELD_PATH_LABELS_RU: dict[str, str] = {
+    "ai.provider": "Сервер нейросети",
+    "ai.base_url": "Адрес сервера нейросети",
+    "ai.model": "Модель",
+    "general.interval_minutes": "Как часто проверять",
+    "general.timezone": "Часовой пояс",
+    "general.min_listing_price": "Не смотреть дешевле",
+    "pricing.min_profit": "Минимальная прибыль",
+    "pricing.min_roi": "Минимальный ROI",
+    "pricing.safety_margin_percent": "Запас на торг и риск",
+    "notifications.min_score": "Минимальный балл",
+    "notifications.max_alerts_per_hour": "Не больше в час",
 }
 
 
@@ -70,25 +111,47 @@ class ApiError(Exception):
     """Raise anywhere in /api/v1 handlers: becomes {"error": {...}} with `status`."""
 
     def __init__(self, status: int, code: str, message_ru: str, *, fields: dict[str, str] | None = None,
-                 headers: dict[str, str] | None = None) -> None:
+                 headers: dict[str, str] | None = None, details: str | None = None,
+                 action: dict[str, str] | None = None) -> None:
         super().__init__(message_ru)
         self.status = status
         self.code = code
         self.message_ru = message_ru
         self.fields = fields
         self.headers = headers
+        self.details = details or None
+        self.action = action or None
 
 
-def error_body(code: str, message_ru: str, fields: dict[str, str] | None = None) -> dict[str, Any]:
+def error_body(code: str, message_ru: str, fields: dict[str, str] | None = None, *, details: str | None = None,
+               action: dict[str, str] | None = None) -> dict[str, Any]:
     error: dict[str, Any] = {"code": code, "message_ru": message_ru}
     if fields:
         error["fields"] = fields
+    if details:
+        error["details"] = details
+    if action:
+        error["action"] = action
     return {"error": error}
 
 
 def error_response(status: int, code: str, message_ru: str, *, fields: dict[str, str] | None = None,
-                   headers: dict[str, str] | None = None) -> JSONResponse:
-    return JSONResponse(error_body(code, message_ru, fields), status_code=status, headers=headers)
+                   headers: dict[str, str] | None = None, details: str | None = None,
+                   action: dict[str, str] | None = None) -> JSONResponse:
+    return JSONResponse(error_body(code, message_ru, fields, details=details, action=action), status_code=status,
+                        headers=headers)
+
+
+def from_exception(exc: BaseException, service: str = "", *, status: int = 502, host: str = "",
+                   code: str | None = None) -> ApiError:
+    """Any failure of an outside service -> ApiError with a friendly message_ru and the
+    technical text in `details` (ebeyparser.errors_ru is the one humanizer)."""
+    from ...errors_ru import humanize
+
+    if isinstance(exc, ApiError):
+        return exc
+    human = humanize(exc, service, host=host)
+    return ApiError(status, code or human.code, human.message_ru, details=human.details, action=human.action)
 
 
 def not_found(message_ru: str) -> ApiError:
@@ -153,6 +216,10 @@ def _message_ru(err: dict[str, Any]) -> str:
         bound = next(iter(ctx.values()), None)
         sign = {"greater_than_equal": "не меньше", "less_than_equal": "не больше",
                 "greater_than": "больше", "less_than": "меньше"}[kind]
+        if kind == "greater_than_equal" and bound in (0, 0.0):
+            return "не может быть меньше нуля"
+        if kind == "greater_than" and bound in (0, 0.0):
+            return "должно быть больше нуля"
         return f"{sign} {bound}" if bound is not None else text
     if text:
         return text
@@ -174,9 +241,17 @@ def validation_error(exc: ValidationError | list[Any] | dict[str, str], message_
     return ApiError(422, "validation", text, fields=fields)
 
 
+def field_label(field: str) -> str:
+    return FIELD_PATH_LABELS_RU.get(field) or FIELD_LABELS_RU.get(field.rsplit(".", 1)[-1], "")
+
+
 def _labelled(field: str, message: str) -> str:
-    label = FIELD_LABELS_RU.get(field.rsplit(".", 1)[-1], "")
-    return f"«{label}» — {message}" if label else (f"{field}: {message}" if field and field != "_" else message)
+    """«Цена от» — больше, чем «Цена до»; a field without a label shows only the message
+    (never a raw dotted key); a message that already names the field is kept as is."""
+    label = field_label(field)
+    if not label or f"«{label}»" in message:
+        return message
+    return f"«{label}» — {message}"
 
 
 def install_error_handlers(app: FastAPI) -> None:
@@ -185,7 +260,8 @@ def install_error_handlers(app: FastAPI) -> None:
 
     async def api_error(request: Request, exc: Exception) -> Response:
         assert isinstance(exc, ApiError)
-        return error_response(exc.status, exc.code, exc.message_ru, fields=exc.fields, headers=exc.headers)
+        return error_response(exc.status, exc.code, exc.message_ru, fields=exc.fields, headers=exc.headers,
+                              details=exc.details, action=exc.action)
 
     previous_http: Callable[[Request, Exception], Awaitable[Response]] | None = \
         app.exception_handlers.get(StarletteHTTPException)  # type: ignore[assignment]
@@ -219,7 +295,7 @@ def install_error_handlers(app: FastAPI) -> None:
     async def crash(request: Request, exc: Exception) -> Response:
         if is_api_v1(request):
             log.error("API %s %s failed: %s", request.method, request.url.path, exc)
-            return error_response(500, "internal", STATUS_MESSAGES_RU[500])
+            return error_response(500, "internal", STATUS_MESSAGES_RU[500])  # the traceback is in the log
         if previous_crash is not None:
             return await previous_crash(request, exc)  # type: ignore[misc]
         return PlainTextResponse("Internal Server Error", status_code=500)
@@ -237,6 +313,8 @@ __all__ = [
     "error_body",
     "error_response",
     "field_errors",
+    "field_label",
+    "from_exception",
     "install_error_handlers",
     "is_api_v1",
     "not_found",

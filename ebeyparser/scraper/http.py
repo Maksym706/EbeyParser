@@ -107,6 +107,10 @@ _CONTENT_MARKERS = (
     "s-card__",
 )
 _SMALL_PAGE = 30_000
+# a 403 from a proxy / firewall / sandbox between us and the site (not the site's bot protection):
+# a network problem, never a block strike
+_PROXY_DENIED_MARKERS = ("not in allowlist", "egress settings", "network egress", "blocked by your network",
+                         "proxy authentication required")
 
 Kind = Literal["document", "image"]
 
@@ -166,6 +170,19 @@ def looks_blocked(html: str) -> bool:
     return len(low) < _SMALL_PAGE and any(m in low for m in _WEAK_BLOCK_MARKERS)
 
 
+def proxy_denied(response: httpx.Response) -> bool:
+    """Did a proxy / firewall answer instead of the site ("403 Host not in allowlist")?"""
+    if response.status_code not in (403, 407):
+        return False
+    if response.status_code == 407 or "proxy-authenticate" in response.headers:
+        return True
+    try:
+        head = response.text[:2000].lower()
+    except Exception:  # noqa: BLE001 - undecodable body
+        return False
+    return any(m in head for m in _PROXY_DENIED_MARKERS)
+
+
 def _blocked_url(url: httpx.URL) -> bool:
     """Redirected to a captcha endpoint (eBay: /splashui/captcha, DataDome, ...)."""
     return "captcha" in url.path.lower() or "captcha" in (url.host or "").lower()
@@ -201,8 +218,13 @@ def format_duration(seconds: float) -> str:
 
 
 def _local_time(ts: float, now: float) -> str:
-    """Wall-clock time in the user's time zone: '14:05' today, '29.09 03:10' otherwise."""
-    when, today = datetime.fromtimestamp(ts), datetime.fromtimestamp(now)
+    """Wall-clock time in the user's time zone (general.timezone, not the host's):
+    '14:05' today, '29.09 03:10' otherwise."""
+    from ..timefmt import local_tz
+
+    zone = local_tz()
+    when = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(zone)
+    today = datetime.fromtimestamp(now, tz=timezone.utc).astimezone(zone)
     return f"{when:%H:%M}" if when.date() == today.date() else f"{when:%d.%m %H:%M}"
 
 
@@ -254,6 +276,9 @@ class PoliteClient:
         steps = DEFAULT_COOLDOWN_HOURS if cooldown_hours is None else cooldown_hours
         self.cooldown_hours: tuple[float, ...] = tuple(max(0.0, float(h)) for h in steps)
         self.state_path = Path(state_path) if state_path else None
+        # optional checks (the onboarding's live category list): a bare 403 without a block page
+        # is ambiguous -> an error for that check only, no cooldown for the whole app
+        self.soft_403 = False
         self._clock = clock
         self._locks: dict[str, asyncio.Lock] = {}
         self._last_request: dict[str, float] = {}  # host -> monotonic time of last response
@@ -635,6 +660,15 @@ class PoliteClient:
                     self._last_request[host] = time.monotonic()
                     self._count(host, kind, len(response.history))  # followed redirects are requests too
                     status = response.status_code
+                    if status in (403, 407) and proxy_denied(response):
+                        raise httpx.ProxyError(
+                            f"{host}: доступ закрыт сетью или прокси (HTTP {status}): "
+                            f"{' '.join(response.text[:160].split())}", request=response.request)
+                    if status == 403 and self.soft_403 and kind == "document" and not (
+                            looks_blocked(response.text) or _blocked_url(response.url)):
+                        log.info("GET %s -> HTTP 403 without a block page: not counted as a block", url)
+                        raise httpx.HTTPStatusError(f"HTTP 403 от {host} без страницы блокировки",
+                                                    request=response.request, response=response)
                     if status == 403:
                         raise self._blocked(host, kind, "HTTP 403", url=url, status_code=status)
                     if status == 429 or status >= 500:

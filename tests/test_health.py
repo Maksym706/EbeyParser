@@ -6,15 +6,13 @@ import json
 import sqlite3
 from datetime import timedelta
 
-import httpx
-import pytest
 
 from ebeyparser.config import parse_config
 from ebeyparser.db import Database
 from ebeyparser.models import AIVerdict, Comparable, Evaluation, PriceEstimate, utcnow
 from ebeyparser.monitor import Monitor
 from ebeyparser.notify.emailer import EmailNotifier
-from ebeyparser.pricing.estimator import estimate_from_history, history_key_for
+from ebeyparser.pricing.estimator import estimate_from_history
 from ebeyparser.scraper.http import BlockedError
 from ebeyparser.scraper.kleinanzeigen import KleinanzeigenScraper, PageLayoutError
 
@@ -87,7 +85,8 @@ async def test_email_send_text_uses_the_first_line_as_subject() -> None:
 async def test_ai_down_is_reported_once_per_six_hours_and_deals_still_arrive_marked() -> None:
     monitor, db, source, (email,) = build([make_listing("1", "RTX 3080", 300.0)], verdict=DOWN)
     first = await monitor.run_once()
-    assert any("Нейросеть недоступна" in t for t in email.texts) and first.health_alerts == 1
+    # the default provider is Ollama: its own hint (LM Studio users get "Developer → Start Server")
+    assert any("Нейросеть не отвечает" in t and "Ollama" in t for t in email.texts) and first.health_alerts == 1
     assert email.sent == [(["1"], None)]  # the would-be buy went out (renderer marks it unchecked)
     ev = db.get_evaluation("1")
     assert ev.verdict == "maybe" and ev.would_buy and ev.ai_checked is False
@@ -111,7 +110,11 @@ async def test_site_block_is_reported_with_the_pause_end() -> None:
 
     source.search = blocked
     await monitor.run_once()
-    assert len(email.texts) == 1 and email.texts[0].startswith("⚠ Kleinanzeigen ограничил запросы, пауза до ")
+    assert len(email.texts) == 1 and email.texts[0].startswith("⚠ Kleinanzeigen попросил паузу — продолжу сам ")
+    # the time is the user's (Europe/Berlin), not the host's
+    from ebeyparser.timefmt import hhmm
+
+    assert hhmm(utcnow() + timedelta(hours=2)) in email.texts[0]
 
 
 async def test_empty_search_two_passes_in_a_row_is_reported() -> None:
@@ -134,7 +137,8 @@ async def test_unreadable_search_page_two_passes_in_a_row_is_reported() -> None:
     source.search = layout
     await monitor.run_once()
     await monitor.run_once()
-    assert len(email.texts) == 1 and "не распознаётся" in email.texts[0]
+    assert len(email.texts) == 1 and "не получается разобрать" in email.texts[0]
+    assert "python -m" not in email.texts[0] and "debug-search" not in email.texts[0]
 
 
 async def test_heartbeat_once_a_day() -> None:
@@ -155,7 +159,7 @@ async def test_a_failed_channel_is_reported_elsewhere_and_retried() -> None:
     await monitor.run_once()
     assert telegram.sent == [(["1"], None)] and db.was_notified("1", "telegram")
     assert not db.was_notified("1", "email")
-    assert any("через email" in t for t in telegram.texts)
+    assert any("через почту" in t for t in telegram.texts)
     email.fail = False
     source.listings = []
     summary = await monitor.run_once()
@@ -327,7 +331,7 @@ def test_price_points_get_first_and_last_seen_with_migration(tmp_path) -> None:
     db.add_price_points("rtx|3080", [Comparable(title="RTX 3080", price=380, url="u")])
     listing = make_listing("1", "RTX 3080", 390.0)
     db.record_price_points([("rtx|3080", listing)])  # seen again: first_seen stays
-    spans = {c.price: (f, l) for c, f, l in db.price_history_spans("rtx|3080")}
+    spans = {c.price: (first, last) for c, first, last in db.price_history_spans("rtx|3080")}
     assert spans[390.0][0].isoformat() == "2026-09-01T10:00:00+00:00" and spans[390.0][1] > spans[390.0][0]
 
 

@@ -3,7 +3,7 @@
 import { html, cx, useEffect, useState, useRef, createContext, useContext } from "../../lib/html.js";
 import { api } from "../../lib/api.js";
 import { addNavigationGuard, navigate } from "../../lib/router.js";
-import { Button, Spinner, Icon, confirm, toast } from "../../ui/index.js";
+import { Button, Spinner, Icon, confirm, toast, showFieldErrors } from "../../ui/index.js";
 
 export const SECTIONS_EDITABLE = ["region", "general", "pricing", "ai", "notifications", "ebay", "web"];
 
@@ -70,6 +70,12 @@ export function useSettingsForm() {
 
   const save = async () => {
     if (!patch) return true;
+    // never save (or silently clamp) an impossible number: point at the field instead (P1-9)
+    const body = document.querySelector(".settings-body");
+    if (body && showFieldErrors(body)) {
+      setStatus({ state: "error", error: { message: "исправь поле, отмеченное красным" } });
+      return false;
+    }
     setStatus({ state: "saving", error: null });
     try {
       const res = await api.patch("/settings", patch);

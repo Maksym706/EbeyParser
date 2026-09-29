@@ -166,6 +166,18 @@ export function StatusDot({ tone = "neutral", pulse = false }) {
   return html`<span class=${cx("status-dot", `status-dot--${hue(tone)}`, pulse && "is-pulsing")} aria-hidden="true"></span>`;
 }
 
+/**
+ * Collapsed «Подробнее» with the technical text of an error (brief §2.2: never shown by default).
+ *   <Details text={error.details} />
+ */
+export function Details({ text, label = "Подробнее", class: cls = "" }) {
+  if (!text) return null;
+  return html`<details class=${cx("tech-details", cls)}>
+    <summary><${Icon} name="chevron-right" size=${14} class="tech-details__chev" />${label}</summary>
+    <pre class="tech-details__text">${text}</pre>
+  </details>`;
+}
+
 /** External link that opens in a new tab with an arrow icon. */
 export function ExternalLink({ href, children, class: cls = "" }) {
   return html`<a class=${cx("ext-link", cls)} href=${href} target="_blank" rel="noopener noreferrer"

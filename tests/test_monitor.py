@@ -34,7 +34,7 @@ class FakeSource:
         self.seen_given.append(seen is not None)
         if self.block_search:
             raise BlockedError("captcha")
-        return [l.model_copy(update={"search_name": search.name}) for l in self.listings]
+        return [item.model_copy(update={"search_name": search.name}) for item in self.listings]
 
     async def fetch_detail(self, listing: Listing) -> Listing:
         self.detail_calls.append(listing.ad_id)
@@ -178,7 +178,8 @@ async def test_notifier_failure_is_reported_not_marked():
                               verdict=GOOD_AI, notifier=notifier)
     summary = await monitor.run_once()
     assert summary.notified == 0
-    assert any("smtp down" in e for e in summary.errors)
+    assert any("Уведомление через" in e for e in summary.errors)
+    assert any("smtp down" in d for d in summary.error_details)
     assert not db.was_notified("3001")
 
 
@@ -228,7 +229,9 @@ async def test_ebay_search_requires_credentials():
     cfg = config(searches=[{"name": "eBay", "source": "ebay", "query": "rtx 3080"}])
     monitor, db, _, _ = build(cfg, [])
     summary = await monitor.run_once()
-    assert any("client_id" in e for e in summary.errors)
+    assert any("eBay не подключён" in e for e in summary.errors)
+    assert not any("client_id" in e or "config.yaml" in e for e in summary.errors)
+    assert any("client_id" in d for d in summary.error_details)  # the technical text stays for «Подробнее»
 
 
 async def test_ebay_source_routed_to_api_client():

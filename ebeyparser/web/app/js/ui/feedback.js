@@ -2,7 +2,7 @@
 // Steps, Tabs, PageHeader, Section, KeyValue, Stat.
 import { html, cx, useRef } from "../lib/html.js";
 import { Icon } from "./icons.js";
-import { Button, Glyph } from "./core.js";
+import { Button, Glyph, Details } from "./core.js";
 import { hue } from "../lib/tones.js";
 
 /** Shimmering placeholder. <Skeleton w="60%" h={14} /> or <Skeleton variant="card" /> */
@@ -67,7 +67,7 @@ export function ErrorState({ error, onRetry, compact = false, title }) {
     title=${title || (offline ? "Нет связи с программой" : "Не получилось загрузить")}
     message=${(error && error.message) || "Попробуй ещё раз через минуту."}
     action=${onRetry && html`<${Button} icon="refresh-cw" onClick=${() => onRetry()}>Повторить<//>`}
-  />`;
+  ><${Details} text=${error && error.details} /><//>`;
 }
 
 /** Linear progress. value 0..1, or indeterminate when value is null. */
@@ -135,7 +135,7 @@ export function Checklist({ items = [] }) {
 }
 
 /** Inline callout. tone: info | profit | haggle | danger | neutral | bid */
-export function Banner({ tone = "info", icon, title, children, action, onClose, class: cls = "" }) {
+export function Banner({ tone = "info", icon, title, children, action, onClose, details, class: cls = "" }) {
   const h = hue(tone);
   const defaultIcon = { blue: "info", green: "circle-check", amber: "triangle-alert", red: "circle-alert", neutral: "lightbulb", violet: "gavel" }[h];
   return html`<div class=${cx("banner", `banner--${h}`, cls)} role=${h === "red" ? "alert" : "note"}>
@@ -143,6 +143,7 @@ export function Banner({ tone = "info", icon, title, children, action, onClose, 
     <div class="banner__body">
       ${title && html`<div class="banner__title">${title}</div>`}
       ${children && html`<div class="banner__text">${children}</div>`}
+      <${Details} text=${details} />
     </div>
     ${action && html`<div class="banner__action">${action}</div>`}
     ${onClose && html`<button type="button" class="banner__close" aria-label="Скрыть" onClick=${onClose}><${Icon} name="x" size=${16} /></button>`}

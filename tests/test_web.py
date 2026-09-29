@@ -183,7 +183,7 @@ def test_dashboard_renders(client: TestClient) -> None:
     html = r.text
     for text in ("EbeyParser", "Сделки", "Поиски", "Статус", "Проверить сейчас", "Лучшие", "Покупать",
                  "Подумать", "Все", "Новых за 24 ч", "Потенциальная прибыль", "Куплено",
-                 "Gigabyte GeForce RTX 3090", "рынок ~780", "ROI 56", "экономия", "Выгодно до",
+                 "Gigabyte GeForce RTX 3090", "рынок ~780", "предложи 420", "экономия", "Выгодно до",
                  "Макс. ставка", "Kleinanzeigen", "eBay", "Следующая проверка через", "/static/placeholder.svg"):
         assert text in html, text
     # default filter = buy + maybe, no ignored
@@ -371,7 +371,8 @@ def test_api_stats_and_runs(client: TestClient, db: Database) -> None:
 def test_api_run(db: Database, monitor: FakeMonitor) -> None:
     with TestClient(create_app(AppConfig(), db), base_url=LOCAL) as c:
         r = c.post("/api/run")
-        assert r.status_code == 503 and "Монитор" in r.json()["detail"]
+        assert r.status_code == 503 and "Перезапусти программу" in r.json()["detail"]
+        assert "ebeyparser run" not in r.json()["detail"]
 
     app = create_app(AppConfig(), db, monitor=monitor)
     with TestClient(app, base_url=LOCAL) as c:
@@ -634,7 +635,8 @@ def test_setup_refresh_discovers_once_and_caches(setup_env, tmp_path: Path) -> N
     assert calls == [("Berlin", 30)] and "Sammeln" in again.text  # served from the cache
     state["fail"] = True
     failed = c.get("/classic/setup", params={"location": "Hamburg", "radius": "30", "refresh": "1"})
-    assert failed.status_code == 200 and "получить не удалось" in failed.text and "proxy says no" in failed.text
+    assert failed.status_code == 200 and "получить не удалось" in failed.text
+    assert "Нет связи с Kleinanzeigen" in failed.text and "proxy says no" not in failed.text  # no raw exception
     assert "Handy &amp; Telefon" in failed.text  # built-in fallback
 
 

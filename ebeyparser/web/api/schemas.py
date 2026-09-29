@@ -28,6 +28,8 @@ class ErrorInfo(BaseModel):
     code: str
     message_ru: str
     fields: dict[str, str] | None = None
+    details: str | None = None  # technical text for «Подробнее» (collapsed)
+    action: dict[str, str] | None = None  # {"label_ru", "href"}: the screen that fixes it
 
 
 class ErrorOut(BaseModel):
@@ -96,7 +98,7 @@ class WishItem(ApiModel):
 class PricingPreset(ApiModel):
     min_profit: float | None = Field(default=None, ge=0)
     min_roi: float | None = Field(default=None, ge=0, le=10)
-    safety_margin_percent: float | None = Field(default=None, ge=0, le=90)
+    safety_margin_percent: float | None = Field(default=None, ge=0, le=50)
     min_comparables: int | None = Field(default=None, ge=1, le=100)
 
 
@@ -113,7 +115,9 @@ class SetupIn(ApiModel):
     notify_min_score: float | None = Field(default=None, ge=0, le=100)
     wishlist: list[WishItem] = Field(default_factory=list, max_length=30)
     interval_minutes: float | None = Field(default=None, ge=5, le=1440)
-    replace: bool = True
+    # False (default): new searches are added / same-named ones updated, nothing is removed.
+    # True: the answers replace every current search (the response lists them in `replaced`).
+    replace: bool = False
     set_max_capital: bool = True
     start_run: bool = False
     complete_onboarding: bool = False
@@ -132,7 +136,10 @@ class EstimateOut(Out):
     evaluation_per_hour: int | None
     tight: bool
     level: Literal["ok", "warn", "danger"]
-    text_ru: str
+    text_ru: str  # the full explanation (for «Как это работает?»)
+    short_ru: str = ""  # «Безопасно — блокировки маловероятны»
+    pages_label_ru: str = ""  # «~20 из 150 страниц в час»
+    searches: int = 0
 
 
 # ------------------------------------------------------------- settings
@@ -209,11 +216,11 @@ class NotifyTestIn(ApiModel):
 class DealPatchIn(ApiModel):
     status: ApiStatus | None = None
     note: str | None = Field(default=None, max_length=5000)
-    bought_price: float | None = Field(default=None, ge=0)
+    bought_price: float | None = None  # checked in the route: clear messages, never clamped
     bought_at: datetime | None = None
-    sold_price: float | None = Field(default=None, ge=0)
+    sold_price: float | None = None
     sold_at: datetime | None = None
-    extra_costs: float | None = Field(default=None, ge=0)
+    extra_costs: float | None = None
     hidden_reason: str | None = Field(default=None, max_length=200)
 
 

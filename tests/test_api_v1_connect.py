@@ -168,7 +168,9 @@ def test_ai_test_on_sample_ad_and_save(conn) -> None:
     assert not missing["ok"] and missing["server_ok"] and not missing["model_available"] and missing["error_ru"]
     services.lmstudio_up = False
     down = c.post("/api/v1/ai/test", json={"save": True}).json()
-    assert not down["ok"] and not down["server_ok"] and "недоступна" in down["message_ru"] and not down["saved"]
+    assert not down["ok"] and not down["server_ok"] and not down["saved"]
+    assert down["message_ru"] == "LM Studio не отвечает. Открой LM Studio → Developer → Start Server"
+    assert "ConnectError" not in down["message_ru"] and "http://" not in down["message_ru"]
     assert c.post("/api/v1/ai/test", json={"provider": "gpt"}).status_code == 422
 
 
@@ -230,7 +232,8 @@ def test_telegram_guided_linking(conn) -> None:
     assert sent and json.loads(sent[-1].content)["chat_id"] == "555666777"
     lost = c.post("/api/v1/telegram/test", json={"chat_id": "404", "with_deal": False})
     assert lost.status_code == 502 and lost.json()["error"]["code"] == "delivery_failed"
-    assert "/start" in lost.json()["error"]["message_ru"]
+    assert "нажми Start" in lost.json()["error"]["message_ru"] and "chat_id" not in lost.json()["error"]["message_ru"]
+    assert lost.json()["error"]["details"]  # the technical text for «Подробнее»
 
 
 def test_telegram_needs_token_and_chat(conn) -> None:
@@ -263,7 +266,8 @@ def test_email_test_and_save(conn) -> None:
 
     FakeSMTP.fail = smtplib.SMTPAuthenticationError(535, b"Username and Password not accepted")
     failed = c.post("/api/v1/email/validate", json={})
-    assert failed.status_code == 502 and "Пароль приложения" in failed.json()["error"]["message_ru"]
+    assert failed.status_code == 502 and "пароль приложения" in failed.json()["error"]["message_ru"]
+    assert "535" in failed.json()["error"]["details"] and "535" not in failed.json()["error"]["message_ru"]
 
 
 # ---------------------------------------------------------------------- eBay
@@ -293,7 +297,8 @@ def test_notify_test_per_channel_and_all(conn) -> None:
     assert c.post("/api/v1/notify/test").json()["error"]["code"] == "no_channels"
     c.put("/api/v1/secrets", json={"telegram_bot_token": BOT_TOKEN, "telegram_chat_id": "555666777"})
     ok = c.post("/api/v1/notify/test", params={"channel": "telegram"}).json()
-    assert ok == {"ok": True, "results": {"telegram": {"ok": True, "message_ru": "Отправлено"}}}
+    assert ok == {"ok": True, "message_ru": "Отправлено: Telegram",
+                  "results": {"telegram": {"ok": True, "label_ru": "Telegram", "message_ru": "Отправлено"}}}
     photo = [r for r in services.requests if r.url.path.endswith("/sendPhoto")]
     assert photo and "RTX 3080" in json.loads(photo[-1].content)["caption"]  # a sample deal with a photo
     assert c.post("/api/v1/notify/test", json={"channel": "email"}).json()["error"]["code"] == "not_configured"
@@ -318,7 +323,8 @@ def test_notify_test_uses_injected_factory(tmp_path: Path) -> None:
 
     app, *_ = make_app(tmp_path, notifiers_factory=lambda: [Fake()])
     with TestClient(app, base_url=LOCAL) as c:
-        assert c.post("/api/v1/notify/test").json() == {"ok": True, "results": {"fake": {"ok": True,
-                                                                                        "message_ru": "Отправлено"}}}
+        assert c.post("/api/v1/notify/test").json() == {
+            "ok": True, "message_ru": "Отправлено: fake",
+            "results": {"fake": {"ok": True, "label_ru": "fake", "message_ru": "Отправлено"}}}
     assert sent and sent[0][1] == "EbeyParser: тестовое уведомление"
     assert not events_of(app, "health_alert")

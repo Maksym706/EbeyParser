@@ -648,7 +648,7 @@ def search_places(query: str, limit: int = 10) -> list[dict[str, Any]]:
         hits = sorted((p for p in places() if p.plz.startswith(raw)),
                       key=lambda p: (p.plz != raw, p.kind != "city", -p.population))
         out = [p.as_dict() for p in hits[:limit]]
-        if len(raw) == 5 and not any(p["plz"] == raw for p in out):
+        if len(raw) == 5 and not any(p["plz"] == raw for p in out) and _plausible_plz(raw):
             out.insert(0, {"id": f"plz:{raw}", "name": raw, "label": f"Почтовый индекс {raw}", "value": raw,
                            "kind": "plz", "state": None, "state_code": None, "plz": raw, "parent": None,
                            "population": None})
@@ -663,4 +663,20 @@ def search_places(query: str, limit: int = 10) -> list[dict[str, Any]]:
     return [p.as_dict() for *_, p in scored[:limit]]
 
 
-__all__ = ["STATES", "Place", "places", "search_places"]
+def _plausible_plz(code: str) -> bool:
+    """German postal codes run 01001–99998 (no 00xxx, no 05xxx / 43xxx / 62xxx regions)."""
+    return code.isdigit() and len(code) == 5 and code[:2] not in ("00", "05", "43", "62") and code != "99999"
+
+
+def place_label(value: str | None) -> str:
+    """What the user picked, for display: SearchConfig.location '12043' -> 'Neukölln',
+    '06108' -> 'Halle (Saale)', 'Berlin' -> 'Berlin'. An unknown postal code stays as is."""
+    text = " ".join(str(value or "").split())
+    if not (text.isdigit() and len(text) == 5):
+        return text
+    exact = [p for p in places() if p.plz == text]
+    picked = next((p for p in exact if p.value == text), None) or (exact[0] if exact else None)
+    return picked.name if picked is not None else text
+
+
+__all__ = ["STATES", "Place", "place_label", "places", "search_places"]

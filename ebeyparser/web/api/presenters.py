@@ -11,8 +11,10 @@ from typing import Any, Iterable, overload
 
 from ...config import AppConfig, SearchConfig
 from ...models import AIVerdict, DealView, Evaluation, Listing, utcnow
+from ...timefmt import local_tz, when_label
 
-VERDICT_LABELS = {"buy": "Покупать", "maybe": "Подумать", "skip": "Пропустить", "none": "Не оценено"}
+# the glossary of the UI (§7.2): Покупай / Подумай / Не выгодно
+VERDICT_LABELS = {"buy": "Покупай", "maybe": "Подумай", "skip": "Не выгодно", "none": "Не оценено"}
 ACTION_LABELS = {
     "buy": "Брать по цене",
     "haggle": "Торговаться",
@@ -70,12 +72,55 @@ STAGE_LABELS = {"": "—", "prefilter": "Отсеяно фильтром", "mark
                 "expired": "Не успели проверить"}
 
 
-try:
-    from zoneinfo import ZoneInfo
+# the user's time zone lives in ebeyparser.timefmt (general.timezone, default Europe/Berlin)
+LOCAL_TZ: Any = local_tz()  # the default zone; code uses local_tz() so a changed setting applies
 
-    LOCAL_TZ: Any = ZoneInfo("Europe/Berlin")
-except Exception:  # pragma: no cover - missing tzdata
-    LOCAL_TZ = timezone.utc
+
+# German words of the sites -> Russian (the UI must not show "Heute", "Gut", "Zustand")
+CONDITION_DE_RU = {
+    "neu": "Новое", "neu mit etikett": "Новое с биркой", "neuwertig": "Как новое", "wie neu": "Как новое",
+    "sehr gut": "Очень хорошее", "gut": "Хорошее", "in ordnung": "Нормальное", "akzeptabel": "Нормальное",
+    "gebraucht": "Б/у", "defekt": "Неисправно", "als ersatzteil / defekt": "На запчасти / неисправно",
+    "generalüberholt": "Восстановленное", "gebraucht – sehr gut": "Б/у, очень хорошее",
+    "gebraucht – gut": "Б/у, хорошее", "gebraucht – akzeptabel": "Б/у, нормальное",
+}
+ATTRIBUTE_KEYS_RU = {
+    "art": "Тип", "zustand": "Состояние", "versand": "Доставка", "marke": "Бренд", "modell": "Модель",
+    "farbe": "Цвет", "größe": "Размер", "speichergröße": "Память", "speicherkapazität": "Объём памяти",
+    "speichertyp": "Тип памяти", "kapazität": "Ёмкость", "hersteller": "Производитель", "typ": "Тип",
+    "material": "Материал", "rahmengröße": "Размер рамы", "anzahl": "Количество", "produktart": "Тип товара",
+}
+ATTRIBUTE_VALUES_RU = {
+    "versand möglich": "можно с доставкой", "nur abholung": "только самовывоз", "nur versand": "только доставка",
+}
+
+
+def condition_ru(text: str) -> str:
+    """'Gut' -> 'Хорошее', 'Gebraucht – Sehr gut' -> 'Б/у, очень хорошее' (unknown: as is)."""
+    raw = " ".join((text or "").split())
+    return CONDITION_DE_RU.get(raw.lower().replace(" - ", " – "), raw)
+
+
+def day_words_ru(text: str) -> str:
+    """'Heute, 19:35' -> 'сегодня, 19:35'; 'Gestern' -> 'вчера'; 'Verkauft 15.09.2026' -> '15.09.2026'."""
+    out = " ".join((text or "").split())
+    out = re.sub(r"^(?:Verkauft|Verkauft am)\s+", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bHeute\b", "сегодня", out)
+    out = re.sub(r"\bGestern\b", "вчера", out)
+    out = re.sub(r"\bSofort-Kaufen\b", "купить сразу", out)
+    return out
+
+
+def attributes_ru(attributes: dict[str, str]) -> list[dict[str, str]]:
+    """[{key, key_ru, value, value_ru}] — the seller's description table in Russian."""
+    rows = []
+    for key, value in attributes.items():
+        value_ru = ATTRIBUTE_VALUES_RU.get(str(value).strip().lower())
+        if value_ru is None and key.strip().lower() == "zustand":
+            value_ru = condition_ru(str(value))
+        rows.append({"key": key, "key_ru": ATTRIBUTE_KEYS_RU.get(key.strip().lower(), key), "value": value,
+                     "value_ru": value_ru or str(value)})
+    return rows
 
 
 # --------------------------------------------------------------------- helpers
@@ -164,6 +209,33 @@ def api_status(deal: DealView, extras: dict[str, Any] | None = None) -> str:
     return deal.status
 
 
+def is_auction(listing: Listing) -> bool:
+    return "AUCTION" in {str(o).upper() for o in (listing.buying_options or [])}
+
+
+def derive_action(listing: Listing, ev: Evaluation | None) -> str:
+    """What to do with a deal — never empty in API output (older evaluations and demo data
+    have action ""): an auction is always "bid" (never "buy"), a buy with an offer on a VB /
+    best-offer ad is "haggle", buy -> "buy", maybe -> "watch", skip -> "skip". The same rule
+    is the SQL of Database.ACTION_SQL (the ?action= filter and the facets)."""
+    if ev is None:
+        return "watch"
+    action = ev.action or ""
+    auction = is_auction(listing)
+    if action:
+        return "bid" if auction and action in ("buy", "haggle") else action
+    if ev.verdict == "skip":
+        return "skip"
+    if auction:
+        return "bid" if (ev.max_buy_price or 0) > 0 else "watch"
+    negotiable = listing.negotiable or "BEST_OFFER" in {str(o).upper() for o in (listing.buying_options or [])}
+    if ev.verdict == "buy" and ev.offer_price is not None and negotiable:
+        return "haggle"
+    if ev.verdict == "buy":
+        return "buy"
+    return "watch"
+
+
 def market_price(ev: Evaluation | None) -> float | None:
     if ev is None:
         return None
@@ -176,6 +248,8 @@ def offer_terms(ev: Evaluation | None, listing: Listing) -> tuple[float, float |
     """Haggle deals: (offer, profit/savings at the offer, ROI at the offer) — as the notifier."""
     from ...notify.render import offer_terms as render_offer_terms
 
+    if ev is not None and ev.action != "haggle" and derive_action(listing, ev) == "haggle":
+        ev = ev.model_copy(update={"action": "haggle"})  # an old / demo evaluation without an action
     return render_offer_terms(ev, listing)
 
 
@@ -243,13 +317,13 @@ def deal_card(deal: DealView, extras: dict[str, Any] | None = None, *, config: A
     listing, ev = deal.listing, deal.evaluation
     source = listing.source or "kleinanzeigen"
     verdict = ev.verdict if ev else "none"
-    action = ev.action if ev else ""
+    action = derive_action(listing, ev)
     purpose = ev.purpose if ev else "resale"
     status = api_status(deal, extras)
     images = [u for u in listing.image_urls if u]
     market = market_price(ev)
     terms = offer_terms(ev, listing)
-    auction = "AUCTION" in (listing.buying_options or [])
+    auction = is_auction(listing)
     extras = extras or {}
     card: dict[str, Any] = {
         "id": listing.ad_id,
@@ -310,6 +384,7 @@ def deal_card(deal: DealView, extras: dict[str, Any] | None = None, *, config: A
         "postal_code": listing.postal_code,
         "distance_km": rnd(listing.distance_km, 1),
         "posted_at_text": listing.posted_at_text,
+        "posted_at_ru": day_words_ru(listing.posted_at_text),
         "first_seen": iso(listing.first_seen),
         "evaluated_at": iso(ev.evaluated_at) if ev else None,
         "stage": ev.stage if ev else "",
@@ -318,9 +393,12 @@ def deal_card(deal: DealView, extras: dict[str, Any] | None = None, *, config: A
         "purpose": purpose,
         "purpose_label": PURPOSE_LABELS.get(purpose, purpose),
         "condition": (listing.condition or listing.attributes.get("Zustand", "")).strip(),
+        "condition_ru": condition_ru(listing.condition or listing.attributes.get("Zustand", "")),
         "seller_type": listing.seller_type,
         "buying_options": list(listing.buying_options or []),
-        "auction": {"bid_count": listing.bid_count, "ends_at": iso(listing.ends_at)} if auction else None,
+        "auction": {"bid_count": listing.bid_count, "ends_at": iso(listing.ends_at),
+                    "ends_at_label": when_label(listing.ends_at) if listing.ends_at else ""} if auction else None,
+        "first_seen_label": when_label(listing.first_seen),
     }
     return card
 
@@ -345,7 +423,7 @@ def profit_breakdown(deal: DealView, config: AppConfig) -> dict[str, Any]:
     }]
     if ev.purpose == "personal":
         rows.append({"key": "buy", "label": "Цена покупки", "value": rnd(-buy),
-                     "note": f"вкл. доставку {rnd(shipping_in)} €" if shipping_in else ""})
+                     "note": f"вкл. доставку {_euro(shipping_in)}" if shipping_in else ""})
         computed = market - buy
         total_label = "Экономия"
     else:
@@ -358,7 +436,7 @@ def profit_breakdown(deal: DealView, config: AppConfig) -> dict[str, Any]:
              "note": f"{fee_pct:g} %" if fee_pct else "частным продавцам 0 %"},
             {"key": "shipping", "label": "Твоя доставка покупателю", "value": rnd(-ev.shipping_cost), "note": ""},
             {"key": "buy", "label": "Цена покупки", "value": rnd(-buy),
-             "note": f"вкл. доставку {rnd(shipping_in)} €" if shipping_in else ""},
+             "note": f"вкл. доставку {_euro(shipping_in)}" if shipping_in else ""},
         ]
         computed = market - margin - ev.fees - ev.shipping_cost - buy
         total_label = "Чистая прибыль"
@@ -486,6 +564,7 @@ def deal_detail(deal: DealView, extras: dict[str, Any] | None, config: AppConfig
             "description": listing.description,
             "images": [u for u in listing.image_urls if u],
             "attributes": dict(listing.attributes),
+            "attributes_ru": attributes_ru(listing.attributes),
             "tags": list(listing.tags),
             "condition": card["condition"],
             "detail_loaded": listing.detail_loaded,
@@ -529,7 +608,7 @@ def deal_detail(deal: DealView, extras: dict[str, Any] | None, config: AppConfig
                 "comparables": [{
                     "title": c.title, "price": rnd(c.price), "url": c.url, "source": c.source,
                     "source_label": COMP_SOURCE_LABELS.get(c.source, c.source), "sold": c.sold,
-                    "date_text": c.date_text,
+                    "date_text": c.date_text, "date_ru": day_words_ru(c.date_text),
                 } for c in comps],
             },
         },
@@ -567,10 +646,25 @@ def _pipeline_done(status: str, step: str) -> bool:
 
 
 # ---------------------------------------------------------------------- search
+def location_label(search: SearchConfig) -> str:
+    """The place as the user picked it ('Neukölln', never the postal code '12043')."""
+    from .locations import place_label
+
+    return place_label(search.location)
+
+
+def where_text(search: SearchConfig) -> str:
+    """'Neukölln · 50 км' / 'Berlin' / 'вся Германия' for a search card."""
+    where = location_label(search) or ("вся Германия" if search.source == "kleinanzeigen" and not search.url else "")
+    if where and search.radius_km:
+        where = f"{where} · {search.radius_km} км"
+    return where
+
+
 def search_summary(search: SearchConfig) -> str:
     """'Berlin + 30 км · до 400 €' for a search card."""
     parts: list[str] = []
-    where = search.location or ("вся Германия" if search.source == "kleinanzeigen" else "")
+    where = location_label(search) or ("вся Германия" if search.source == "kleinanzeigen" else "")
     if search.radius_km and where:
         where = f"{where} + {search.radius_km} км"
     if where:
@@ -628,6 +722,8 @@ def search_view(search: SearchConfig, sid: str, stats: dict[str, Any] | None, *,
         "purpose_label": PURPOSE_LABELS.get(search.purpose, search.purpose),
         "kind": search_kind(search),
         "summary": search_summary(search),
+        "location_label": location_label(search),  # 'Neukölln' (config.location may be '12043')
+        "where_ru": where_text(search),
         "config": search.model_dump(mode="json"),
         "stats": {
             "ads": int(stats.get("ads") or 0),
@@ -647,12 +743,15 @@ def search_view(search: SearchConfig, sid: str, stats: dict[str, Any] | None, *,
 
 def search_errors(runs: Iterable[Any], name: str, limit: int = 5) -> list[str]:
     """Errors of the latest passes that belong to search `name` (they start with its name)."""
+    from ...errors_ru import friendly_run_error
+
     out: list[str] = []
     prefixes = (f"{name}:", f"{name} /")
     for run in runs:
         for err in getattr(run, "errors", []) or []:
-            if str(err).startswith(prefixes) and err not in out:
-                out.append(str(err))
+            text = friendly_run_error(str(err))  # plain Russian even for runs of older versions
+            if str(err).startswith(prefixes) and text not in out:
+                out.append(text)
         if len(out) >= limit:
             break
     return out[:limit]

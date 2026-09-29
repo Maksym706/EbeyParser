@@ -5,7 +5,7 @@
 import { html, cx, useState, useEffect, useRef } from "../lib/html.js";
 import { useAsync, useDebouncedCallback, useIsMobile, useLocalState } from "../lib/hooks.js";
 import { onEvent } from "../lib/events.js";
-import { money, percent, ago, dateTime, plural } from "../lib/format.js";
+import { money, percent, ago, dateTime, plural, whenTime } from "../lib/format.js";
 import { api } from "../lib/api.js";
 import { Icon, Button, IconButton, Badge, Skeleton, EmptyState, ErrorState, Tooltip, toast, SaveState, Checkbox } from "../ui/index.js";
 import "./icons-extra.js";
@@ -25,6 +25,15 @@ import {
   sourceLabel,
   humanOffer,
   secondsLeft,
+  actionOf,
+  isAuction,
+  ruCondition,
+  ruAttrKey,
+  ruAttrValue,
+  ruTag,
+  ruDateText,
+  ruNumbers,
+  dedupe,
 } from "./deal-model.js";
 import { dealsApi, applyUpdate, setStatus, toggleStar, hideDeal, unhideDeal, moveTo, markBought, markSold, writeToSeller } from "./deal-actions.js";
 import { Gallery } from "./gallery.js";
@@ -33,6 +42,8 @@ import { Composer } from "./composer.js";
 import { Popover, Menu } from "./popover.js";
 import { Countdown } from "./deal-card.js";
 import { copyText, quickMessage } from "./messages.js";
+
+const reducedMotion = () => window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 // ------------------------------------------------------------------ data
 /** Load the detail; seed it with the list card for an instant first paint. */
@@ -122,10 +133,11 @@ export function DealView({ id, initial, mode = "page", onClose, onPrev, onNext, 
               <${Description} deal=${deal} />
               <${SellerBlock} deal=${deal} />
               <${MeetChecklist} deal=${deal} />
-              <section class="dv-sec" id="composer">
+              ${dec.kind !== "bid" &&
+              html`<section class="dv-sec" id="composer">
                 <h3 class="dv-sec__title"><${Icon} name="message-square" size=${18} />Сообщение продавцу</h3>
                 <${Composer} deal=${deal} offer=${offer} />
-              </section>
+              </section>`}
               <${StatusBlock} deal=${deal} />
               <${Notes} deal=${deal} />
               <${WhyScore} deal=${deal} />
@@ -223,7 +235,7 @@ function BottomBar({ deal, dec }) {
         { label: "Купил за…", icon: "package-check", onClick: () => markBought(deal) },
         { label: "Продал за…", icon: "banknote", onClick: () => markSold(deal) },
         { divider: true },
-        { label: "Скопировать сообщение", icon: "copy", onClick: () => copyText(quickMessage(deal)).then((ok) => ok && toast.success("Скопировано")) },
+        dec.kind !== "bid" && { label: "Скопировать сообщение продавцу", icon: "copy", onClick: () => copyText(quickMessage(deal)).then((ok) => ok && toast.success("Сообщение скопировано")) },
         deal.status === "ignored"
           ? { label: "Вернуть в ленту", icon: "undo-2", onClick: () => unhideDeal(deal) }
           : { label: "Скрыть", icon: "eye-off", danger: true, onClick: () => hideDeal(deal) },
@@ -236,6 +248,7 @@ function BottomBar({ deal, dec }) {
 // ------------------------------------------------------------------ title
 function TitleBlock({ deal, menu }) {
   const place = distanceText(deal);
+  const posted = ruDateText(deal.posted_at_text);
   const shipping =
     deal.shipping_cost != null && deal.shipping_cost > 0
       ? `+ ${money(deal.shipping_cost, { cents: deal.shipping_cost % 1 !== 0 })} доставка`
@@ -251,27 +264,27 @@ function TitleBlock({ deal, menu }) {
     </div>
     <div class="dv-title__price">
       <span class="price-xl num">${deal.is_free ? "Бесплатно" : money(deal.price)}</span>
-      ${deal.negotiable && html`<${Tooltip} text="Verhandlungsbasis — продавец готов торговаться"><span class="vb">VB</span><//>`}
+      ${deal.negotiable && html`<${Tooltip} text="VB — продавец готов торговаться"><span class="vb">VB</span><//>`}
       ${shipping && html`<span class="dv-title__ship">${shipping}</span>`}
     </div>
     <div class="dv-title__meta">
       ${place && html`<span><${Icon} name="map-pin" size=${14} />${place}</span>`}
       ${deal.first_seen && html`<span title=${dateTime(deal.first_seen)}><${Icon} name="clock" size=${14} />${ago(deal.first_seen)}</span>`}
-      ${deal.posted_at_text && html`<span class="muted">опубликовано: ${deal.posted_at_text}</span>`}
+      ${posted && html`<span class="muted">опубликовано ${posted}</span>`}
     </div>
     <div class="dv-title__chips">
       <span class="tag">${sourceLabel(deal)}</span>
       ${deal.search_name &&
       html`<a class="tag tag--link" href=${`/?search=${encodeURIComponent(deal.search_name)}`}><${Icon} name="radar" size=${12} />${deal.search_name}</a>`}
       ${deal.purpose === "personal" && html`<span class="tag tone-profit"><${Icon} name="piggy-bank" size=${12} />Для себя</span>`}
-      ${deal.condition && html`<span class="tag"><${Icon} name="package" size=${12} />${deal.condition}</span>`}
+      ${deal.condition && html`<span class="tag" title=${deal.condition !== ruCondition(deal.condition) ? deal.condition : undefined}><${Icon} name="package" size=${12} />${ruCondition(deal.condition)}</span>`}
     </div>
   </div>`;
 }
 
 // ------------------------------------------------------------------ decision
 function DecisionBlock({ deal, dec, offer, setOffer }) {
-  const haggle = dec.kind === "haggle" || (dec.kind === "personal" && deal.action === "haggle");
+  const haggle = dec.kind === "haggle" || (dec.kind === "personal" && actionOf(deal) === "haggle");
   const bid = dec.kind === "bid";
   const buyPrice = deal.buy_price ?? deal.price;
   const baseProfit = deal.profit;
@@ -302,7 +315,7 @@ function DecisionBlock({ deal, dec, offer, setOffer }) {
         endsAt &&
         html`<div class="dblock__sub">
           конец через <b><${Countdown} endsAt=${endsAt} /></b>
-          ${left > 0 && html` (${new Date(endsAt).toLocaleString("ru-RU", { weekday: "short", hour: "2-digit", minute: "2-digit" })})`}
+          ${left > 0 && html` (${whenTime(endsAt)})`}
         </div>`}
       </div>
       ${deal.score != null &&
@@ -349,7 +362,7 @@ function DecisionBlock({ deal, dec, offer, setOffer }) {
             icon="message-square"
             onClick=${() => {
               const el = document.getElementById("composer");
-              if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+              if (el) el.scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth", block: "start" });
             }}
             >${haggle ? `Написать с предложением ${money(humanOffer(current))}` : "Написать продавцу"}<//
           >`}
@@ -424,7 +437,7 @@ function Breakdown({ deal, offer }) {
       <tbody>
         ${rows.map(
           (r, i) => html`<tr class=${cx((r.value < 0 || COST_ROWS.includes(r.key)) && "is-minus")}>
-            <th scope="row">${i > 0 ? (COST_ROWS.includes(r.key) || r.value < 0 ? "− " : "+ ") : ""}${r.label}${r.note && html`<small>${r.note}</small>`}</th>
+            <th scope="row">${i > 0 ? (COST_ROWS.includes(r.key) || r.value < 0 ? "− " : "+ ") : ""}${r.label}${r.note && html`<small>${ruNumbers(r.note)}</small>`}</th>
             <td class="num">${COST_ROWS.includes(r.key) && !r.value ? "0 €" : money(r.value, { sign: r.key === "other" })}</td>
           </tr>`,
         )}
@@ -508,7 +521,7 @@ function Market({ deal, tone }) {
           <span class="comps__meta">
             ${c.sold && !/продано/i.test(c.source_label || "") && html`<span class="tag tone-info">продано</span>`}
             <span class=${cx("tag", c.sold && "tone-info")}>${c.source_label || c.source}</span>
-            ${c.date_text && html`<span class="muted">${c.date_text}</span>`}
+            ${c.date_text && ruDateText(c.date_text) && html`<span class="muted">${ruDateText(c.date_text)}</span>`}
           </span>
           <span class="comps__price num">${money(c.price)}</span>
         </a>`,
@@ -535,12 +548,13 @@ function AiPanel({ ai, title = "Что увидела нейросеть", secon
   }
   const conf = ai.confidence_percent ?? Math.round((ai.confidence || 0) * 100);
   const vTone = { buy: "profit", maybe: "haggle", skip: "danger" }[ai.verdict] || "neutral";
+  const vLabel = { buy: "Покупай", maybe: "Подумай", skip: "Не выгодно" }[ai.verdict] || ai.verdict_label || ai.verdict;
   return html`<div class=${cx("ai", second && "ai--second")}>
     <div class="ai__head">
       <${Icon} name="scan-eye" size=${18} />
       <span class="ai__title">${title}</span>
       ${ai.model && html`<code class="ai__model">${ai.model}</code>`}
-      ${ai.verdict && html`<${Badge} tone=${vTone} size="sm">${ai.verdict_label || ai.verdict}<//>`}
+      ${ai.verdict && html`<${Badge} tone=${vTone} size="sm">${vLabel}<//>`}
     </div>
     <dl class="ai__grid">
       ${ai.product && html`<div><dt>Товар</dt><dd>${ai.product}</dd></div>`}
@@ -583,7 +597,7 @@ function Description({ deal }) {
   return html`<section class="dv-sec">
     <h3 class="dv-sec__title"><${Icon} name="file-text" size=${18} />Описание продавца</h3>
     ${Object.keys(attrs).length > 0 &&
-    html`<dl class="attrs">${Object.entries(attrs).map(([k, v]) => html`<div><dt>${k}</dt><dd>${v}</dd></div>`)}</dl>`}
+    html`<dl class="attrs">${Object.entries(attrs).map(([k, v]) => html`<div><dt title=${ruAttrKey(k) !== k ? k : undefined}>${ruAttrKey(k)}</dt><dd>${ruAttrValue(k, v)}</dd></div>`)}</dl>`}
     ${text &&
     html`<p class=${cx("desc", long && !open && "is-clamped")} lang="de">${text}</p>
       ${long && html`<button type="button" class="linkish" onClick=${() => setOpen(!open)}>${open ? "Свернуть" : "Показать полностью"}</button>`}`}
@@ -607,8 +621,9 @@ function SellerBlock({ deal }) {
     s.feedback_percent != null
       ? html`<span class="tag tone-info">${String(s.feedback_percent).replace(".", ",")} %${s.feedback_score != null ? ` · ${s.feedback_score} ${plural(s.feedback_score, "отзыв", "отзыва", "отзывов")}` : ""}</span>`
       : null,
-    ...tags.map((t) => html`<span class="tag"><${Icon} name=${/versand/i.test(t) ? "truck" : "tag"} size=${12} />${t}</span>`),
-    ...opts.map((o) => html`<span class="tag">${o.label || o}</span>`),
+    ...dedupe([...tags.map(ruTag), ...opts.map((o) => ruTag((o && o.label) || (o && o.key) || o))]).map(
+      (t) => html`<span class="tag"><${Icon} name=${/доставк|самовывоз/i.test(t) ? "truck" : /аукцион/i.test(t) ? "gavel" : "tag"} size=${12} />${t}</span>`,
+    ),
   ].filter(Boolean);
   return html`<section class="dv-sec">
     ${chips.length > 0 &&
@@ -636,7 +651,7 @@ function MeetChecklist({ deal }) {
   return html`<section class="dv-sec">
     <div class="dv-sec__head">
       <h3 class="dv-sec__title"><${Icon} name="clipboard-check" size=${18} />Проверь при встрече${type !== "generic" && html`<span class="tag">${TYPE_LABELS[type]}</span>`}</h3>
-      <button type="button" class="linkish" onClick=${copy}><${Icon} name="copy" size=${14} />Скопировать</button>
+      <button type="button" class="linkish" onClick=${copy}><${Icon} name="copy" size=${14} />Скопировать чек-лист</button>
     </div>
     <div class="checks">
       ${items.map(

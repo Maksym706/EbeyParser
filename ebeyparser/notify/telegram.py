@@ -11,6 +11,7 @@ import httpx
 
 from ..config import TelegramConfig
 from ..models import DealView
+from ..errors_ru import humanize, status_message
 from .base import NotifyError
 from .render import (
     more_deals_phrase,
@@ -28,6 +29,7 @@ API_BASE = "https://api.telegram.org"
 MAX_DEALS_PER_SEND = 20
 MAX_RETRY_AFTER = 30.0  # seconds; longer 429 waits are not worth blocking the monitor
 PAUSE_BETWEEN_MESSAGES = 0.5  # Telegram allows ~1 msg/s per chat; short bursts are fine
+NOT_CONNECTED_RU = "Telegram не подключён — привяжи бота в настройках уведомлений"
 
 Sleep = Callable[[float], Awaitable[Any]]
 
@@ -64,7 +66,8 @@ class TelegramNotifier:
         if not deals:
             return
         if not self._token or not str(self.cfg.chat_id).strip():
-            raise NotifyError("Telegram: не указан bot_token или chat_id.")
+            raise NotifyError("Telegram: не указан bot_token или chat_id.", message_ru=NOT_CONNECTED_RU,
+                              code="not_configured", service="telegram")
         shown = deals[:MAX_DEALS_PER_SEND]
         rest = len(deals) - len(shown)
         async with httpx.AsyncClient(transport=self._transport, timeout=self.timeout) as client:
@@ -96,7 +99,8 @@ class TelegramNotifier:
         if not text:
             return
         if not self._token or not str(self.cfg.chat_id).strip():
-            raise NotifyError("Telegram: не указан bot_token или chat_id.")
+            raise NotifyError("Telegram: не указан bot_token или chat_id.", message_ru=NOT_CONNECTED_RU,
+                              code="not_configured", service="telegram")
         async with httpx.AsyncClient(transport=self._transport, timeout=self.timeout) as client:
             await self._call(client, "sendMessage", self._text_payload(_esc(text[:4000]), preview=False))
         log.info("Telegram: служебное сообщение отправлено в чат %s", self.cfg.chat_id)
@@ -161,7 +165,8 @@ class TelegramNotifier:
                 log.warning("Telegram %s отклонён (%s), пробую запасной вариант", method, exc)
                 last = exc
         assert last is not None
-        raise NotifyError(str(last)) from last
+        raise NotifyError(str(last), message_ru=getattr(last, "message_ru", ""), code=last.code,
+                          service="telegram") from last
 
     async def _call(self, client: httpx.AsyncClient, method: str, payload: dict[str, Any]) -> Any:
         for attempt in range(2):
@@ -169,14 +174,16 @@ class TelegramNotifier:
                 resp = await client.post(self._api + method, json=payload)
             except httpx.HTTPError as exc:
                 raise NotifyError(
-                    f"Telegram: сетевая ошибка ({exc.__class__.__name__}): {self._redact(str(exc))}"
+                    f"Telegram: сетевая ошибка ({exc.__class__.__name__}): {self._redact(str(exc))}",
+                    message_ru=humanize(exc, "telegram").message_ru, code="network", service="telegram",
                 ) from None
             try:
                 data = resp.json()
+                json_answer = True
             except ValueError:
-                data = {}
+                data, json_answer = {}, False
             if not isinstance(data, dict):
-                data = {}
+                data, json_answer = {}, False
             if resp.status_code == 200 and data.get("ok"):
                 return data.get("result")
             code = int(data.get("error_code") or resp.status_code)
@@ -191,29 +198,35 @@ class TelegramNotifier:
                 log.warning("Telegram: слишком много запросов, жду %.0f с", wait)
                 await self._sleep(wait)
                 continue
-            raise self._error(code, desc)
+            raise self._error(code, desc, json_answer=json_answer, method=method)
         raise AssertionError("unreachable")  # pragma: no cover
 
-    def _error(self, code: int, desc: str) -> NotifyError:
+    def _error(self, code: int, desc: str, *, json_answer: bool = True, method: str = "") -> NotifyError:
+        """Technical text for the log / CLI + a plain `message_ru` for the web UI (a 403 that is
+        not Telegram's own JSON answer comes from a proxy / firewall, not from a blocked bot)."""
+        kind, message_ru = status_message(code, "telegram", method=method, description=desc, json_answer=json_answer)
         low = desc.lower()
+        extra = {"message_ru": message_ru, "code": kind, "service": "telegram"}
         if code == 400 and "chat not found" in low:
             return _BadRequest(
-                f"Telegram: чат не найден ({desc}). Проверьте chat_id и сначала напишите своему боту /start."
+                f"Telegram: чат не найден ({desc}). Проверьте chat_id и сначала напишите своему боту /start.", **extra
             )
         if code == 400:
-            return _BadRequest(f"Telegram: запрос отклонён (400): {desc}")
+            return _BadRequest(f"Telegram: запрос отклонён (400): {desc}", **extra)
         if code == 401:
-            return NotifyError(f"Telegram: неверный bot_token ({desc}). Скопируйте токен из @BotFather заново.")
+            return NotifyError(f"Telegram: неверный bot_token ({desc}). Скопируйте токен из @BotFather заново.", **extra)
+        if code == 403 and not json_answer:
+            return NotifyError(f"Telegram: доступ закрыт сетью или прокси (HTTP 403, не ответ Telegram): {desc}", **extra)
         if code == 403:
             return NotifyError(
                 f"Telegram: бот не может писать в этот чат ({desc}). "
-                "Напишите боту /start (или добавьте его в группу/канал) и проверьте chat_id."
+                "Напишите боту /start (или добавьте его в группу/канал) и проверьте chat_id.", **extra
             )
         if code == 404:
-            return NotifyError("Telegram: API вернул 404 — скорее всего, bot_token указан неверно.")
+            return NotifyError("Telegram: API вернул 404 — скорее всего, bot_token указан неверно.", **extra)
         if code == 429:
-            return NotifyError(f"Telegram: слишком много сообщений, попробуйте позже ({desc}).")
-        return NotifyError(f"Telegram: ошибка {code}: {desc}")
+            return NotifyError(f"Telegram: слишком много сообщений, попробуйте позже ({desc}).", **extra)
+        return NotifyError(f"Telegram: ошибка {code}: {desc}", **extra)
 
     def _redact(self, text: str) -> str:
         return text.replace(self._token, "***") if self._token else text

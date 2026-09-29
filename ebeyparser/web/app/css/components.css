@@ -610,6 +610,10 @@
   font-size: var(--fs-caption);
   font-weight: var(--weight-medium);
   line-height: var(--lh-caption);
+  /* never inherit the host's overline / uppercase / tracking */
+  text-transform: none;
+  letter-spacing: normal;
+  font-style: normal;
   white-space: normal;
   text-align: left;
   pointer-events: none;
@@ -641,6 +645,17 @@
 
 .tooltip--bottom-end:hover .tooltip__bubble,
 .tooltip--bottom-end:focus-within .tooltip__bubble {
+  transform: none;
+}
+
+.tooltip--bottom-start .tooltip__bubble {
+  bottom: auto;
+  top: calc(100% + 8px);
+  left: 0;
+  transform: translateY(-4px);
+}
+.tooltip--bottom-start:hover .tooltip__bubble,
+.tooltip--bottom-start:focus-within .tooltip__bubble {
   transform: none;
 }
 
@@ -2275,16 +2290,19 @@
 
 /* ================================================================ toasts */
 /* §6.8.10: ink surface, bottom-right (desktop) / bottom-center above the tab bar (phone), max 3 */
+/* JS (useToasterPlacement) lifts the stack above docked controls via --toaster-bottom / --toaster-right;
+   the toaster itself never takes clicks — only the toasts do. */
 .toaster {
   position: fixed;
   z-index: var(--z-toast);
-  right: 24px;
-  bottom: 24px;
+  right: var(--toaster-right, 24px);
+  bottom: var(--toaster-bottom, 24px);
   display: flex;
   flex-direction: column-reverse;
   gap: var(--s-3);
-  width: 360px;
+  width: min(360px, calc(100vw - 48px));
   pointer-events: none;
+  transition: bottom var(--d-base) var(--ease-standard), right var(--d-base) var(--ease-standard);
 }
 
 @media (max-width: 599px) {
@@ -2292,10 +2310,7 @@
     left: 16px;
     right: 16px;
     width: auto;
-    bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom) + 12px);
-  }
-  .fullscreen ~ .toaster {
-    bottom: calc(env(safe-area-inset-bottom) + 88px);
+    bottom: var(--toaster-bottom, calc(var(--tabbar-h) + env(safe-area-inset-bottom) + 12px));
   }
 }
 
@@ -3254,4 +3269,188 @@ button.list__row {
 
 .list__chevron {
   color: var(--text-disabled);
+}
+
+/* ================================================================ «Подробнее» (technical details) */
+.tech-details {
+  margin-top: 6px;
+  font-size: var(--fs-caption);
+  line-height: var(--lh-caption);
+  color: var(--text-3);
+}
+.tech-details > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 24px;
+  cursor: pointer;
+  list-style: none;
+  color: var(--text-3);
+  font-weight: var(--weight-medium);
+  border-radius: var(--r-xs);
+}
+.tech-details > summary::-webkit-details-marker {
+  display: none;
+}
+.tech-details > summary:hover {
+  color: var(--text-2);
+}
+.tech-details__chev {
+  transition: transform var(--d-fast) var(--ease-standard);
+}
+.tech-details[open] .tech-details__chev {
+  transform: rotate(90deg);
+}
+.tech-details__text {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  max-height: 160px;
+  overflow: auto;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 16px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-2);
+  text-align: left;
+}
+.empty .tech-details {
+  margin-top: var(--s-2);
+}
+
+.toast__more {
+  margin-top: 2px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  opacity: 0.7;
+  font-size: var(--fs-caption);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.toast__more:hover {
+  opacity: 1;
+}
+.toast__details {
+  margin: 6px 0 0;
+  max-height: 120px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 15px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  opacity: 0.8;
+}
+
+/* ================================================================ number field + its range message */
+.numfield {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  min-width: 0;
+}
+.numfield__error {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  color: var(--red-text);
+  font-size: var(--fs-caption);
+  line-height: var(--lh-caption);
+  text-align: left;
+}
+.numfield__error svg {
+  flex: none;
+  margin-top: 1px;
+}
+
+/* ================================================================ touch targets ≥ 44 px (brief §2.10, P1-15) */
+@media (pointer: coarse) {
+  .btn--sm {
+    --btn-h: 44px;
+  }
+  .icon-btn,
+  .icon-btn--sm {
+    --size: 44px;
+  }
+  .switch--sm {
+    --w: 44px;
+    --h: 26px;
+    --t: 22px;
+  }
+  .help-btn {
+    width: 44px;
+    height: 44px;
+    margin: -12px;
+  }
+  .segmented__item {
+    min-height: 44px;
+  }
+  .chip {
+    min-height: 44px;
+  }
+  .toast__action,
+  .toast__close {
+    min-height: 44px;
+    min-width: 44px;
+  }
+  .tech-details > summary {
+    min-height: 44px;
+  }
+}
+.toast__action--quiet {
+  background: transparent !important;
+  color: inherit !important;
+  opacity: 0.8;
+}
+.toast__action--quiet:hover {
+  opacity: 1;
+}
+
+/* ≥1280 px: the deal drawer is a side panel — the list next to it stays usable (brief §4.2, P2-15) */
+.overlay--panel {
+  background: transparent !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  pointer-events: none;
+}
+.overlay--panel > .drawer {
+  pointer-events: auto;
+  box-shadow: var(--shadow-lg);
+  border-left: 1px solid var(--border);
+}
+
+/* touch: invisible hit extenders — the control keeps its look, the finger gets 44 px (P1-15) */
+@media (pointer: coarse) {
+  .switch::after,
+  .ext-link::after,
+  .page-header__back::after,
+  .input__btn::after {
+    content: "";
+    position: absolute;
+    z-index: 1;
+    inset: -12px -6px;
+  }
+  .input--sm,
+  .select--sm {
+    --h: 44px;
+  }
+  .segmented--sm .segmented__item {
+    min-height: 44px;
+  }
+  .ext-link,
+  .page-header__back,
+  .input__btn {
+    position: relative;
+  }
+  .input__btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
 }

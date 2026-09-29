@@ -1528,3 +1528,101 @@
     width: 100%;
   }
 }
+
+/* ================================================================ fix pass (UX report) */
+/* P2-2: a skipped optional step gets a neutral dash, not a green check */
+.onb-stepper__item.is-skipped button {
+  color: var(--text-2);
+}
+.onb-stepper__item.is-skipped .onb-stepper__dot {
+  background: var(--surface-3);
+  border-color: var(--border-strong);
+  color: var(--text-2);
+}
+
+/* P1-9: impossible thresholds */
+.example-box--warn {
+  background: var(--amber-bg);
+  border-color: var(--amber-border);
+}
+.example-box--warn .example-box__title {
+  color: var(--amber-text);
+}
+.mini-field__warn {
+  color: var(--amber-text);
+  font-size: var(--fs-caption);
+  line-height: var(--lh-caption);
+}
+
+/* P2-4: the fees line keeps its icon, text and help together */
+.fees-line {
+  flex-wrap: nowrap;
+  align-items: flex-start;
+}
+.fees-line > svg {
+  flex: none;
+  margin-top: 2px;
+}
+.fees-line .popover-anchor {
+  margin-top: -1px;
+}
+
+.wish-suggest__hint {
+  margin: -2px 0 8px;
+  color: var(--text-3);
+  font-size: var(--fs-caption);
+}
+
+/* P0-1: «Заменить текущие поиски или добавить к ним?» */
+.done__replace {
+  margin-top: var(--s-7);
+}
+.done__replace .done__next-title {
+  margin-top: 0;
+}
+.done__replace-sub {
+  margin: calc(-1 * var(--s-2)) 0 var(--s-4);
+  color: var(--text-2);
+  font-size: var(--fs-body-sm);
+}
+
+/* P1-15 / P2-3: phone — «Назад» sits in the bottom bar next to «Дальше»; sticky bars are opaque */
+@media (max-width: 599px) {
+  .onb-progress {
+    padding-left: var(--s-5);
+    background: var(--surface-1);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+  .onb-footer {
+    background: var(--surface-1);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+  .onb-footer__back {
+    flex: none;
+    width: 48px;
+    height: 48px;
+  }
+  .onb-progress__skip {
+    min-height: 44px;
+  }
+}
+@media (pointer: coarse) {
+  .alt-link,
+  .summary-row__edit,
+  .disclosure {
+    min-height: 44px;
+  }
+}
+.chip__hint {
+  color: var(--text-3);
+  font-weight: var(--weight-regular, 400);
+}
+.done__plan {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  color: var(--text-2);
+}

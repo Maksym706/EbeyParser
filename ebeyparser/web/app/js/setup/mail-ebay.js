@@ -22,7 +22,17 @@ export function EmailConnect({ initial = {}, onDone }) {
   const [port, setPort] = useState(587);
   const [state, setState] = useState({ state: "idle" });
   const preset = MAIL_PRESETS[provider];
+  const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
   const run = async () => {
+    // obvious mistakes are caught here, next to the field (P0-6)
+    const fields = {};
+    if (!EMAIL_RE.test(email.trim())) fields.username = "Это не похоже на адрес почты — например, me@gmail.com";
+    if (to.trim() && !to.split(/[,;\s]+/).filter(Boolean).every((a) => EMAIL_RE.test(a))) fields.to_addrs = "Это не похоже на адрес почты";
+    if (provider === "other" && !host.trim()) fields.smtp_host = "Укажи адрес сервера, например smtp.example.com";
+    if (Object.keys(fields).length) {
+      setState({ state: "idle", fields });
+      return;
+    }
     setState({ state: "loading" });
     try {
       const res = await api.post(
@@ -40,8 +50,12 @@ export function EmailConnect({ initial = {}, onDone }) {
       setState({ state: "ok", message: res.message_ru });
       onDone && onDone(res);
     } catch (e) {
-      const gmail = provider === "gmail" && /auth|password|535|534|Username/i.test(e.message);
-      setState({ state: "fail", message: gmail ? "Gmail не пустил: нужен «пароль приложения», а не обычный пароль" : e.message, fields: e.fields || {} });
+      const raw = `${e.message} ${e.details || ""}`;
+      const gmail = provider === "gmail" && /auth|password|535|534|Username/i.test(raw);
+      const fields = {};
+      for (const [k, v] of Object.entries(e.fields || {})) fields[k.split(".").pop()] = v;
+      if (fields.to_addrs) fields.to_addrs = "Это не похоже на адрес почты";
+      setState({ state: "fail", message: gmail ? "Gmail не пустил: нужен «пароль приложения», а не обычный пароль" : e.message, details: e.details, fields });
     }
   };
   const f = state.fields || {};
@@ -53,7 +67,7 @@ export function EmailConnect({ initial = {}, onDone }) {
     html`<p class="substep__text">Gmail пускает программы только по «паролю приложения»: открой <${ExternalLink} href=${LINKS.googleAppPasswords}>страницу паролей приложений<//>, создай пароль с любым названием и скопируй 16 букв.</p>`}
     <div class="form-grid">
       <${Field} label="Твой адрес" error=${f.username}>
-        ${(id) => html`<${Input} id=${id} type="email" value=${email} onChange=${setEmail} placeholder="me@gmail.com" autocomplete="email" />`}
+        ${(id) => html`<${Input} id=${id} type="email" value=${email} onChange=${setEmail} placeholder="me@gmail.com" autocomplete="email" invalid=${Boolean(f.username)} />`}
       <//>
       <${Field} label=${provider === "gmail" ? "Пароль приложения" : "Пароль"} error=${f.password} help=${initial.password_set ? "Пароль уже сохранён — оставь пустым, чтобы не менять" : ""}>
         ${(id) => html`<${SecretInput} id=${id} value=${password} onChange=${setPassword} placeholder=${provider === "gmail" ? "abcd efgh ijkl mnop" : ""} saved=${initial.password_set} />`}
@@ -64,15 +78,15 @@ export function EmailConnect({ initial = {}, onDone }) {
       <${Field} label="SMTP-сервер" error=${f.smtp_host}>${(id) => html`<${Input} id=${id} value=${host} onChange=${setHost} placeholder="smtp.example.com" />`}<//>
       <${Field} label="Порт" help="587 — STARTTLS, 465 — SSL">${(id) => html`<${NumberInput} id=${id} value=${port} onChange=${(v) => setPort(v || 587)} />`}<//>
     </div>`}
-    <${Field} label="Куда присылать" optional help="По умолчанию — на этот же адрес">
-      ${(id) => html`<${Input} id=${id} value=${to} onChange=${setTo} placeholder=${email || "me@gmail.com"} />`}
+    <${Field} label="Куда присылать" optional error=${f.to_addrs} help="По умолчанию — на этот же адрес">
+      ${(id) => html`<${Input} id=${id} type="email" value=${to} onChange=${setTo} placeholder=${email || "me@gmail.com"} invalid=${Boolean(f.to_addrs)} />`}
     <//>
     <div class="row">
       <${Button} variant="primary" icon="mail-check" loading=${state.state === "loading"} disabled=${!email.trim() || (!password && !initial.password_set)} onClick=${run}>Проверить и сохранить<//>
     </div>
-    ${state.state === "loading" && html`<${TestResult} state="loading" title="Отправляю тестовое письмо…" />`}
+    ${state.state === "loading" && html`<${TestResult} state="loading" title="Отправляю тестовое письмо…" detail="Обычно это занимает до 30 секунд" />`}
     ${state.state === "ok" && html`<${TestResult} state="ok" title=${state.message} detail="Почта включена — уведомления будут приходить и туда" />`}
-    ${state.state === "fail" && html`<${TestResult} state="fail" title=${state.message} />`}
+    ${state.state === "fail" && html`<${TestResult} state="fail" title=${state.message} details=${state.details} />`}
   </div>`;
 }
 
@@ -88,7 +102,7 @@ export function EbayConnect({ initial = {}, onDone }) {
       setState({ state: "ok", message: res.message_ru, warning: res.warning_ru });
       onDone && onDone(res);
     } catch (e) {
-      setState({ state: "fail", message: e.message, fields: e.fields || {} });
+      setState({ state: "fail", message: e.message, details: e.details, fields: e.fields || {} });
     }
   };
   const f = state.fields || {};
@@ -117,6 +131,6 @@ export function EbayConnect({ initial = {}, onDone }) {
     </div>
     ${state.state === "loading" && html`<${TestResult} state="loading" title="Спрашиваю eBay…" />`}
     ${state.state === "ok" && html`<${TestResult} state="ok" title=${state.message} detail=${state.warning || "Ключи сохранены"} />`}
-    ${state.state === "fail" && html`<${TestResult} state="fail" title=${state.message} />`}
+    ${state.state === "fail" && html`<${TestResult} state="fail" title=${state.message} details=${state.details} />`}
   </div>`;
 }

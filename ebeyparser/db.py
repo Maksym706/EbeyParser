@@ -6,6 +6,7 @@ calls are quick, so the async code calls these methods directly.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import sqlite3
@@ -24,6 +25,9 @@ from .models import (
     utcnow,
 )
 from .pricing.text import history_anchor_words, normalize, price_point_words
+from .timefmt import date_label
+
+log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS listings (
@@ -600,7 +604,7 @@ class Database:
             seen = datetime.fromisoformat(r["seen_at"])
             out.append((
                 Comparable(title=r["title"], price=r["price"], url=r["url"], source=r["source"],
-                           sold=bool(r["sold"]), date_text=seen.strftime("%d.%m.%Y")),
+                           sold=bool(r["sold"]), date_text=date_label(seen)),
                 seen,
             ))
         return out
@@ -635,7 +639,7 @@ class Database:
             seen = datetime.fromisoformat(r["seen_at"])
             out.append((
                 Comparable(title=r["title"], price=r["price"], url=r["url"], source=r["source"],
-                           sold=bool(r["sold"]), date_text=seen.strftime("%d.%m.%Y")),
+                           sold=bool(r["sold"]), date_text=date_label(seen)),
                 seen,
             ))
         return out
@@ -677,7 +681,7 @@ class Database:
     @staticmethod
     def _point_comparable(r: sqlite3.Row, seen: datetime) -> Comparable:
         return Comparable(title=r["title"], price=r["price"], url=r["url"], source=r["source"],
-                          sold=bool(r["sold"]), date_text=seen.strftime("%d.%m.%Y"))
+                          sold=bool(r["sold"]), date_text=date_label(seen))
 
     def prune_price_points(self, days: float | None = None, *, before: datetime | None = None) -> int:
         """Delete price points not seen for `days` days (or since `before`). Returns the count."""
@@ -917,6 +921,25 @@ class Database:
                   " julianday(json_extract(l.data, '$.ends_at')) ASC, l.first_seen DESC",
         "updated": "COALESCE(s.updated_at, l.first_seen) DESC, l.first_seen DESC",
     }
+    # what to do with a deal, never "": the SQL twin of web.api.presenters.derive_action (an
+    # auction is always "bid", buy + offer on a VB / best-offer ad -> "haggle", buy -> "buy",
+    # maybe -> "watch", skip -> "skip"; a stored action wins, except "buy"/"haggle" on an auction)
+    _AUCTION_SQL = "COALESCE(json_extract(l.data, '$.buying_options'), '[]') LIKE '%\"AUCTION\"%'"
+    ACTION_SQL = (
+        "(CASE"
+        " WHEN e.ad_id IS NULL THEN 'watch'"
+        " WHEN COALESCE(json_extract(e.data, '$.action'), '') != '' THEN"
+        f"  CASE WHEN json_extract(e.data, '$.action') IN ('buy', 'haggle') AND {_AUCTION_SQL} THEN 'bid'"
+        "  ELSE json_extract(e.data, '$.action') END"
+        " WHEN e.verdict = 'skip' THEN 'skip'"
+        f" WHEN {_AUCTION_SQL} THEN"
+        "  CASE WHEN COALESCE(json_extract(e.data, '$.max_buy_price'), 0) > 0 THEN 'bid' ELSE 'watch' END"
+        " WHEN e.verdict = 'buy' AND json_extract(e.data, '$.offer_price') IS NOT NULL"
+        "  AND (COALESCE(json_extract(l.data, '$.negotiable'), 0) = 1"
+        "   OR COALESCE(json_extract(l.data, '$.buying_options'), '[]') LIKE '%\"BEST_OFFER\"%') THEN 'haggle'"
+        " WHEN e.verdict = 'buy' THEN 'buy'"
+        " ELSE 'watch' END)"
+    )
     _API_DEAL_SELECT = (
         "SELECT l.data AS l_data, e.data AS e_data, s.status AS status, s.note AS note,"
         " s.bought_price AS bought_price, s.bought_at AS bought_at, s.sold_price AS sold_price,"
@@ -1042,9 +1065,9 @@ class Database:
                 parts.append("e.ad_id IS NULL")
             where.append("(" + " OR ".join(parts) + ")")
         if actions:
-            among("json_extract(e.data, '$.action')", actions)
+            among(Database.ACTION_SQL, actions)
         if actionable:  # worth acting on: a "buy" verdict or a buy / haggle / bid action
-            where.append("(e.verdict = 'buy' OR json_extract(e.data, '$.action') IN ('buy', 'haggle', 'bid'))")
+            where.append(f"(e.verdict = 'buy' OR {Database.ACTION_SQL} IN ('buy', 'haggle', 'bid'))")
         if statuses:
             among("COALESCE(s.status, 'new')", statuses)
         elif not include_ignored:
@@ -1176,7 +1199,7 @@ class Database:
                 "SELECT evaluated_at FROM evaluations WHERE evaluated_at >= ?", (s,))],
             "deals": [tuple(r) for r in self._query(
                 "SELECT l.first_seen, e.verdict, e.purpose, e.profit, COALESCE(st.status, 'new'),"
-                " COALESCE(json_extract(e.data, '$.action'), '')"
+                f" {self.ACTION_SQL}"
                 " FROM evaluations e JOIN listings l ON l.ad_id = e.ad_id"
                 " LEFT JOIN deal_state st ON st.ad_id = e.ad_id"
                 " WHERE e.verdict IN ('buy', 'maybe') AND l.first_seen >= ?", (s,))],
@@ -1270,6 +1293,11 @@ class Database:
             except Exception:
                 self._conn.rollback()
                 raise
+            try:  # give the space back: "delete everything" must not make the file bigger
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                self._conn.execute("VACUUM")
+            except sqlite3.Error as exc:  # e.g. another connection is reading: harmless
+                log.info("VACUUM after reset skipped: %s", exc)
         return counts
 
     def backup_to(self, target: str | Path) -> None:

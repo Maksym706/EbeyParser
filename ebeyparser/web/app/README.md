@@ -105,13 +105,20 @@ api.url("/backup", { include_secrets: 1 })     // for <a href download>
 ```
 
 - Errors are thrown as `ApiError` with:
-  - `.message`: Russian text you can show as is
+  - `.message`: Russian text you can show as is. It passes through `humanize()` (a safety net): a text that
+    still carries a CLI command, a config file name, an exception class or a local URL becomes a calm Russian
+    sentence with a next step
+  - `.details`: the technical text (the server's `error.details` or what `humanize()` replaced). Show it only
+    collapsed: `<Details text=${e.details} />`, `Banner details=…`, `TestResult details=…`,
+    `toast.error(e)` (adds «Подробнее» by itself)
   - `.status`, `.code`
   - `.fields`: `{ "pricing.min_profit": "не меньше 0" }`; use `err.field("min_profit")` for one field
   - `.missing`: the endpoint doesn't exist
   - `.network`: the program isn't reachable
 - Network failures also flip `appStore.connection` to `"offline"`, and the shell shows the offline banner by
   itself. Don't add your own.
+- Texts from non-throwing results (`{ ok: false, error_ru }`, run errors, health problems) go through
+  `humanize(localizeText(text))` → `{ message, details }` before they are shown.
 - Auth: same-origin cookie. A `?token=` in the page URL is kept in sessionStorage and sent as
   `X-EbeyParser-Token`.
 - `useAsync(fn, deps)` returns `{ data, error, loading, reload, setData }`. Also available: `useDebounced`,
@@ -152,9 +159,9 @@ api.url("/backup", { include_secrets: 1 })     // for <a href download>
 |---|---|
 | Actions | `Button` (variant `primary · secondary · ghost · danger · danger-ghost · tinted` + `tone`, `link`; size `sm 32 · md 40 · lg 48`; `icon`, `iconRight`, `loading`, `block`, `href`), `IconButton` (`label` required → aria + tooltip; `badge`), `CopyButton` (check-mark feedback) |
 | Display | `Card`, `CardHeader`, `Badge` (tone, `soft · solid · outline`, sizes), `Chip` (filter chip; selected = ink + check), `Glyph` (tinted icon tile), `Avatar`, `Money` (tabular, `sign`, `tone="auto"`), `StatusDot` (pulse), `Kbd`, `Divider`, `ExternalLink`, `Icon`, `QrCode` |
-| Forms | `Field` (label, help, error, optional; render-prop `(id) => …`), `Input` (`icon`, `prefix`, `suffix`, `trailing`), `NumberInput` (comma decimals, returns numbers/null), `SecretInput` (eye toggle, "сохранён" placeholder), `Textarea`, `Select`, `Toggle` (switch; with `label`/`description` → full row), `Checkbox`, `Slider` (discrete `steps` with ticks, `bubble="drag·always·none"`, `marks`, `tone`), `Segmented`, `NumberStepper`, `Autocomplete`, `ChipInput` (word lists), `ChoiceCards` (radio cards), `SettingRow` (label left, control right), `TestResult` (loading/ok/warn/fail line for «Проверить»), `SaveState` |
-| Feedback | `toast(...)` / `toast.success/error/warning/info/promise`, `Banner` (tones), `Progress` (determinate / indeterminate), `Ring`, `Meter` (load bar: green < 60 %, amber, red > 85 %, `marker`), `Checklist`, `Steps`, `Skeleton` (`variant="card"·"row"`), `EmptyState`, `ErrorState` |
-| Overlays | `Modal` (bottom sheet on phones), `Drawer` (right drawer ≥ 600 px, bottom sheet with drag-to-close on phones), `await confirm({ title, message, confirmLabel, tone: "danger" })`, `Tooltip`, `HelpTip` («?» popover, click/touch), `Portal` |
+| Forms | `Field` (label, help, error, optional; render-prop `(id) => …`), `Input` (`icon`, `prefix`, `suffix`, `trailing`), `NumberInput` (comma decimals, returns numbers/null; `min`/`max` are **never clamped** — an out-of-range value shows «Можно от 0 до 50 %» under the field; `showFieldErrors(root)` before saving), `SecretInput` (eye toggle, "сохранён" placeholder), `Textarea`, `Select`, `Toggle` (switch; with `label`/`description` → full row), `Checkbox`, `Slider` (discrete `steps` with ticks, `bubble="drag·always·none"`, `marks`, `tone`), `Segmented`, `NumberStepper`, `Autocomplete`, `ChipInput` (word lists), `ChoiceCards` (radio cards), `SettingRow` (label left, control right), `TestResult` (loading/ok/warn/fail line for «Проверить»), `SaveState` |
+| Feedback | `toast(...)` / `toast.success/error/warning/info/promise`, `Banner` (tones, `details`), `Details` (collapsed «Подробнее»), `Progress` (determinate / indeterminate), `Ring`, `Meter` (load bar: green < 60 %, amber, red > 85 %, `marker`), `Checklist`, `Steps`, `Skeleton` (`variant="card"·"row"`), `EmptyState`, `ErrorState` |
+| Overlays | `Modal` (bottom sheet on phones), `Drawer` (right drawer ≥ 600 px, bottom sheet with drag-to-close on phones; `modal={false}` = side panel without scrim, `restoreFocus(prev)` = where focus goes on close), `await confirm({ title, message, confirmLabel, tone: "danger" })`, `Tooltip`, `HelpTip` («?» popover, click/touch), `Portal` |
 | Layout | `PageHeader`, `Section`, `KeyValue`, `Stat`, `Tabs` (`line · pills`) |
 
 Details:
@@ -162,7 +169,9 @@ Details:
 - **Tones:** components accept the brief's hues (`green · amber · violet · red · blue · neutral`) or the meanings
   (`profit · haggle · bid · danger · info`). `lib/tones.js` has `hue()`, `verdictTone()` and `DECISION_ICONS`.
 - **Toasts:** use `toast({ kind: "deal" | "success" | …, title, message, action: { label, href | onClick },
-  duration })`.
+  action2, details, duration })`. The stack moves itself above docked controls (drawer / sheet / dialog
+  footers, the phone deal action bar, the settings save bar, the tab bar, the onboarding footer) and beside
+  an open side drawer, so a toast never covers a button.
   - Durations: 4 s plain, 6 s with an action, 8 s for errors.
   - At most 3 are shown at once, newest on top.
   - For undo: `toast.success("Скрыто", { action: { label: "Отменить", onClick: undo } })`.
@@ -176,6 +185,10 @@ Details:
   - `percent(0.38)` → «38 %»
   - `plural`, `count(3, "поиск", "поиска", "поисков")`
   - `ago`, `until`, `span`, `dateTime`, `bytes`
+  - every time is **Europe/Berlin**, whatever the browser's zone: `clockTime` «21:34», `whenTime` «завтра в 08:10»,
+    `untilTime` «завтра 03:10» (for «пауза до …»), `dateShort` «15.09», `berlinDay` (for `<input type=date>`),
+    `localizeText` (ISO timestamps inside server texts → «21:34»). Never print raw ISO; prefer a server
+    `*_label` field when there is one
   - `everyLabel(30)` → «каждые 30 мин»
   - `radiusLabel`
 - **Theme:** `lib/theme.js` exports `setTheme("system" | "light" | "dark")`, `toggleTheme()` and `themeStore`.
@@ -196,8 +209,11 @@ Details:
   - Z-index: `--z-*`.
 - **Typography:** prices and counters use `.num` / `.money` (tabular numbers). Prefer the type classes
   (`.t-h2`, `.t-caption`, `.price-lg`) or the `--fs-*` / `--lh-*` tokens.
-- **Touch and motion:** 44 px touch targets on coarse pointers (the tokens handle controls). All animations
-  respect `prefers-reduced-motion` globally.
+- **Touch and motion:** 44 px touch targets on coarse pointers (the tokens and `@media (pointer: coarse)` rules
+  handle controls; small inline controls get an invisible `::after` hit extender). All animations respect
+  `prefers-reduced-motion` globally; JS scrolling uses `behavior: "smooth"` only when motion is allowed.
+- **Ids:** use `useId` from `lib/html.js` (unique across render roots — Portals are separate roots, where
+  Preact's own `useId` repeats and `<label for>` would point at the page underneath).
 
 ## Testing & QA
 

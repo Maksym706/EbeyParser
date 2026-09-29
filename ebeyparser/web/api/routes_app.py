@@ -20,6 +20,8 @@ from ...scraper.categories import RADIUS_CHOICES, answers_from_searches, scan_na
 from ..security import COOKIE_MAX_AGE, COOKIE_NAME, TOKEN_FILE, TOKEN_PARAM, ensure_token, is_loopback, local_addresses
 from .context import BOOTSTRAPPED_KEY, ONBOARDING_DRAFT_KEY, ONBOARDING_STEPS, ApiContext, dig, get_ctx
 from .errors import ApiError, validation_error
+from .locations import place_label
+from ...timefmt import when_label
 from .presenters import iso, search_ids
 from .schemas import (
     ERRORS,
@@ -63,7 +65,7 @@ RANGES: dict[str, tuple[float | None, float | None]] = {
     "pricing.selling_fee_percent": (0, 50),
     "pricing.payment_fee_percent": (0, 50),
     "pricing.default_shipping_cost": (0, 1000),
-    "pricing.safety_margin_percent": (0, 90),
+    "pricing.safety_margin_percent": (0, 50),
     "pricing.asking_price_discount": (0.1, 1.5),
     "pricing.comps_limit": (1, 200),
     "pricing.vb_expected_discount": (0, 0.9),
@@ -88,6 +90,19 @@ RANGES: dict[str, tuple[float | None, float | None]] = {
     "notifications.heartbeat_hour": (0, 23),
     "notifications.email.smtp_port": (1, 65535),
     "web.port": (1, 65535),
+}
+# a clearer message than "не меньше 0" for the money / percent settings
+RANGE_MESSAGES: dict[str, str] = {
+    "pricing.min_profit": "Прибыль не может быть отрицательной",
+    "pricing.min_roi": "ROI — от 0 до 1000 %",
+    "pricing.safety_margin_percent": "Запас на торг и риск — от 0 до 50 %",
+    "pricing.selling_fee_percent": "Комиссия — от 0 до 50 %",
+    "pricing.payment_fee_percent": "Комиссия — от 0 до 50 %",
+    "pricing.default_shipping_cost": "Доставка — от 0 до 1000 €",
+    "pricing.max_capital": "Бюджет должен быть больше нуля",
+    "pricing.paypal_fixed_fee": "Комиссия — от 0 до 100 €",
+    "general.min_listing_price": "Цена не может быть отрицательной",
+    "general.interval_minutes": "Проверять можно не чаще раза в 5 минут и не реже раза в сутки",
 }
 
 
@@ -149,8 +164,8 @@ def settings_view(ctx: ApiContext) -> dict[str, Any]:
         "editable": ctx.config_path is not None and ctx.config_writable(),
         "config_path": str(ctx.config_path) if ctx.config_path else None,
         "env_path": str(ctx.env_path) if ctx.env_path else None,
-        "region": {"location": answers.location, "radius_km": answers.radius_km,
-                   "radius_choices": list(RADIUS_CHOICES)},
+        "region": {"location": answers.location, "location_label": place_label(answers.location),
+                   "radius_km": answers.radius_km, "radius_choices": list(RADIUS_CHOICES)},
         **{section: dump[section] for section in SECTIONS},
         "secrets": ctx.secrets_status(),
         "channels": {
@@ -171,9 +186,14 @@ def _problems(cfg: AppConfig, keys: list[str]) -> dict[str, str]:
         if bounds and isinstance(value, (int, float)) and not isinstance(value, bool):
             low, high = bounds
             if low is not None and value < low:
-                problems[key] = f"не меньше {low:g}"
+                problems[key] = RANGE_MESSAGES.get(key, f"не меньше {low:g}")
             elif high is not None and value > high:
-                problems[key] = f"не больше {high:g}"
+                problems[key] = RANGE_MESSAGES.get(key, f"не больше {high:g}")
+    if "general.timezone" in keys:
+        from ...timefmt import is_valid_timezone
+
+        if not is_valid_timezone(cfg.general.timezone):
+            problems["general.timezone"] = "Неизвестный часовой пояс — например, Europe/Berlin"
     ai = cfg.ai
     touched = set(keys)
     if touched & {"ai.base_url", "ai.provider", "ai.enabled"} and ai.provider != "anthropic":
@@ -195,14 +215,17 @@ def _problems(cfg: AppConfig, keys: list[str]) -> dict[str, str]:
 
     missing = missing_settings(cfg.notifications)
     if "notifications.telegram.enabled" in touched and missing.get("telegram"):
-        problems["notifications.telegram.enabled"] = "сначала подключи бота: нужен токен и chat_id"
+        problems["notifications.telegram.enabled"] = "Сначала подключи бота: вставь его ключ и нажми Start в Telegram"
     if "notifications.email.enabled" in touched and missing.get("email"):
-        problems["notifications.email.enabled"] = "сначала заполни почту: не хватает " + ", ".join(missing["email"])
+        labels = {"smtp_host": "почтовый сервер", "smtp_port": "порт", "username": "адрес почты",
+                  "password": "пароль приложения", "from_addr": "отправитель", "to_addrs": "куда слать"}
+        problems["notifications.email.enabled"] = ("Сначала заполни почту: не хватает "
+                                                   + ", ".join(labels.get(m, m) for m in missing["email"]))
     if "web.host" in touched and not cfg.web.host.strip():
         problems["web.host"] = "укажи адрес, например 127.0.0.1"
     if "ai.second_opinion.enabled" in touched and ai.second_opinion.enabled and ai.second_opinion.provider == "anthropic" \
             and not ai.second_opinion.api_key:
-        problems["ai.second_opinion.enabled"] = "нужен ключ Claude (anthropic_api_key)"
+        problems["ai.second_opinion.enabled"] = "Сначала вставь ключ Claude (Anthropic)"
     return problems
 
 
@@ -223,8 +246,8 @@ def patch_settings(ctx: ApiContext, patch: dict[str, Any]) -> dict[str, Any]:
             continue
         for key, value in _flatten(values, section).items():
             if key in READ_ONLY_KEYS:
-                errors[key] = ("секрет — меняется через PUT /api/v1/secrets" if key != "general.data_dir"
-                               else "меняется только в config.yaml (нужен перезапуск)")
+                errors[key] = ("Ключи и пароли меняются на своих экранах подключения" if key != "general.data_dir"
+                               else "Папку с данными отсюда поменять нельзя")
             elif not _known_key(current, key):
                 errors[key] = "неизвестная настройка"
             else:
@@ -296,7 +319,10 @@ def _patch_region(ctx: ApiContext, region: Any) -> list[str]:
 
 
 # --------------------------------------------------------------------- app
-def _learning(ctx: ApiContext) -> dict[str, Any]:
+def _learning(ctx: ApiContext, mon: dict[str, Any] | None = None) -> dict[str, Any]:
+    """First passes of new searches only learn prices. `mon` (monitor_view without learning):
+    the message then says honestly when the first alerts can come — after the next check (at
+    HH:MM), after a site's pause, or only after «Проверить сейчас» when automatic checks are off."""
     cfg = ctx.config
     stats = ctx.db.search_stats()
     enabled = [(s, sid) for s, sid in zip(cfg.searches, search_ids(cfg.searches)) if s.enabled]
@@ -319,12 +345,52 @@ def _learning(ctx: ApiContext) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         pass
     message = ""
+    eta_at: Any = None
     if learning and total:
         learned = sum(1 for s in learning if s["state"] == "learned")
-        message = (f"Изучаю рынок: {total - len(learning) + learned} из {total} поисков · собрано {points} цен."
-                   " Первые уведомления — после следующей проверки.")
+        done = total - len(learning) + learned
+        if done:
+            head = f"Изучаю рынок: готово {done} из {total} · собрано {points} {_prices_word(points)}"
+        elif points:
+            head = f"Изучаю рынок · собрано {points} {_prices_word(points)}"
+        else:
+            head = "Изучаю рынок — первая проверка ещё впереди"
+        tail, eta_at = _first_alerts(mon)
+        message = f"{head}. {tail}"
     return {"baseline_first_run": cfg.general.baseline_first_run, "learning": bool(learning), "searches": learning,
-            "enabled_searches": total, "price_points": points, "message_ru": message}
+            "enabled_searches": total, "price_points": points, "message_ru": message,
+            "first_alerts_at": iso(eta_at), "first_alerts_label": when_label(eta_at) if eta_at else ""}
+
+
+def _prices_word(n: int) -> str:
+    from ...scraper.categories import _plural
+
+    return _plural(n, "цена", "цены", "цен")
+
+
+def _first_alerts(mon: dict[str, Any] | None) -> tuple[str, Any]:
+    """('Первые уведомления — после паузы, около 21:40', when) for the learning note."""
+    from datetime import datetime
+
+    if not mon:
+        return "Первые уведомления — после следующей проверки.", None
+    if not mon.get("available") or mon.get("state") == "stopped":
+        return "Автопроверка выключена — первые уведомления после проверок по кнопке «Проверить сейчас».", None
+    if mon.get("paused"):
+        return "Проверки на паузе — продолжи их, чтобы пошли уведомления.", None
+    candidates = []
+    for raw in ((mon.get("cooldown") or {}).get("until"), mon.get("next_run_at")):
+        if raw:
+            try:
+                candidates.append(datetime.fromisoformat(str(raw)))
+            except ValueError:
+                pass
+    when = max(candidates) if candidates else None
+    if mon.get("cooldown") and when is not None:
+        return f"Первые уведомления — после паузы, около {when_label(when)}.", when
+    if when is not None:
+        return f"Первые уведомления — после следующей проверки, около {when_label(when)}.", when
+    return "Первые уведомления — после следующей проверки.", None
 
 
 def onboarding_view(ctx: ApiContext) -> dict[str, Any]:
@@ -350,7 +416,9 @@ def onboarding_view(ctx: ApiContext) -> dict[str, Any]:
                       "skipped": key in skipped and not done})
     next_step = next((s["key"] for s in steps if not s["done"] and not s["skipped"]), None)
     return {"steps": steps, "completed_at": state["completed_at"], "next_step": next_step,
-            "required_done": all(s["done"] for s in steps if s["required"])}
+            "required_done": all(s["done"] for s in steps if s["required"]),
+            # a re-run of the wizard asks «Заменить текущие поиски или добавить?» when > 0
+            "existing_searches": len(searches), "existing_search_names": [s.name for s in searches]}
 
 
 def is_onboarded(ctx: ApiContext, view: dict[str, Any] | None = None) -> bool:
@@ -392,11 +460,13 @@ async def app_info(ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
     from ...runtime import pillow_missing
     from ...notify.base import missing_settings
 
+    from .routes_monitor import monitor_view
+
     cfg = ctx.config
     view = onboarding_view(ctx)
     mon = ctx.monitor
     missing = missing_settings(cfg.notifications)
-    next_run = getattr(mon, "next_run_at", None)
+    mon_view = await monitor_view(ctx, with_hosts=False)
     demo = demo_count(ctx)
     token_mode = bool(getattr(ctx.app.state, "access_token", None))
     return {
@@ -406,7 +476,7 @@ async def app_info(ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
         "config_writable": ctx.config_writable(),
         "config_path": str(ctx.config_path) if ctx.config_path else None,
         "onboarding": view,
-        "first_run": _learning(ctx),
+        "first_run": mon_view["learning"],
         "features": {
             "monitor": mon is not None and hasattr(mon, "run_once"),
             "pause": callable(getattr(mon, "pause", None)),
@@ -427,12 +497,9 @@ async def app_info(ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
             "listings": ctx.db.count_deals_v1(include_ignored=True),
             "deals_good": ctx.db.count_deals_v1(verdicts=["buy", "maybe"]),
         },
-        "monitor": {
-            "available": mon is not None,
-            "running": bool(getattr(mon, "is_running", False)),
-            "paused": bool(getattr(mon, "paused", False)),
-            "next_run_at": iso(next_run) if next_run is not None and hasattr(next_run, "isoformat") else None,
-        },
+        "monitor": {k: mon_view[k] for k in ("available", "running", "paused", "loop", "state", "state_ru",
+                                             "next_run_at", "next_run_label", "cooldown")},
+        "timezone": cfg.general.timezone,
         "access": {"token_required": token_mode,
                    "bind_host": ctx.bind_host if ctx.bind_host is not None else cfg.web.host},
         "server_time": utcnow().isoformat(),
@@ -521,7 +588,7 @@ def check_secret(name: str, value: str) -> str | None:
     if name == "telegram_bot_token" and not _TG_TOKEN_RE.match(value):
         return "похоже, скопировалось не всё — ключ выглядит так: 123456789:AA…"
     if name == "telegram_chat_id" and not _TG_CHAT_RE.match(value):
-        return "chat_id — это число, например 123456789"
+        return "Номер чата — это число, например 123456789"
     if name in ("smtp_user",) and "@" not in value:
         return "нужен адрес почты"
     if name == "notify_email" and not all("@" in part for part in value.split(",") if part.strip()):
@@ -632,7 +699,10 @@ async def access_put(body: AccessIn, ctx: ApiContext = Depends(get_ctx)) -> dict
     else:
         host = (body.host or "").strip() or next(iter(_tailscale_ips()), "")
         if not host:
-            raise validation_error({"host": "Tailscale не найден на этом компьютере — укажи его адрес 100.x.y.z"})
+            raise ApiError(422, "tailscale_not_found",
+                           "Tailscale не найден на этом компьютере — установи Tailscale и войди в аккаунт, "
+                           "либо впиши адрес компьютера в Tailscale (100.x.y.z) вручную",
+                           fields={"host": "Tailscale не найден — впиши адрес 100.x.y.z или установи Tailscale"})
         try:
             ipaddress.ip_address(host)
         except ValueError:
@@ -658,7 +728,8 @@ async def access_rotate(ctx: ApiContext = Depends(get_ctx)) -> JSONResponse:
     try:
         path.unlink(missing_ok=True)
     except OSError as exc:
-        raise ApiError(500, "write_failed", f"Не удалось удалить старый ключ {path}: {exc}") from exc
+        raise ApiError(500, "write_failed", "Не получилось заменить ключ доступа — закрой другие программы, "
+                       "которые могут держать папку с данными, и попробуй ещё раз", details=f"{path}: {exc}") from exc
     token = ensure_token(ctx.config.data_path)
     live = bool(getattr(ctx.app.state, "access_token", None))
     if live:

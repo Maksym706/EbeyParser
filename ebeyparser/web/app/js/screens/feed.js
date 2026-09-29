@@ -20,6 +20,7 @@ import { FilterBar, fromQuery, toQuery, hasQuery, toParams, activeCount, DEFAULT
 import { Hero, SetupChecklist, DemoRibbon, HeroSkeleton } from "./feed/hero.js";
 
 const PAGE = 30;
+const smooth = () => (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth");
 const KEEP_MS = 10 * 60 * 1000;
 // the last feed (list + scroll) survives a trip to a deal page and back
 let snapshot = null;
@@ -299,6 +300,8 @@ export default function FeedScreen({ query = {} }) {
 
   // ---------------------------------------------------------------- drawer
   const openId = query.deal || null;
+  const lastOpen = useRef(null);
+  if (openId) lastOpen.current = openId;
   const openIndex = openId ? items.findIndex((d) => String(d.id) === String(openId)) : -1;
   const openCard = openIndex >= 0 ? items[openIndex] : null;
   const openDeal = (deal, e) => {
@@ -414,7 +417,7 @@ export default function FeedScreen({ query = {} }) {
     </div>`;
   }
 
-  return html`<div class="feed-screen" onClickCapture=${onClickCapture}>
+  return html`<div class=${cx("feed-screen", wide && openId && "feed-screen--panel")} onClickCapture=${onClickCapture}>
     <${DemoRibbon} />
     ${today.loading && !today.data ? html`<${HeroSkeleton} />` : html`<${Hero} summary=${today.data} loading=${today.loading} />`}
     <${SetupChecklist} summary=${today.data} />
@@ -436,7 +439,7 @@ export default function FeedScreen({ query = {} }) {
         type="button"
         class="newpill"
         onClick=${() => {
-          window.scrollTo({ top: 0, behavior: "smooth" });
+          window.scrollTo({ top: 0, behavior: smooth() });
           feed.showPending();
         }}
       >
@@ -449,8 +452,10 @@ export default function FeedScreen({ query = {} }) {
     html`<${Drawer}
       open=${Boolean(openId)}
       onClose=${closeDeal}
+      modal=${!wide}
       width=${wide ? 600 : 560}
       class="deal-drawer"
+      restoreFocus=${() => lastOpen.current && document.querySelector(`[data-deal="${CSS.escape(String(lastOpen.current))}"] .dcard__link`)}
       title=${openCard ? openCard.title : "Сделка"}
       header=${html`<${DrawerHead} card=${openCard} index=${openIndex} total=${items.length} onPrev=${openIndex > 0 ? () => step(-1) : null} onNext=${openIndex >= 0 && openIndex < items.length - 1 ? () => step(1) : null} id=${openId} />`}
     >
@@ -461,7 +466,7 @@ export default function FeedScreen({ query = {} }) {
 
   function scrollToCard(id) {
     const el = document.querySelector(`[data-deal="${CSS.escape(String(id))}"]`);
-    if (el) el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    if (el) el.scrollIntoView({ block: "nearest", behavior: smooth() });
   }
 }
 
@@ -489,7 +494,17 @@ function DrawerHead({ card, index, total, onPrev, onNext, id }) {
 function FeedEmpty({ filtered, app, summary, reset }) {
   const counts = app.counts || {};
   const first = (summary && summary.learning) || app.first_run || {};
-  if (counts.searches === 0) {
+  const demo = Boolean(app.demo && (app.demo.loaded || app.demo === true));
+  // filters first: an empty result of a chip is never "set up your searches" (P0-2)
+  if (filtered) {
+    return html`<${EmptyState}
+      icon="sliders-horizontal"
+      title="По этим фильтрам ничего не нашлось"
+      message="Сбрось фильтры, чтобы снова увидеть все выгодные находки."
+      action=${html`<${Button} variant="primary" icon="filter-x" onClick=${reset}>Сбросить фильтры<//>`}
+    />`;
+  }
+  if (counts.searches === 0 && !demo) {
     return html`<${EmptyState}
       icon="radar"
       tone="brand"
@@ -499,13 +514,13 @@ function FeedEmpty({ filtered, app, summary, reset }) {
       secondary=${html`<${Button} variant="secondary" icon="flask-conical" onClick=${loadDemo}>Посмотреть демо<//>`}
     />`;
   }
-  if (filtered) {
+  if (counts.searches === 0) {
     return html`<${EmptyState}
-      icon="sliders-horizontal"
-      title="По этим фильтрам ничего"
-      message="Попробуй убрать пару фильтров — или посмотри всё подряд."
-      action=${html`<${Button} variant="primary" icon="filter-x" onClick=${reset}>Сбросить фильтры<//>`}
-      secondary=${html`<${Button} variant="secondary" onClick=${() => setQuery({ ...toQuery(DEFAULTS), q: null })}>Показать все<//>`}
+      icon="radar"
+      tone="brand"
+      title="Здесь пока пусто"
+      message="Демо-находки скрыты. Настрой свои поиски — и здесь появятся настоящие объявления."
+      action=${html`<${Button} variant="primary" icon="sparkles" href="/welcome">Настроить по-настоящему<//>`}
     />`;
   }
   if (first.learning) {

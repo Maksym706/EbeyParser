@@ -5,15 +5,16 @@ import { onEvent } from "../../lib/events.js";
 import { useNow } from "../../lib/hooks.js";
 import { appStore, useStore } from "../../lib/store.js";
 import { api } from "../../lib/api.js";
-import { money, number, plural, ago } from "../../lib/format.js";
+import { money, number, plural, ago, clockTime } from "../../lib/format.js";
+import { isOnboarded, loadApp } from "../../lib/app.js";
 import { navigate } from "../../lib/router.js";
 import { Icon, Button, IconButton, Ring, toast, Skeleton } from "../../ui/index.js";
-import { monitorAction } from "../../shell/monitor.js";
+import { monitorAction, cooldownOf, nextCheckAt } from "../../shell/monitor.js";
 import "../../features/icons-extra.js";
 import { DealImage } from "../../features/deal-card.js";
 import { decide, normalizeCard } from "../../features/deal-model.js";
 
-export const SETTINGS = { ai: "/settings/ai", telegram: "/settings/notifications", ebay: "/settings/ebay", categories: "/searches", location: "/settings/search", money: "/settings/money" };
+export const SETTINGS = { ai: "/settings/ai", telegram: "/settings/notifications", ebay: "/settings/ebay", categories: "/searches", location: "/settings/region", money: "/settings/money" };
 
 function clock(seconds) {
   const s = Math.max(0, Math.round(seconds));
@@ -23,7 +24,15 @@ function clock(seconds) {
   return h ? `${h}:${String(m).padStart(2, "0")}:${ss}` : `${m}:${ss}`;
 }
 
-const hm = (iso) => new Date(iso).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+const hm = (iso) => clockTime(iso);
+
+/** Where the finds will show up: Telegram, e-mail or just here. */
+function channelText(app) {
+  const f = (app && app.features) || {};
+  if (f.telegram) return "Пришлю в Telegram";
+  if (f.email) return "Пришлю на почту";
+  return "Покажу здесь, в ленте";
+}
 
 /** «● Работает · следующая проверка через 12:03» + Проверить сейчас / Пауза. */
 export function StatusStrip({ compact = false }) {
@@ -46,9 +55,7 @@ export function StatusStrip({ compact = false }) {
   };
   if (!m) return html`<div class="strip"><${Skeleton} w="60%" h=${14} /></div>`;
   const raw = m.raw || {};
-  const hosts = Array.isArray(raw.http) ? raw.http : [];
-  const blocked = hosts.find((h) => h.cooldown_until && new Date(h.cooldown_until) > now);
-  const cooldown = blocked ? blocked.cooldown_until : null;
+  const cd = cooldownOf(m, now);
   let tone = "profit";
   let text;
   let pulse = true;
@@ -70,9 +77,10 @@ export function StatusStrip({ compact = false }) {
     tone = "neutral";
     pulse = false;
     text = "Проверки на паузе";
-  } else if (cooldown && new Date(cooldown) > now) {
+  } else if (cd) {
     tone = "haggle";
-    text = `Пауза до ${hm(cooldown)}: ${blocked.host.includes("ebay") ? "eBay" : "Kleinanzeigen"} попросил отдохнуть${blocked.strikes ? ` (блокировка №${blocked.strikes})` : ""}. Сам продолжу — ничего делать не нужно.`;
+    pulse = false;
+    text = `${cd.label ? `Пауза до ${cd.label}` : "Пауза"}: ${cd.site} попросил отдохнуть${cd.strikes ? ` (блокировка №${cd.strikes})` : ""}. Сам продолжу — ничего делать не нужно.`;
   } else if (m.nextRunAt) {
     const left = (new Date(m.nextRunAt) - now) / 1000;
     text = left > 0 ? html`Работает · следующая проверка через <b class="num">${clock(left)}</b>` : "Работает · проверка вот-вот начнётся";
@@ -122,7 +130,10 @@ export function Hero({ summary, loading }) {
                   ? "Лучшие — сверху"
                   : "Пока тихо — я продолжаю смотреть"}
             </p>
-            ${first.learning && first.message_ru && html`<p class="hero__note"><${Icon} name="hourglass" size=${14} />${first.message_ru}</p>`}`}
+            ${first.learning &&
+            (app.demo && app.demo.loaded
+              ? (first.searches || []).length > 0 && html`<p class="hero__note"><${Icon} name="hourglass" size=${14} />Ниже — демо-находки. Твои поиски пока изучают рынок.</p>`
+              : first.message_ru && html`<p class="hero__note"><${Icon} name="hourglass" size=${14} />${first.message_ru}</p>`)}`}
     </div>
     ${best &&
     html`<a class=${cx("hero__best", `tone-${decide(best).tone}`)} href=${`/deal/${encodeURIComponent(best.id)}`} data-deal-open=${best.id}>
@@ -141,22 +152,33 @@ export function Hero({ summary, loading }) {
 }
 
 function LearningHero({ first, monitor }) {
+  const app = useStore(appStore, (st) => st.app) || {};
+  const now = useNow(15000);
   const total = first.enabled_searches || (first.searches || []).length || 0;
   const pending = (first.searches || []).filter((s) => s.state === "pending").length;
   const done = Math.max(0, total - pending);
-  const next = monitor && monitor.nextRunAt ? hm(monitor.nextRunAt) : null;
+  // never promise a check that falls inside a block pause (brief §2.3)
+  const cd = cooldownOf(monitor, now);
+  const at = nextCheckAt(monitor, now);
+  const stopped = monitor && (monitor.state === "stopped" || monitor.available === false);
+  const when = monitor && monitor.paused
+    ? "проверки на паузе — нажми «Продолжить»"
+    : stopped
+      ? "автопроверка выключена — нажми «Проверить сейчас»"
+      : cd
+        ? `первые уведомления после паузы${cd.label ? `, около ${cd.label}` : ""}`
+        : `первые уведомления после следующей проверки${at ? ` (~${hm(at)})` : ""}`;
   return html`<section class="hero hero--learning" aria-label="Изучаю рынок">
     <div class="hero__main">
       <div class="overline"><${Icon} name="hourglass" size=${12} />Первый запуск</div>
       <h1 class="hero__title">Изучаю рынок в твоём районе</h1>
       <p class="hero__sub">
-        ${done} из ${total} ${plural(total, "поиска", "поисков", "поисков")} · собрано <b class="num">${number(first.price_points || 0)}</b> цен ·
-        первые уведомления после следующей проверки${next ? ` (~${next})` : ""}
+        ${done} из ${total} ${plural(total, "поиска", "поисков", "поисков")} · собрано <b class="num">${number(first.price_points || 0)}</b> ${plural(first.price_points || 0, "цена", "цены", "цен")} · ${when}
       </p>
       <div class="gauge gauge--lg" role="progressbar" aria-valuemin="0" aria-valuemax=${total} aria-valuenow=${done}>
         <span style=${{ width: `${total ? Math.max(4, (done / total) * 100) : 4}%` }}></span>
       </div>
-      <p class="hero__note">Первая проверка каждого поиска только собирает цены — так я пойму, что на самом деле дёшево. Уведомлю в Telegram.</p>
+      <p class="hero__note">Первая проверка каждого поиска только собирает цены — так я пойму, что на самом деле дёшево. ${channelText(app)}.</p>
     </div>
     <${StatusStrip} />
   </section>`;
@@ -207,11 +229,19 @@ export function DemoRibbon() {
     setBusy(true);
     try {
       await api.post("/demo/clear", {});
-      toast.success("Демо-данные убраны");
-      appStore.set({ app: { ...appStore.get().app, demo: { loaded: false, count: 0 } } });
-      window.dispatchEvent(new CustomEvent("ebp:feed-reload"));
+      const cur = appStore.get().app || {};
+      appStore.set({ app: { ...cur, demo: { loaded: false, count: 0 } } });
+      if (!isOnboarded(cur)) {
+        // nothing is set up yet: the feed would be empty — go to the setup, and say why
+        toast.success("Демо-данные убраны — давай настроим поиск", { message: "Это займёт 3–5 минут" });
+        navigate("/welcome");
+      } else {
+        toast.success("Демо-данные убраны");
+        window.dispatchEvent(new CustomEvent("ebp:feed-reload"));
+      }
+      loadApp().catch(() => {});
     } catch (e) {
-      toast.error(e.message);
+      toast.error(e);
     }
     setBusy(false);
   };

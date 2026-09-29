@@ -33,13 +33,72 @@ export function authToken() {
   return token;
 }
 
+// ------------------------------------------------------------------ human errors
+// Safety net (brief §2.1–2.2): the server sends friendly Russian texts, but if a message still
+// carries a CLI command, a config file name, an exception class or a local URL, the person gets
+// a calm Russian sentence with a next step, and the raw text goes under «Подробнее» (`details`).
+const TECH_RE =
+  /python\s+-m|config\.ya?ml|\.env\b|errno|connecterror|connecttimeout|readtimeout|timeoutexception|exception|traceback|https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])|\b[a-z]+error\b|\b[a-z]+_[a-z_]+\s*[:=]|\b[a-z]+\.[a-z]+_[a-z_]+\b|allowlist|egress|getaddrinfo|ssl:|httpx|\bnone\b|\bnull\b|undefined|\bnan\b/i;
+const NET_RE = /errno|connect|timeout|timed out|unreachable|refused|getaddrinfo|name or service|allowlist|egress|proxy|ssl|network|address family|host not/i;
+
+function serviceOf(text) {
+  if (/lm ?studio|localhost:1234|llama|vllm|ollama|нейросет|модел/i.test(text)) return "ai";
+  if (/telegram/i.test(text)) return "Telegram";
+  if (/ebay/i.test(text)) return "eBay";
+  if (/smtp|gmail|gmx|outlook|e-?mail|почт/i.test(text)) return "почтовым сервером";
+  if (/kleinanzeigen/i.test(text)) return "Kleinanzeigen";
+  if (/tailscale/i.test(text)) return "tailscale";
+  return null;
+}
+
+/** Latin-heavy text (an English upstream error) with hardly any Russian in it. */
+function mostlyLatin(text) {
+  const lat = (text.match(/[a-z]/gi) || []).length;
+  const cyr = (text.match(/[а-яё]/gi) || []).length;
+  return lat > 12 && lat > cyr * 2;
+}
+
+/**
+ * { message, details } for any error text. `message` is always safe to show; `details` holds
+ * the technical original (for a collapsed «Подробнее») or "" when the text was fine.
+ */
+export function humanize(text, { fallback } = {}) {
+  const raw = String(text ?? "").trim();
+  if (!raw) return { message: fallback || "Что-то пошло не так — попробуй ещё раз", details: "" };
+  // light clean-up first: "Нет связи с Telegram (ConnectError) — проверь интернет"
+  const cleaned = raw
+    .replace(/\s*\((?:[A-Za-z]+(?:Error|Exception|Timeout))\)/g, "")
+    .replace(/:\s*[a-z][a-z0-9_.]*:\s/g, ": ")
+    .replace(/\s*(?:или\s+)?(?:в|через)\s+config\.ya?ml(?:\s*\/\s*\.env)?/gi, "")
+    .split(/(?<=[.!?])\s+/)
+    .filter((sentence) => !/python\s+-m|`[^`]+`/.test(sentence))
+    .join(" ")
+    .trim();
+  if (cleaned && !TECH_RE.test(cleaned) && !mostlyLatin(cleaned)) return { message: cleaned, details: cleaned === raw ? "" : raw };
+  const svc = serviceOf(raw);
+  let message;
+  if (/python\s+-m\s+ebeyparser(?!\s+\w)/i.test(raw) || /программ\w* не запущен/i.test(raw))
+    message = "Программа ещё не готова — подожди минуту и попробуй снова";
+  else if (svc === "eBay" && /client_id|client_secret|config|\.env|ключ/i.test(raw)) message = "eBay не подключён — добавь ключи в «Настройки → eBay»";
+  else if (svc === "ai") message = "Нейросеть не отвечает — открой LM Studio и нажми Developer → Start Server";
+  else if (svc === "tailscale") message = "Tailscale не найден на этом компьютере — установи его и попробуй ещё раз";
+  else if (NET_RE.test(raw)) message = svc ? `Не получилось связаться с ${svc} — проверь интернет и попробуй ещё раз` : "Нет связи — проверь интернет и попробуй ещё раз";
+  else if (/config\.ya?ml|\.env\b|python\s+-m/i.test(raw)) message = "Не хватает настройки — открой «Настройки» и проверь этот раздел";
+  else message = fallback || "Что-то пошло не так — попробуй ещё раз. Если повторится, загляни в «Состояние → Журнал»";
+  return { message, details: raw };
+}
+
 export class ApiError extends Error {
   constructor(status, code, message, data) {
-    super(message);
+    const human = humanize(message);
+    super(human.message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
     this.data = data;
+    const err = data && typeof data === "object" && data.error && typeof data.error === "object" ? data.error : null;
+    // technical text for «Подробнее»: the server's own `details`, or what the sanitizer replaced
+    this.details = [err && typeof err.details === "string" ? err.details : "", human.details].filter(Boolean).join("\n");
     // per-field validation messages: { "pricing.min_profit": "не меньше 0", … } (PATCH /settings, POST /setup)
     const fields = data && data.error && data.error.fields;
     this.fields = Array.isArray(fields)
@@ -91,7 +150,9 @@ function errorFrom(status, body) {
     if (Array.isArray(detail)) {
       // FastAPI validation errors
       const msg = detail.map((d) => d && (d.msg || d.message)).filter(Boolean).slice(0, 2).join("; ");
-      return new ApiError(status, "validation", msg ? `${STATUS_TEXT[422]}: ${msg}` : STATUS_TEXT[422], body);
+      const e = new ApiError(status, "validation", STATUS_TEXT[422], body);
+      if (msg) e.details = msg;
+      return e;
     }
   }
   return new ApiError(status, `http_${status}`, STATUS_TEXT[status] || `Ошибка ${status}`, body);

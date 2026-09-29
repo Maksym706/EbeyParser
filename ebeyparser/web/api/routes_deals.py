@@ -16,13 +16,16 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse, Response
 
 from ...models import utcnow
+from ...timefmt import local_tz, to_local
 from .context import ApiContext, get_ctx, parse_since
 from .errors import ApiError, validation_error
 from .presenters import (
+    ACTION_LABELS,
     API_STATUSES,
     COMP_SOURCE_LABELS,
-    LOCAL_TZ,
+    SOURCE_LABELS,
     STATUS_LABELS,
+    VERDICT_LABELS,
     aware,
     deal_card,
     deal_detail,
@@ -125,6 +128,9 @@ def deal_filters(ctx: ApiContext, params: Any) -> tuple[dict[str, Any], str]:
         value = _number(params, key, errors, low)
         if value is not None:
             filters[target] = value
+    if filters.get("min_price") is not None and filters.get("max_price") is not None \
+            and filters["min_price"] > filters["max_price"]:
+        errors["min_price"] = "«Цена от» больше, чем «Цена до»"
     shipping = _bool(params.get("shipping"))
     if shipping is not None:
         filters["shipping"] = shipping
@@ -197,7 +203,7 @@ def _facets(ctx: ApiContext, filters: dict[str, Any]) -> dict[str, Any]:
     return {
         "verdict": {"good": count(verdicts=["buy", "maybe"]), "buy": count(verdicts=["buy"]),
                     "maybe": count(verdicts=["maybe"]), "all": count(verdicts=None)},
-        "action": {a: count(actions=[a]) for a in ("buy", "haggle", "bid")},
+        "action": {a: count(actions=[a]) for a in ACTIONS},  # the derived action (never "")
         "purpose": {"resale": count(purpose="resale"), "personal": count(purpose="personal")},
         "unseen": count(unseen=True),
         "no_flags": count(no_flags=True),
@@ -263,6 +269,9 @@ async def deal_patch(ad_id: str, body: DealPatchIn, ctx: ApiContext = Depends(ge
     fields = body.model_fields_set
     if not fields:
         raise ApiError(400, "bad_request", "Нечего менять")
+    money_problems = _money_problems(body, deal)
+    if money_problems:
+        raise validation_error(money_problems, "Проверь суммы")
     changes: dict[str, Any] = {}
     for key in ("bought_price", "sold_price", "extra_costs", "bought_at", "sold_at", "hidden_reason"):
         if key in fields:
@@ -300,6 +309,31 @@ async def deal_patch(ad_id: str, body: DealPatchIn, ctx: ApiContext = Depends(ge
     return publish_update(ctx, ad_id)
 
 
+MAX_MONEY = 1_000_000.0
+
+
+def _money_problems(body: DealPatchIn, deal: Any) -> dict[str, str]:
+    """Bought / sold prices and extra costs: never negative, never absurd, never clamped."""
+    problems: dict[str, str] = {}
+    free = bool(deal.listing.is_free)
+    checks = (("bought_price", "Цена покупки", not free), ("sold_price", "Цена продажи", True),
+              ("extra_costs", "Доп. расходы", False))
+    for key, label, positive in checks:
+        value = getattr(body, key)
+        if key not in body.model_fields_set or value is None:
+            continue
+        if not math.isfinite(value):
+            problems[key] = "Нужно число"
+        elif value < 0:
+            problems[key] = f"{label} не может быть меньше нуля"
+        elif value > MAX_MONEY:
+            problems[key] = "Слишком большая сумма — проверь, нет ли лишних нулей"
+        elif positive and value == 0:
+            problems[key] = ("Укажи, за сколько купил — 0 € бывает только у бесплатных вещей" if key == "bought_price"
+                             else "Укажи, за сколько продал")
+    return problems
+
+
 @router.post("/deals/{ad_id}/seen", responses=ERRORS, summary="Отметить сделку просмотренной")
 async def deal_seen(ad_id: str, ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
     _get(ctx, ad_id)
@@ -318,7 +352,8 @@ async def deal_reevaluate(ad_id: str, body: ReevaluateIn | None = None,
     deal, _ = _get(ctx, ad_id)
     mon = ctx.monitor
     if mon is None or not (callable(getattr(mon, "evaluate_listing", None)) or callable(getattr(mon, "evaluate_url", None))):
-        raise ApiError(503, "unavailable", "Монитор не подключён — переоценка недоступна")
+        raise ApiError(503, "unavailable", "Переоценка сейчас недоступна: программа запущена без фоновых проверок. "
+                                           "Перезапусти программу")
     refetch = bool(body and body.refetch)
     listing = deal.listing
     search = ctx.config.search_by_name(listing.search_name)
@@ -409,7 +444,7 @@ async def deal_market(ad_id: str, days: int = Query(60, ge=0, le=730, descriptio
     median_line: list[dict[str, Any]] = []
     by_day: dict[date, list[float]] = {}
     for p in others:
-        day = aware(datetime.fromisoformat(p["seen_at"])).astimezone(LOCAL_TZ).date()
+        day = aware(datetime.fromisoformat(p["seen_at"])).astimezone(local_tz()).date()
         by_day.setdefault(day, []).append(p["price"])
     window = timedelta(days=14)
     for day in sorted(by_day):
@@ -420,7 +455,9 @@ async def deal_market(ad_id: str, days: int = Query(60, ge=0, le=730, descriptio
         span = f"за {days} дней" if days else "за всё время"
         caption = f"Рынок ~{stats['median']:.0f} € по {stats['count']} объявлениям {span}"
         if stats["avg_days_listed"] is not None:
-            caption += f" · держатся в среднем {stats['avg_days_listed']:.0f} дн."
+            days_listed = stats["avg_days_listed"]
+            caption += (" · обычно уходят в тот же день" if days_listed < 1
+                        else f" · держатся в среднем {days_listed:.0f} дн.")
     return {**base, "available": bool(stats), "points": points, "stats": stats, "median_line": median_line,
             "caption_ru": caption}
 
@@ -433,8 +470,8 @@ async def deal_price_history(ad_id: str, days: int = Query(60, ge=0, le=730),
 
 # ------------------------------------------------------------------ summary
 def local_midnight(now: datetime | None = None) -> datetime:
-    local = (now or utcnow()).astimezone(LOCAL_TZ)
-    return datetime.combine(local.date(), dtime(0), tzinfo=LOCAL_TZ)
+    local = (now or utcnow()).astimezone(local_tz())
+    return datetime.combine(local.date(), dtime(0), tzinfo=local_tz())
 
 
 def _profit_of(card: dict[str, Any]) -> float:
@@ -444,7 +481,7 @@ def _profit_of(card: dict[str, Any]) -> float:
 
 @router.get("/summary/today", summary="Для шапки ленты: сегодня найдено, потенциал, лучшая находка, обучение, статус")
 async def summary_today(ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
-    from .routes_app import _learning, onboarding_view
+    from .routes_app import onboarding_view
     from .routes_monitor import monitor_view
 
     db = ctx.db
@@ -481,9 +518,9 @@ async def summary_today(ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
             actionable=True, since=day_ago) == 0 and bool(enabled),
         "unseen_good": db.count_deals_v1(actionable=True, unseen=True),
         "followups": followups,
-        "learning": _learning(ctx),
+        "learning": mon["learning"],
         "monitor": {k: mon[k] for k in ("available", "running", "paused", "state", "state_ru", "next_run_at",
-                                        "progress", "interval_minutes")},
+                                        "next_run_label", "cooldown", "progress", "interval_minutes")},
         "last_run": mon["last_summary"],
         "setup_checklist": {"items": checklist, "done": sum(1 for c in checklist if c["done"]),
                             "total": len(checklist)},
@@ -491,6 +528,13 @@ async def summary_today(ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
 
 
 # ----------------------------------------------------------------- pipeline
+def _paid(bought_price: Any, price: Any) -> float:
+    """What a bought item cost: the saved purchase price (even 0 for a free one), else the ad price."""
+    if bought_price is not None:
+        return float(bought_price)
+    return float(price or 0)
+
+
 COLUMNS = (("starred", "Избранное"), ("contacted", "Написал"), ("bought", "Купил"), ("sold", "Продал"))
 
 
@@ -501,7 +545,7 @@ def _older(when: datetime | None, now: datetime, **delta: float) -> bool:
 def pipeline_summary(ctx: ApiContext, months: int = 6) -> dict[str, Any]:
     rows = ctx.db.pipeline_rows()
     now = utcnow()
-    local_now = now.astimezone(LOCAL_TZ)
+    local_now = now.astimezone(local_tz())
     sold = [r for r in rows if r["status"] == "sold"]
     stock = [r for r in rows if r["status"] == "bought"]
 
@@ -521,12 +565,12 @@ def pipeline_summary(ctx: ApiContext, months: int = 6) -> dict[str, Any]:
         profit = real(r)
         if when is None or profit is None:
             continue
-        key = aware(when).astimezone(LOCAL_TZ).strftime("%Y-%m")
+        key = aware(when).astimezone(local_tz()).strftime("%Y-%m")
         if key in by_month:
             by_month[key]["profit"] += profit
             by_month[key]["sold"] += 1
     earned = [{**v, "profit": rnd(v["profit"])} for v in reversed(list(by_month.values()))]
-    invested = sum(float(r["bought_price"] or r["price"] or 0) for r in stock)
+    invested = sum(float(_paid(r["bought_price"], r["price"])) for r in stock)
     expected = sum(float(r["expected_profit"] or 0) for r in stock if r["purpose"] != "personal")
     pairs = [(real(r), r["expected_profit"]) for r in sold
              if real(r) is not None and r["expected_profit"] not in (None, 0)]
@@ -562,7 +606,7 @@ async def pipeline(limit: int = Query(100, ge=1, le=500), ctx: ApiContext = Depe
         rows, total = ctx.db.find_deals(statuses=[key], verdicts=None, sort="updated", limit=limit)
         cards = [deal_card(d, e, config=ctx.config) for d, e in rows]
         if key == "bought":
-            amount = sum(float(c["bought_price"] or c["price"] or 0) for c in cards)
+            amount = sum(float(_paid(c["bought_price"], c["price"])) for c in cards)
         elif key == "sold":
             amount = sum(float(c["realized_profit"] or 0) for c in cards)
         else:
@@ -577,7 +621,7 @@ def _day(raw: Any) -> date | None:
     if not raw:
         return None
     try:
-        return aware(datetime.fromisoformat(str(raw))).astimezone(LOCAL_TZ).date()
+        return aware(datetime.fromisoformat(str(raw))).astimezone(local_tz()).date()
     except ValueError:
         return None
 
@@ -622,9 +666,9 @@ async def stats_overview(ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
 
 @router.get("/stats/timeseries", summary="По дням (Берлин): объявлений, оценено, выгодных, уведомлений, прибыль")
 async def stats_timeseries(days: int = Query(14, ge=1, le=90), ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
-    today = utcnow().astimezone(LOCAL_TZ).date()
+    today = utcnow().astimezone(local_tz()).date()
     first = today - timedelta(days=days - 1)
-    since = datetime.combine(first, dtime(0), tzinfo=LOCAL_TZ)
+    since = datetime.combine(first, dtime(0), tzinfo=local_tz())
     activity = ctx.db.activity_since(since)
     series: dict[date, dict[str, Any]] = {
         first + timedelta(days=i): {"date": (first + timedelta(days=i)).isoformat(), "ads_seen": 0, "evaluated": 0,
@@ -671,6 +715,10 @@ CSV_COLUMNS = (
 )
 
 
+CSV_LABELS = {"verdict": VERDICT_LABELS, "action": ACTION_LABELS, "source": SOURCE_LABELS}
+CSV_TIMES = ("bought_at", "sold_at", "first_seen")  # local time (general.timezone), not ISO UTC
+
+
 @router.get("/export/deals.csv", summary="Сделки в CSV (Excel: ; и запятая в числах). Фильтры как у /deals; "
                                          "по умолчанию — все этапы «Мои сделки»")
 async def export_deals(request: Request, excel: bool = Query(True), ctx: ApiContext = Depends(get_ctx)) -> Response:
@@ -689,11 +737,15 @@ async def export_deals(request: Request, excel: bool = Query(True), ctx: ApiCont
             value = card.get(key)
             if key == "status":
                 value = STATUS_LABELS.get(str(value), value)
+            elif key in CSV_LABELS:  # Russian words for Excel, not machine keys
+                value = CSV_LABELS[key].get(str(value), value)
+            elif key in CSV_TIMES and value:
+                value = to_local(datetime.fromisoformat(str(value))).strftime("%d.%m.%Y %H:%M")
             if isinstance(value, float) and excel:
                 value = f"{value:.2f}".replace(".", ",")
             line.append("" if value is None else value)
         writer.writerow(line)
     body = ("﻿" if excel else "") + buf.getvalue()
-    stamp = utcnow().astimezone(LOCAL_TZ).strftime("%Y-%m-%d")
+    stamp = utcnow().astimezone(local_tz()).strftime("%Y-%m-%d")
     return Response(body.encode("utf-8"), media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": f'attachment; filename="ebeyparser-deals-{stamp}.csv"'})

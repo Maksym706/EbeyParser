@@ -34,6 +34,8 @@ ONBOARDING_KEY = "onboarding"
 ONBOARDING_DRAFT_KEY = "onboarding:draft"
 BOOTSTRAPPED_KEY = "onboarding:bootstrapped"  # config.yaml was created by `run` for the web onboarding
 DEMO_RUNS_KEY = "demo:run_ids"
+WRITE_FAILED_RU = ("Не получилось сохранить настройки — файл занят другой программой или нет места на диске. "
+                   "Попробуй ещё раз через минуту")
 ONBOARDING_STEPS: tuple[tuple[str, str, bool], ...] = (  # key, title, required
     ("location", "Где искать", True),
     ("categories", "Что искать", True),
@@ -147,9 +149,12 @@ class ApiContext:
     def require_editable(self) -> Path:
         path = self.config_path
         if path is None:
-            raise ApiError(403, "read_only", "Настройки только для чтения: программа запущена без файла config.yaml")
+            raise ApiError(403, "read_only", "Настройки сейчас только для чтения — перезапусти программу обычным "
+                                             "способом, и их снова можно будет менять")
         if not self.config_writable():
-            raise ApiError(403, "read_only", f"Не могу сохранить настройки: нет доступа к файлу {path}")
+            raise ApiError(403, "read_only", "Не могу сохранить настройки: нет доступа к папке программы. Если она "
+                                             "лежит в OneDrive или защищённой папке, перенеси её, например, в Документы",
+                           details=f"нет прав на запись: {path}")
         return path
 
     def raw_config(self) -> dict[str, Any]:
@@ -170,11 +175,15 @@ class ApiContext:
         try:
             fresh = load_config(path)
         except ConfigError as exc:
-            raise ApiError(500, "config_invalid", str(exc)) from exc
+            raise ApiError(500, "config_invalid", "Файл настроек повреждён — изменения не применились. Восстанови "
+                                                  "резервную копию в «Настройки» → «Данные»", details=str(exc)) from exc
         cfg = self.config
         for section in LIVE_SECTIONS:
             if hasattr(fresh, section):
                 setattr(cfg, section, getattr(fresh, section))
+        from ...timefmt import apply_config as apply_timezone
+
+        apply_timezone(cfg)
         self.notify_monitor()
         sections = sorted({k.split(".", 1)[0] for k in keys or []})
         self.hub.publish("settings_changed", {"reason": reason, "sections": sections, "keys": list(keys or [])})
@@ -199,7 +208,7 @@ class ApiContext:
                     path.write_text("", encoding="utf-8")
                 update_yaml_values(path, updates)
         except OSError as exc:
-            raise ApiError(500, "config_write_failed", f"Не удалось записать {path}: {exc}") from exc
+            raise ApiError(500, "config_write_failed", WRITE_FAILED_RU, details=f"{path}: {exc}") from exc
         self.apply_file(reason=reason, keys=list(updates) + [f"env.{k}" for k in (env or {})])
 
     def save_searches(self, searches: list[SearchConfig], *, backup: bool = False, reason: str = "searches") -> None:
@@ -212,7 +221,7 @@ class ApiContext:
         try:
             save_searches_block(path, searches)
         except OSError as exc:
-            raise ApiError(500, "config_write_failed", f"Не удалось записать {path}: {exc}") from exc
+            raise ApiError(500, "config_write_failed", WRITE_FAILED_RU, details=f"{path}: {exc}") from exc
         self.config.searches = list(searches)
         self.notify_monitor()
         from .presenters import search_ids
@@ -327,34 +336,31 @@ def get_ctx(request: Request) -> ApiContext:
     return request.app.state.api
 
 
-def describe_exception(exc: BaseException) -> tuple[str, str]:
-    """Any failure of a job / check -> (code, Russian message)."""
-    import httpx
-
-    from ...scraper.categories import describe_error
-    from ...scraper.ebay_api import EbayAPIError
-    from ...scraper.http import BlockedError, RateBudgetExceeded
+def describe_exception(exc: BaseException) -> dict[str, Any]:
+    """Any failure of a job / check -> {"code", "message_ru", "details"?, "action"?} (plain
+    Russian with a next step; the technical text only in `details`)."""
+    from ...errors_ru import GENERIC, humanize, sanitize
 
     if isinstance(exc, ApiError):
-        return exc.code, exc.message_ru
-    if isinstance(exc, ValueError):
-        return "bad_request", str(exc) or "Неверные данные"
-    if isinstance(exc, RateBudgetExceeded):
-        return "rate_limited", describe_error(exc) + ". Это защита от блокировки — попробуй позже."
-    if isinstance(exc, BlockedError):
-        return "blocked", describe_error(exc)
-    if isinstance(exc, EbayAPIError):
-        return "upstream", str(exc)
-    if isinstance(exc, httpx.HTTPError):
-        return "network", f"Ошибка сети: {exc.__class__.__name__} — проверь интернет и попробуй ещё раз"
-    try:
-        from ...scraper.kleinanzeigen import PageLayoutError
+        return _error_dict(exc.code, exc.message_ru, exc.details or "", exc.action)
+    if isinstance(exc, ValueError) and type(exc).__name__ in ("ValueError",) and str(exc):
+        text = sanitize(str(exc))  # our own "Объявление удалено" / "Не похоже на ссылку…"
+        return _error_dict("bad_request", text or GENERIC, str(exc) if text != str(exc) else "")
+    service = "kleinanzeigen"
+    if type(exc).__name__ == "EbayAPIError" or getattr(exc, "service", "") == "ebay":
+        service = "ebay"
+    human = humanize(exc, service)
+    code = human.code if human.code != "error" else "internal"
+    return _error_dict(code, human.message_ru, human.details, human.action)
 
-        if isinstance(exc, PageLayoutError):
-            return "layout", f"Страница не распознана: {exc}"
-    except ImportError:  # pragma: no cover
-        pass
-    return "internal", f"Не получилось: {exc}" if str(exc) else f"Не получилось ({type(exc).__name__})"
+
+def _error_dict(code: str, message_ru: str, details: str = "", action: dict[str, str] | None = None) -> dict[str, Any]:
+    out: dict[str, Any] = {"code": code, "message_ru": message_ru}
+    if details:
+        out["details"] = details
+    if action:
+        out["action"] = action
+    return out
 
 
 def as_float(value: Any) -> float | None:

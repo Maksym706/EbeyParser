@@ -2,19 +2,31 @@
 // (run now, pause/resume, test AI, test notifications), runs chart + table; /health/logs = logs.
 import { html, cx, useState, useEffect } from "../lib/html.js";
 import { useAsync, useNow, useMediaQuery, BREAKPOINTS } from "../lib/hooks.js";
-import { api } from "../lib/api.js";
+import { api, humanize } from "../lib/api.js";
 import { onEvent } from "../lib/events.js";
 import { navigate } from "../lib/router.js";
-import { ago, number, plural, span, bytes, dateTime } from "../lib/format.js";
-import { Icon, Button, PageHeader, ErrorState, Skeleton, Tooltip, Meter, toast, Tabs } from "../ui/index.js";
+import { ago, number, plural, span, bytes, dateTime, untilTime, localizeText } from "../lib/format.js";
+import { Icon, Button, PageHeader, ErrorState, Skeleton, Tooltip, Meter, toast, Tabs, Details } from "../ui/index.js";
 import { useTopbar } from "../shell/topbar.js";
-import { refreshMonitor, monitorAction } from "../shell/monitor.js";
+import { refreshMonitor, monitorAction, cooldownOf, normalize } from "../shell/monitor.js";
 import "../features/icons-extra.js";
 import { setBadge } from "../features/badges.js";
 import { LogsView } from "./health/logs.js";
 
 const LEVEL_TONE = { ok: "profit", warn: "haggle", error: "danger" };
-const hm = (iso) => (iso ? new Date(iso).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }) : "");
+/** Server text → { message, details }: Berlin times instead of ISO, no CLI / exception text. */
+const siteNames = (text) =>
+  String(text || "")
+    .replace(/\b(?:https?:\/\/)?(?:www\.)?kleinanzeigen\.de\b/gi, "Kleinanzeigen")
+    .replace(/\b(?:https?:\/\/)?(?:api\.|www\.)?ebay\.(?:com|de)\b/gi, "eBay");
+const human = (text) => humanize(localizeText(siteNames(text)));
+const CHANNEL_RU = { telegram: "Telegram", email: "почта", mail: "почта" };
+
+/** GET /health `monitor` + `sites` → the normalised monitor used by the shell helpers. */
+function monitorOf(d) {
+  const m = d.monitor || {};
+  return normalize({ ...m, http: m.http && m.http.length ? m.http : d.sites || [] });
+}
 
 function clock(seconds) {
   const s = Math.max(0, Math.round(seconds));
@@ -70,8 +82,9 @@ function Overview() {
   if (h.error) return html`<${ErrorState} error=${h.error} onRetry=${h.reload} />`;
   if (!h.data) return html`<${OverviewSkeleton} />`;
   const d = h.data;
+  const channels = ((d.notifications && d.notifications.channels) || []).filter((c) => c.enabled && c.configured !== false);
   return html`
-    <${TopBanner} d=${d} reload=${h.reload} />
+    <${TopBanner} d=${d} reload=${h.reload} now=${now} />
     <div class="htiles">
       <${ChecksTile} d=${d} now=${now} reload=${h.reload} />
       <${AiTile} d=${d} loading=${h.aiLoading} reload=${h.reload} />
@@ -83,32 +96,79 @@ function Overview() {
     <${Runs} runs=${d.runs || []} />
     <p class="heartbeat">
       <${Icon} name="bell-ring" size=${16} />
-      ${d.notifications && d.notifications.heartbeat_hour != null
-        ? `Каждый день в ${d.notifications.heartbeat_hour}:00 пришлю отчёт «жив». Нет отчёта — значит, компьютер или программа выключены.`
-        : "Утренний отчёт «жив» выключен — включи его в настройках уведомлений, чтобы знать, что программа работает."}
+      ${!channels.length
+        ? html`Утренний отчёт «жив» приходит в Telegram или на почту — <a href="/settings/notifications">подключи уведомления</a>, чтобы знать, что программа работает.`
+        : d.notifications && d.notifications.heartbeat_hour != null
+          ? `Каждый день в ${d.notifications.heartbeat_hour}:00 пришлю отчёт «жив». Нет отчёта — значит, компьютер или программа выключены.`
+          : html`Утренний отчёт «жив» выключен — <a href="/settings/notifications">включи его</a>, чтобы знать, что программа работает.`}
     </p>
   `;
 }
 
-function TopBanner({ d, reload }) {
-  const tone = LEVEL_TONE[d.level] || "neutral";
+/** The server's `action` ({label_ru, href}) as a button; `href` may also name a local action. */
+function ServerAction({ action, reload }) {
+  const label = action.label_ru || action.label || "Открыть";
+  let href = action.href || "";
+  // a link back to this very page means "do it here": infer the action from its label
+  if (!href || href === "/health" || href === window.location.pathname) {
+    if (/продолж/i.test(label)) href = "action:resume";
+    else if (/проверить сейчас|запустить проверку/i.test(label)) href = "action:run";
+    else if (/нейросет|модел/i.test(label) && /провер/i.test(label)) href = "action:test-ai";
+    else if (/тест|отправить/i.test(label)) href = "action:test-notify";
+  }
+  if (href === "action:test-notify") return html`<${Button} size="sm" variant="secondary" icon="send" onClick=${() => testNotify()}>${label}<//>`;
+  const icon = /resume|продолж/i.test(href + label) ? "play" : /settings\/region|нагрузк/i.test(href + label) ? "sliders-horizontal" : /log|журнал/i.test(href + label) ? "scroll-text" : "arrow-right";
+  if (/^(action:|#)?resume$/i.test(href) || href === "/monitor/resume")
+    return html`<${Button} size="sm" variant="secondary" icon="play" onClick=${() => monitorAction("resume").then(reload)}>${label}<//>`;
+  if (/^(action:|#)?(test[-_]?ai|ai[-_]?test)$/i.test(href)) return html`<${Button} size="sm" variant="secondary" icon="scan-eye" onClick=${() => testAi(reload)}>${label}<//>`;
+  if (/^(action:|#)?run$/i.test(href) || href === "/monitor/run")
+    return html`<${Button} size="sm" variant="secondary" icon="refresh-cw" onClick=${() => monitorAction("run").then(reload)}>${label}<//>`;
+  const to = href.replace(/^\/settings\/search\b/, "/settings/region");
+  return html`<${Button} size="sm" variant="secondary" icon=${icon} href=${to || "/settings"}>${label}<//>`;
+}
+
+function TopBanner({ d, reload, now }) {
+  const m = monitorOf(d);
+  const cd = cooldownOf(m, now);
+  let level = d.level;
+  let banner = human(d.banner_ru);
+  const firstDetails = ((d.problems || [])[0] || {}).details;
+  if (firstDetails && !banner.details) banner = { ...banner, details: firstDetails };
+  // older servers say «Всё работает» while checks are stopped or paused: be truthful anyway
+  const onlyPause = (d.problems || []).every((p) => /пауз|огранич|блокир|cooldown/i.test(p.text_ru || ""));
+  if (cd && (level === "ok" || (level === "error" && onlyPause))) {
+    // a block pause is waited out by itself: calm amber, one sentence, when it ends
+    level = "warn";
+    banner = { message: `${cd.site} попросил паузу — продолжу${cd.label ? ` в ${cd.label}` : " сам"}. Ничего делать не нужно.`, details: banner.details };
+  } else if (level === "ok" && m.state === "stopped") {
+    level = "warn";
+    banner = { message: "Автопроверка выключена — новые объявления смотрю только по кнопке «Проверить сейчас»", details: "" };
+  } else if (level === "ok" && m.paused) {
+    level = "warn";
+    banner = { message: "Проверки на паузе — новые объявления не смотрю", details: "" };
+  }
+  const tone = LEVEL_TONE[level] || "neutral";
   const first = (d.problems || [])[0];
   let action = null;
-  if (first) {
-    const t = first.text_ru || "";
-    if (/нейросет/i.test(t)) action = html`<${Button} size="sm" variant="secondary" icon="scan-eye" onClick=${() => testAi(reload)}>Проверить нейросеть<//>`;
-    else if (/пауз/i.test(t) && d.monitor && d.monitor.paused)
-      action = html`<${Button} size="sm" variant="secondary" icon="play" onClick=${() => monitorAction("resume").then(reload)}>Продолжить<//>`;
-    else if (/огранич|лимит/i.test(t)) action = html`<${Button} size="sm" variant="secondary" icon="sliders-horizontal" href="/settings/search">Снизить нагрузку<//>`;
+  if (d.action && (d.action.href || d.action.label_ru)) action = html`<${ServerAction} action=${d.action} reload=${reload} />`;
+  else if (m.paused) action = html`<${Button} size="sm" variant="secondary" icon="play" onClick=${() => monitorAction("resume").then(reload)}>Продолжить<//>`;
+  else if (first || cd) {
+    const t = (first && first.text_ru) || "";
+    if (/нейросет|модел|lm studio/i.test(t)) action = html`<${Button} size="sm" variant="secondary" icon="scan-eye" onClick=${() => testAi(reload)}>Проверить нейросеть<//>`;
+    else if (cd || /огранич|лимит|пауз|блок/i.test(t)) action = html`<${Button} size="sm" variant="secondary" icon="sliders-horizontal" href="/settings/region">Снизить нагрузку<//>`;
     else if (/не доставлено/i.test(t)) action = html`<${Button} size="sm" variant="secondary" icon="send" onClick=${() => testNotify()}>Отправить тест<//>`;
     else if (/ошиб/i.test(t)) action = html`<${Button} size="sm" variant="secondary" icon="scroll-text" href="/health/logs">Открыть журнал<//>`;
   }
-  const more = (d.problems || []).slice(1);
+  const more = (d.problems || [])
+    .slice(1)
+    .map((p) => human(p.text_ru).message)
+    .filter((t) => t && t !== banner.message);
   return html`<section class=${cx("hbanner", `tone-${tone}`)} role=${tone === "danger" ? "alert" : "status"}>
-    <span class="hbanner__icon"><${Icon} name=${d.level === "ok" ? "circle-check" : d.level === "warn" ? "triangle-alert" : "circle-alert"} size=${22} /></span>
+    <span class="hbanner__icon"><${Icon} name=${level === "ok" ? "circle-check" : level === "warn" ? "triangle-alert" : "circle-alert"} size=${22} /></span>
     <div class="hbanner__body">
-      <div class="hbanner__title">${d.banner_ru}</div>
-      ${more.length > 0 && html`<ul class="hbanner__more">${more.map((p) => html`<li>${p.text_ru}</li>`)}</ul>`}
+      <div class="hbanner__title">${banner.message}</div>
+      ${more.length > 0 && html`<ul class="hbanner__more">${more.map((t) => html`<li>${t}</li>`)}</ul>`}
+      <${Details} text=${banner.details} />
     </div>
     ${action}
   </section>`;
@@ -130,6 +190,7 @@ function Tile({ icon, title, tone = "neutral", state, children, actions, tip }) 
 
 function ChecksTile({ d, now, reload }) {
   const m = d.monitor || {};
+  const cd = cooldownOf(monitorOf(d), now);
   const [busy, setBusy] = useState(null);
   const act = async (kind) => {
     setBusy(kind);
@@ -140,12 +201,16 @@ function ChecksTile({ d, now, reload }) {
   };
   const left = m.next_run_at ? (new Date(m.next_run_at) - now) / 1000 : null;
   let tone = "profit";
-  let state = m.state_ru || "—";
+  let state = localizeText(m.state_ru) || "—";
   if (!m.available) tone = "neutral";
   else if (m.running) tone = "info";
   else if (m.paused) tone = "haggle";
   else if (m.state === "stopped") tone = "neutral";
-  else if (left != null && left > 0) state = html`Работает · следующая через <b class="num">${clock(left)}</b>`;
+  else if (cd) {
+    // never promise a check inside a block pause
+    tone = "haggle";
+    state = cd.label ? html`Пауза до <b class="num">${cd.label}</b> · ${cd.site} попросил отдохнуть` : `Пауза · ${cd.site} попросил отдохнуть`;
+  } else if (left != null && left > 0) state = html`Работает · следующая через <b class="num">${clock(left)}</b>`;
   const p = m.progress || null;
   const last = m.last_summary;
   return html`<${Tile}
@@ -163,7 +228,7 @@ function ChecksTile({ d, now, reload }) {
       ? html`<div class="hmetric"><span>Сейчас</span><b>поиск ${p.index || 0} из ${p.total}</b></div>
           <div class="gauge"><span style=${{ width: `${Math.min(100, ((p.index || 0) / p.total) * 100)}%`, background: "var(--blue-solid)" }}></span></div>`
       : null}
-    <div class="hmetric"><span>Как часто</span><b>каждые ${Math.round(m.interval_minutes || 0)} мин</b></div>
+    <div class="hmetric"><span>Как часто</span><b>${m.state === "stopped" ? "только по кнопке" : `каждые ${Math.round(m.interval_minutes || 0)} мин`}</b></div>
     <div class="hmetric"><span>Активных поисков</span><b class="num">${m.searches_enabled ?? "—"}</b></div>
     ${last &&
     html`<div class="hmetric"><span>Последняя</span><b>${ago(last.finished_at || last.started_at, now)} · ${number(last.new_listings || 0)} новых, ${number(last.deals_found || 0)} выгодных</b></div>`}
@@ -175,9 +240,12 @@ async function testAi(reload) {
   try {
     const r = await api.post("/ai/test", { sample: true }, { timeout: 200000 });
     if (r.ok) toast({ id, kind: "success", title: r.message_ru || `Нейросеть работает · ответ за ${Math.round(r.seconds || 0)} с`, message: r.warning_ru || "" });
-    else toast({ id, kind: "error", title: r.error_ru || r.message_ru || "Нейросеть не ответила", message: r.warning_ru || "" });
+    else {
+      const e = human(r.error_ru || r.message_ru || "Нейросеть не ответила");
+      toast({ id, kind: "error", title: e.message, message: r.warning_ru || "", details: e.details });
+    }
   } catch (e) {
-    toast({ id, kind: "error", title: e.message });
+    toast({ id, kind: "error", title: e.message, details: e.details });
   }
   reload && reload();
 }
@@ -188,10 +256,14 @@ async function testNotify(channel) {
     const r = await api.post("/notify/test", {}, { params: channel ? { channel } : null, timeout: 60000 });
     const res = Object.entries(r.results || {});
     const bad = res.filter(([, v]) => !v.ok);
-    if (!bad.length) toast({ id, kind: "success", title: "Тест отправлен — проверь телефон", message: res.map(([k]) => k).join(", ") });
-    else toast({ id, kind: "error", title: bad.map(([k, v]) => `${k}: ${v.message_ru}`).join(" · ") });
+    const name = (k) => CHANNEL_RU[k] || k;
+    if (!bad.length) toast({ id, kind: "success", title: "Тест отправлен — проверь телефон", message: res.length ? `Куда: ${res.map(([k]) => name(k)).join(", ")}` : "" });
+    else {
+      const parts = bad.map(([k, v]) => ({ k, h: human(v.message_ru || v.error_ru) }));
+      toast({ id, kind: "error", title: parts.map(({ k, h }) => `${name(k)[0].toUpperCase()}${name(k).slice(1)}: ${h.message}`).join(" · "), details: parts.map(({ h }) => h.details).filter(Boolean).join("\n") });
+    }
   } catch (e) {
-    toast({ id, kind: "error", title: e.message });
+    toast({ id, kind: "error", title: e.message, details: e.details });
   }
 }
 
@@ -224,8 +296,8 @@ function AiTile({ d, loading, reload }) {
         html`${ai.enabled
           ? html`<div class="hmetric"><span>Модель</span><code class="mono">${ai.resolved_model || ai.model || "—"}</code></div>
               <div class="hmetric"><span>Сервер</span><b>${ai.provider === "ollama" ? "Ollama" : ai.provider === "anthropic" ? "Claude" : "LM Studio"}</b></div>
-              ${ai.latency_ms != null && html`<div class="hmetric"><span>Ответ сервера</span><b class="num">${ai.latency_ms < 1000 ? `${ai.latency_ms} мс` : `${(ai.latency_ms / 1000).toFixed(1).replace(".", ",")} с`}</b></div>`}
-              ${ai.error_ru && html`<p class="htile__err">${ai.error_ru}</p>`}`
+              ${ai.latency_ms != null && ai.ok !== false && html`<div class="hmetric"><span>Ответ сервера</span><b class="num">${ai.latency_ms < 1000 ? `${ai.latency_ms} мс` : `${(ai.latency_ms / 1000).toFixed(1).replace(".", ",")} с`}</b></div>`}
+              ${ai.error_ru && html`<div class="htile__err">${human(ai.error_ru).message}<${Details} text=${human(ai.error_ru).details || ai.details} /></div>`}`
           : html`<p class="htile__note">Без нейросети фото никто не проверяет — уведомления приходят с пометкой ⚠.</p>`}
         ${d.monitor && d.monitor.last_summary && html`<div class="hmetric"><span>Вызовов за проверку</span><b class="num">${d.monitor.last_summary.ai_calls || 0}</b></div>`}`}
   <//>`;
@@ -234,11 +306,11 @@ function AiTile({ d, loading, reload }) {
 function SiteTile({ d, now }) {
   const site = (d.sites || []).find((s) => /kleinanzeigen/i.test(s.host)) || null;
   const cooldown = site && site.cooldown_until && new Date(site.cooldown_until) > now ? site.cooldown_until : null;
-  const tone = !site ? "neutral" : cooldown || site.blocked ? "danger" : site.exhausted ? "haggle" : "profit";
+  const tone = !site ? "neutral" : cooldown ? "haggle" : site.blocked ? "danger" : site.exhausted ? "haggle" : "profit";
   const state = !site
     ? "Запросов ещё не было"
     : cooldown
-      ? html`Пауза до ${hm(cooldown)}${site.strikes ? ` (блокировка №${site.strikes})` : ""} · <b class="num">${clock((new Date(cooldown) - now) / 1000)}</b>`
+      ? html`Пауза до ${untilTime(cooldown, now)} · ещё <b class="num">${clock((new Date(cooldown) - now) / 1000)}</b>`
       : site.exhausted
         ? "Лимит в час исчерпан — продолжу позже"
         : "Работает";
@@ -248,12 +320,13 @@ function SiteTile({ d, now }) {
     tone=${tone}
     state=${state}
     tip="Я ограничиваю число запросов в час, чтобы Kleinanzeigen не заблокировал. После блокировки сам делаю паузу."
-    actions=${html`<${Button} size="sm" variant="ghost" icon="sliders-horizontal" href="/settings/search">Снизить нагрузку<//>`}
+    actions=${html`<${Button} size="sm" variant="ghost" icon="sliders-horizontal" href="/settings/region">Снизить нагрузку<//>`}
   >
     ${site
       ? html`<${Meter} label="Запросов за час" value=${site.requests_last_hour || 0} max=${site.limit_per_hour || 150} marker=${0.4} />
+          ${site.strikes > 0 && html`<div class="hmetric"><span>Блокировок подряд</span><b class="num">${site.strikes}</b></div>`}
           ${site.last_block_reason &&
-          html`<div class="hmetric"><span>Последняя блокировка</span><b>${site.last_block_reason}${site.last_block_at ? ` · ${ago(site.last_block_at, now)}` : ""}</b></div>`}`
+          html`<div class="hmetric"><span>Последняя блокировка</span><b>${blockReason(site.last_block_reason)}${site.last_block_at ? ` · ${ago(site.last_block_at, now)}` : ""}</b></div>`}`
       : html`<p class="htile__note">Статистика появится после первой проверки.</p>`}
   <//>`;
 }
@@ -305,7 +378,8 @@ function NotifyTile({ d }) {
       </div>`,
     )}
     ${n.queued > 0 && html`<div class="hmetric"><span>В очереди</span><b class="num">${n.queued}</b></div>`}
-    ${active.find((c) => c.last_error) && html`<p class="htile__err">${active.find((c) => c.last_error).last_error}</p>`}
+    ${active.find((c) => c.last_error) &&
+    html`<div class="htile__err">${human(active.find((c) => c.last_error).last_error).message}<${Details} text=${human(active.find((c) => c.last_error).last_error).details || active.find((c) => c.last_error).last_error_details} /></div>`}
   <//>`;
 }
 
@@ -377,7 +451,7 @@ function Runs({ runs }) {
               html`<button type="button" class="runerr" onClick=${() => setOpen(open === r.id ? null : r.id)}>
                   <${Icon} name="circle-alert" size=${14} />${r.error_count} ${plural(r.error_count, "ошибка", "ошибки", "ошибок")}
                 </button>
-                ${open === r.id && html`<ul class="runerrs">${r.errors.map((e) => html`<li>${e}</li>`)}</ul>`}`}
+                ${open === r.id && html`<${RunErrors} errors=${r.errors} details=${r.error_details} />`}`}
             </div>`,
           )}
         </div>`
@@ -401,11 +475,30 @@ function Runs({ runs }) {
                   </td>
                 </tr>
                 ${open === r.id &&
-                html`<tr class="rtable__errs"><td colspan="7"><ul class="runerrs">${r.errors.map((e) => html`<li>${e}</li>`)}</ul></td></tr>`}`,
+                html`<tr class="rtable__errs"><td colspan="7"><${RunErrors} errors=${r.errors} details=${r.error_details} /></td></tr>`}`,
             )}
           </tbody>
         </table>`}
   </section>`;
+}
+
+/** Run errors in plain words; the raw text of each stays under «Подробнее». */
+function RunErrors({ errors = [], details = [] }) {
+  return html`<ul class="runerrs">
+    ${errors.map((e, i) => {
+      const h = human(e);
+      return html`<li>${h.message}<${Details} text=${h.details || (details && details[i]) || ""} /></li>`;
+    })}
+  </ul>`;
+}
+
+/** "HTTP 403" → "сайт ответил отказом (403)". */
+function blockReason(text) {
+  const t = String(text || "");
+  const code = (t.match(/\b(403|429|503)\b/) || [])[1];
+  if (code === "429") return "слишком много запросов";
+  if (code) return `сайт ответил отказом (${code})`;
+  return human(t).message;
 }
 
 function OverviewSkeleton() {

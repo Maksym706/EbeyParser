@@ -2,7 +2,7 @@
 import { html, cx, useState } from "../lib/html.js";
 import { api } from "../lib/api.js";
 import { appStore, useStore } from "../lib/store.js";
-import { until, ago } from "../lib/format.js";
+import { until, ago, untilTime, localizeText } from "../lib/format.js";
 import { useNow } from "../lib/hooks.js";
 import { Icon, Button, IconButton, StatusDot, Progress, toast, Modal } from "../ui/index.js";
 
@@ -46,6 +46,43 @@ export function normalize(m) {
   };
 }
 
+const siteName = (host) => (/ebay/i.test(String(host || "")) ? "eBay" : "Kleinanzeigen");
+
+/**
+ * Active block pause (GET /monitor `cooldown`, or the per-site `http` rows of older servers):
+ * { until, label: "21:34", site: "Kleinanzeigen", strikes, text: "Kleinanzeigen попросил паузу — продолжу в 21:34" } | null
+ */
+export function cooldownOf(m, now = new Date()) {
+  if (!m) return null;
+  const raw = m.raw || m;
+  const c = raw.cooldown;
+  if (c && c.until && new Date(c.until) > now) {
+    const first = (c.hosts || [])[0];
+    const site = (c.sites && c.sites.length === 1 && c.sites[0]) || (c.sites && c.sites.length > 1 ? "Сайт" : siteName(first && typeof first === "object" ? first.host : first));
+    // server label "завтра в 03:10" → "завтра 03:10" (reads as «Пауза до завтра 03:10»)
+    const label = c.until_label ? String(c.until_label).replace(/^в\s+/, "").replace(/\s+в\s+/, " ") : untilTime(c.until, now);
+    const row = hostsOf(raw).find((h) => h && h.strikes && h.cooldown_until);
+    return { until: c.until, label, site, strikes: (row && row.strikes) || 0, text: localizeText(c.text_ru) || `${site} попросил паузу — продолжу ${/^\d/.test(label) ? "в " : ""}${label}` };
+  }
+  const blocked = hostsOf(raw).filter((h) => h && h.cooldown_until && new Date(h.cooldown_until) > now);
+  if (!blocked.length && raw.state !== "cooldown") return null;
+  if (!blocked.length) return { until: null, label: "", site: "Сайт", strikes: 0, text: localizeText(raw.state_ru) || "Сайт попросил паузу — продолжу сам" };
+  const b = blocked.reduce((a, h) => (new Date(h.cooldown_until) > new Date(a.cooldown_until) ? h : a));
+  const label = untilTime(b.cooldown_until, now);
+  const site = b.site && !/фото/.test(b.site) ? b.site : siteName(b.host);
+  return { until: b.cooldown_until, label, site, strikes: b.strikes || 0, text: `${site} попросил паузу — продолжу ${/^\d/.test(label) ? "в " : ""}${label}` };
+}
+
+const hostsOf = (raw) => (Array.isArray(raw.http) && raw.http.length ? raw.http : Array.isArray(raw.sites) ? raw.sites : []);
+
+/** Next check that will really happen: never a time inside a block pause. */
+export function nextCheckAt(m, now = new Date()) {
+  if (!m || !m.nextRunAt) return null;
+  const cd = cooldownOf(m, now);
+  if (cd && cd.until && new Date(cd.until) > new Date(m.nextRunAt)) return cd.until;
+  return m.nextRunAt;
+}
+
 export async function monitorAction(kind) {
   const labels = {
     run: ["Запускаю проверку…", "Проверка запущена"],
@@ -53,8 +90,14 @@ export async function monitorAction(kind) {
     resume: ["Продолжаю…", "Проверки снова работают"],
   };
   const [loading, done] = labels[kind];
+  const cd = kind === "run" ? cooldownOf(appStore.get().monitor) : null;
   try {
-    await toast.promise(api.post(`/monitor/${kind}`), { loading, success: done, error: (e) => e.message });
+    await toast.promise(api.post(`/monitor/${kind}`), {
+      loading,
+      // during a block pause the site is skipped: say so instead of promising a check
+      success: cd ? `${cd.site} на паузе${cd.label ? ` до ${cd.label}` : ""} — проверю его сразу после` : done,
+      error: (e) => e.message,
+    });
   } catch {
     /* toast shown */
   }
@@ -68,6 +111,8 @@ export function monitorSummary(m, now = new Date()) {
   if (m.running) return { tone: "blue", label: "Идёт проверка", detail: m.progressText ? `${m.progressText}` : "Это займёт пару минут", pulse: true };
   if (m.paused) return { tone: "neutral", label: "Проверки на паузе", detail: "Новые объявления не смотрю" };
   if (m.state === "stopped") return { tone: "neutral", label: "Автопроверка выключена", detail: m.lastRunAt ? `Последняя проверка ${ago(m.lastRunAt, now)}` : "Можно проверить вручную" };
+  const cd = cooldownOf(m, now);
+  if (cd) return { tone: "amber", label: cd.label ? `Пауза до ${cd.label}` : "Пауза", detail: `${cd.site} попросил паузу — продолжу сам`, cooldown: cd };
   const next = m.nextRunAt ? `Следующая проверка ${until(m.nextRunAt, now)}` : m.lastRunAt ? `Последняя проверка ${ago(m.lastRunAt, now)}` : "Ждёт первой проверки";
   return { tone: "green", label: "Работает", detail: next, pulse: true };
 }
@@ -84,8 +129,8 @@ function MonitorRailButton() {
   const [open, setOpen] = useState(false);
   const s = monitorSummary(m, now);
   return html`
-    <button type="button" class="monitor-rail" title=${`${s.label}. ${s.detail}`} aria-label=${`Мониторинг: ${s.label}`} onClick=${() => setOpen(true)}>
-      <${Icon} name="radar" size=${20} />
+    <button type="button" class="monitor-rail" data-tip=${`Проверки: ${s.label}`} aria-label=${`Проверки: ${s.label}. ${s.detail}`} onClick=${() => setOpen(true)}>
+      <${Icon} name="timer" size=${20} />
       <${StatusDot} tone=${s.tone} pulse=${s.pulse} />
     </button>
     <${Modal} open=${open} onClose=${() => setOpen(false)} title="Проверки" size="sm">

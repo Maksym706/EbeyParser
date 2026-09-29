@@ -5,8 +5,9 @@ import { useInterval } from "../lib/hooks.js";
 import { money } from "../lib/format.js";
 import { Icon, Tooltip } from "../ui/index.js";
 import "./icons-extra.js";
-import { decide, explainFlags, isSeen, shortAge, ageMinutes, distanceText, secondsLeft, countdown } from "./deal-model.js";
+import { decide, explainFlags, isSeen, isAuction, shortAge, ageMinutes, distanceText, secondsLeft, countdown } from "./deal-model.js";
 import { toggleStar, hideDeal, unhideDeal, writeToSeller } from "./deal-actions.js";
+import { openAd } from "./messages.js";
 
 /** Re-render every `ms` while the element is on screen (auction countdowns). */
 export function useVisibleTick(ref, ms, enabled = true) {
@@ -27,7 +28,7 @@ export function useVisibleTick(ref, ms, enabled = true) {
 /** The coloured "what to do" pill. */
 export function DecisionPill({ deal, size = "md", class: cls = "" }) {
   const ref = useRef(null);
-  const auction = deal.action === "bid" && deal.auction && deal.auction.ends_at;
+  const auction = isAuction(deal) && deal.auction && deal.auction.ends_at;
   useVisibleTick(ref, 1000, Boolean(auction));
   const d = decide(deal);
   return html`<div ref=${ref} class=${cx("dpill", `tone-${d.tone}`, `dpill--${size}`, d.urgent && "is-urgent", cls)}>
@@ -103,15 +104,20 @@ export function DealImage({ src, alt = "", class: cls = "", eager = false }) {
 /** Shared quick-actions row. */
 function QuickActions({ deal, compact = false }) {
   const starred = deal.status === "starred";
+  const bid = decide(deal).kind === "bid";
   const stop = (fn) => (e) => {
     e.preventDefault();
     e.stopPropagation();
     fn();
   };
   return html`<div class=${cx("qa", compact && "qa--compact")}>
-    <button type="button" class="qa__btn qa__btn--main" onClick=${stop(() => writeToSeller(deal))} title="Скопировать сообщение продавцу и открыть объявление">
-      <${Icon} name="message-square" size=${16} /><span>Написать</span>
-    </button>
+    ${bid
+      ? html`<button type="button" class="qa__btn qa__btn--main" onClick=${stop(() => openAd(deal.url))} title="Открыть аукцион на eBay" aria-label="Открыть на eBay">
+          <${Icon} name="external-link" size=${16} /><span>На eBay</span>
+        </button>`
+      : html`<button type="button" class="qa__btn qa__btn--main" onClick=${stop(() => writeToSeller(deal))} title="Скопировать сообщение продавцу и открыть объявление" aria-label="Написать продавцу">
+          <${Icon} name="message-square" size=${16} /><span>Написать</span>
+        </button>`}
     <button
       type="button"
       class=${cx("qa__btn", starred && "is-on")}
@@ -200,7 +206,6 @@ export function DealRow({ deal, now, onOpen, selected = false, glow = false }) {
     <div class="drow__media">
       <${DealImage} src=${deal.image} />
       <span class="drow__dot" title=${d.verb}></span>
-      ${deal.status === "starred" && html`<span class="drow__star"><${Icon} name="star" size=${12} stroke=${2.5} /></span>`}
     </div>
     <div class="drow__body">
       <h3 class="drow__title">
@@ -208,6 +213,7 @@ export function DealRow({ deal, now, onOpen, selected = false, glow = false }) {
         <a class="dcard__link" href=${href} onClick=${(e) => onOpen && onOpen(deal, e)}>${deal.title}</a>
       </h3>
       <div class="drow__price">
+        <span class=${cx("drow__verb", `tone-${d.tone}`)} title=${deal.score != null ? `Оценка ${Math.round(deal.score)} из 100` : undefined}>${d.badge}</span>
         <span class="price-md num">${deal.is_free ? "Бесплатно" : money(deal.price)}</span>
         ${deal.negotiable && html`<span class="vb">VB</span>`}
         ${deal.market_price != null && html`<span class="dcard__market num">~${money(deal.market_price)}</span>`}

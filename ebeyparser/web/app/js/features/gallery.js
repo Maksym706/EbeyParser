@@ -17,7 +17,8 @@ export function Gallery({ images = [], title = "", stock = false }) {
   const go = (i) => {
     const n = (i + list.length) % list.length;
     const el = strip.current;
-    if (el) el.scrollTo({ left: n * el.clientWidth, behavior: "smooth" });
+    const still = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (el) el.scrollTo({ left: n * el.clientWidth, behavior: still ? "auto" : "smooth" });
     setIndex(n);
   };
   const onScroll = (e) => {

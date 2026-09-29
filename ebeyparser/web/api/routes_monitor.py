@@ -13,8 +13,10 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ... import __version__
+from ...errors_ru import friendly_run_error
 from ...models import RunSummary, utcnow
-from .context import ApiContext, get_ctx
+from ...timefmt import at_label, when_label
+from .context import DEMO_RUNS_KEY, ApiContext, get_ctx
 from .errors import ApiError
 from .events import sse_stream
 from .presenters import aware, deal_card, deal_detail, iso
@@ -48,12 +50,18 @@ async def _guarded(coro: Any, label: str) -> Any:
         return None
 
 
+NO_MONITOR_RU = ("Проверки сейчас недоступны: программа запущена без фоновых проверок. "
+                 "Перезапусти программу — проверки включатся сами")
+
+
 def start_run(ctx: ApiContext, *, strict: bool = True) -> bool:
     """Start a pass in the background. strict: raise if impossible, else return False."""
     mon = ctx.monitor
     if mon is None or not hasattr(mon, "run_once"):
         if strict:
-            raise ApiError(503, "unavailable", "Монитор не подключён — запусти программу командой `python -m ebeyparser`")
+            restart = callable(getattr(ctx.app.state, "restart_callback", None))
+            raise ApiError(503, "unavailable", NO_MONITOR_RU,
+                           action={"label_ru": "Перезапустить", "href": "/settings/data"} if restart else None)
         return False
     if monitor_running(ctx):
         if strict:
@@ -64,13 +72,48 @@ def start_run(ctx: ApiContext, *, strict: bool = True) -> bool:
 
 
 def run_view(run: RunSummary) -> dict[str, Any]:
+    """A pass for the UI: errors in plain Russian (old runs may hold technical text; the
+    technical text of new runs is in `error_details`), times also as local labels."""
     data = run.model_dump(mode="json")
     duration = None
     if run.finished_at is not None:
         duration = round((aware(run.finished_at) - aware(run.started_at)).total_seconds(), 1)
     data["duration_seconds"] = duration
     data["error_count"] = len(run.errors)
+    data["errors"] = [friendly_run_error(e) for e in run.errors]
+    details = list(getattr(run, "error_details", []) or [])
+    if not details:
+        details = [e for e, shown in zip(run.errors, data["errors"]) if e != shown]
+    data["error_details"] = details
+    data["started_at_label"] = when_label(run.started_at)
+    data["finished_at_label"] = when_label(run.finished_at) if run.finished_at else ""
     return data
+
+
+def demo_run_ids(ctx: ApiContext) -> set[int]:
+    try:
+        return {int(i) for i in (ctx.get_json(DEMO_RUNS_KEY, []) or [])}
+    except (TypeError, ValueError):
+        return set()
+
+
+def real_runs(ctx: ApiContext, limit: int) -> list[RunSummary]:
+    """Recent passes without the ones the demo data added."""
+    demo = demo_run_ids(ctx)
+    runs = ctx.db.list_runs(limit=limit + len(demo))
+    return [r for r in runs if r.id not in demo][:limit]
+
+
+SITE_LABELS = {"kleinanzeigen": "Kleinanzeigen", "ebay": "eBay"}
+
+
+def site_label(host: str) -> str:
+    """'www.kleinanzeigen.de' -> 'Kleinanzeigen' (the user never sees host names)."""
+    low = (host or "").lower()
+    for key, label in SITE_LABELS.items():
+        if key in low:
+            return label + (" (фото)" if low.startswith("img.") or "ebayimg" in low else "")
+    return host
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -108,21 +151,64 @@ async def http_hosts(ctx: ApiContext) -> list[dict[str, Any]]:
         used = info.get("requests_last_hour") or 0
         until = info.get("cooldown_until")
         last = info.get("last_block_at")
+        if isinstance(until, str):
+            until = _parse_dt(until)
+        if isinstance(last, str):
+            last = _parse_dt(last)
+        blocked = bool(info.get("blocked"))
         rows.append({
             "host": host,
+            "site": site_label(host),
             "requests_last_hour": used,
             "images_last_hour": info.get("images_last_hour") or 0,
             "limit_per_hour": limit,
             "load_percent": int(round(100 * used / limit)) if limit else None,
             "exhausted": limit is not None and limit > 0 and used >= limit,
-            "blocked": bool(info.get("blocked")),
+            "blocked": blocked,
             "cooldown_until": iso(until) if isinstance(until, datetime) else None,
+            "cooldown_until_label": when_label(until) if isinstance(until, datetime) else "",
             "strikes": info.get("strikes") or 0,
             "last_block_reason": str(info.get("last_block_reason") or ""),
             "last_block_at": iso(last) if isinstance(last, datetime) else None,
+            "last_block_at_label": when_label(last) if isinstance(last, datetime) else "",
             "note": str(info.get("note") or ""),
         })
     return rows
+
+
+def _parse_dt(raw: str) -> datetime | None:
+    try:
+        return aware(datetime.fromisoformat(raw.replace("Z", "+00:00")))
+    except ValueError:
+        return None
+
+
+def cooldown_view(hosts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """A site asked us to pause (block cooldown): {until, until_label, hosts, sites, text_ru}
+    or None. The latest end wins when several sites cool down."""
+    now = utcnow()
+    blocked: list[tuple[datetime, dict[str, Any]]] = []
+    for row in hosts:
+        until = _parse_dt(row["cooldown_until"]) if row.get("cooldown_until") else None
+        if row.get("blocked") and until is not None and until > now:
+            blocked.append((until, row))
+    if not blocked:
+        return None
+    until = max(u for u, _ in blocked)
+    sites = list(dict.fromkeys(row.get("site") or site_label(row["host"]) for _, row in blocked))
+    who = sites[0] if len(sites) == 1 else "Сайт"
+    return {
+        "until": iso(until),
+        "until_label": when_label(until),
+        "hosts": [row["host"] for _, row in blocked],
+        "sites": sites,
+        "text_ru": f"{who} попросил паузу — продолжу {at_label(until)}",
+    }
+
+
+def only_kleinanzeigen(ctx: ApiContext) -> bool:
+    enabled = [s for s in ctx.config.searches if s.enabled]
+    return bool(enabled) and all(s.source == "kleinanzeigen" for s in enabled)
 
 
 async def backlog(ctx: ApiContext) -> dict[str, int | None]:
@@ -154,14 +240,14 @@ async def monitor_view(ctx: ApiContext, *, with_hosts: bool = True) -> dict[str,
     cfg = ctx.config
     next_run = getattr(mon, "next_run_at", None) if mon is not None else None
     last = getattr(mon, "last_summary", None) if mon is not None else None
-    if last is None:
-        runs = ctx.db.list_runs(limit=1)
-        last = runs[0] if runs else None
     running = monitor_running(ctx)
     paused = bool(getattr(mon, "paused", False))
     progress = getattr(mon, "progress", None) if running else None
+    hosts = await http_hosts(ctx)
+    cooldown = cooldown_view(hosts)
+    looping = loop_active(ctx)
     if mon is None:
-        state, text = "off", "Монитор выключен"
+        state, text = "off", "Проверки выключены"
     elif running:
         state = "running"
         text = "Идёт проверка…"
@@ -169,30 +255,38 @@ async def monitor_view(ctx: ApiContext, *, with_hosts: bool = True) -> dict[str,
             text = f"Идёт проверка… {progress.get('index')} из {progress.get('total')} поисков"
     elif paused:
         state, text = "paused", "На паузе"
+    elif cooldown is not None and (looping or isinstance(next_run, datetime)):
+        state, text = "cooldown", cooldown["text_ru"]
     elif isinstance(next_run, datetime):
         state = "idle"
         seconds = (aware(next_run) - utcnow()).total_seconds()
         text = "Проверка вот-вот начнётся" if seconds <= 60 else f"Следующая проверка через {int(seconds // 60)} мин"
-    elif loop_active(ctx):
-        state, text = "idle", "Монитор запущен"
+    elif looping:
+        state, text = "idle", "Проверки включены"
     else:
-        state, text = "stopped", "Автопроверка выключена"
-    return {
+        state, text = "stopped", "Автопроверка выключена — проверяю только по кнопке «Проверить сейчас»"
+    if last is None or (isinstance(last, RunSummary) and last.id in demo_run_ids(ctx)):
+        runs = real_runs(ctx, 1)
+        last = runs[0] if runs else None
+    view: dict[str, Any] = {
         "available": mon is not None,
         "running": running,
         "paused": paused,
-        "loop": loop_active(ctx),
+        "loop": looping,
         "state": state,
         "state_ru": text,
         "next_run_at": iso(next_run) if isinstance(next_run, datetime) else None,
+        "next_run_label": when_label(next_run) if isinstance(next_run, datetime) else "",
+        "cooldown": cooldown,
         "interval_minutes": cfg.general.interval_minutes,
         "progress": dict(progress) if isinstance(progress, dict) else None,
         "last_summary": run_view(last) if isinstance(last, RunSummary) else None,
         "backlog": await backlog(ctx),
-        "http": await http_hosts(ctx) if with_hosts else [],
-        "learning": _learning(ctx),
+        "http": hosts if with_hosts else [],
         "searches_enabled": sum(1 for s in cfg.searches if s.enabled),
     }
+    view["learning"] = _learning(ctx, view)
+    return view
 
 
 # ------------------------------------------------------------------- routes
@@ -204,8 +298,16 @@ async def monitor_get(ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
 @router.post("/monitor/run", status_code=202, responses=ERRORS, summary="Проверить сейчас (в фоне)")
 @router.post("/run", status_code=202, include_in_schema=False)
 async def monitor_run(ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
+    cooldown = cooldown_view(await http_hosts(ctx))
+    if cooldown is not None and only_kleinanzeigen(ctx) and ctx.monitor is not None:
+        # every search would only meet the pause: say so instead of "Проверка запущена"
+        raise ApiError(409, "cooldown", f"{cooldown['text_ru']}. Сейчас проверять нельзя: это защита от блокировки")
     start_run(ctx)
-    return {"started": True, "monitor": await monitor_view(ctx, with_hosts=False)}
+    message = "Проверка запущена"
+    if cooldown is not None:
+        message = f"Проверка запущена. {cooldown['text_ru']}: поиски на этом сайте подождут"
+    return {"started": True, "message_ru": message, "cooldown": cooldown,
+            "monitor": await monitor_view(ctx, with_hosts=False)}
 
 
 @router.post("/monitor/pause", responses=ERRORS, summary="Пауза автопроверок (сохраняется после перезапуска)")
@@ -213,7 +315,7 @@ async def monitor_pause(ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
     mon = ctx.monitor
     pause = getattr(mon, "pause", None)
     if not callable(pause):
-        raise ApiError(503, "unavailable", "Монитор не подключён — пауза недоступна")
+        raise ApiError(503, "unavailable", NO_MONITOR_RU)
     pause()
     if not isinstance(getattr(mon, "on_event", None), list):
         ctx.hub.publish("monitor_paused", {"paused": True})
@@ -225,16 +327,16 @@ async def monitor_resume(ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
     mon = ctx.monitor
     resume = getattr(mon, "resume", None)
     if not callable(resume):
-        raise ApiError(503, "unavailable", "Монитор не подключён")
+        raise ApiError(503, "unavailable", NO_MONITOR_RU)
     resume()
     if not isinstance(getattr(mon, "on_event", None), list):
         ctx.hub.publish("monitor_resumed", {"paused": False})
     return await monitor_view(ctx, with_hosts=False)
 
 
-@router.get("/runs", summary="Последние проверки (новые сверху)")
+@router.get("/runs", summary="Последние проверки (новые сверху; без проверок из демо-данных)")
 async def runs(limit: int = Query(30, ge=1, le=500), ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
-    return {"items": [run_view(r) for r in ctx.db.list_runs(limit=limit)]}
+    return {"items": [run_view(r) for r in real_runs(ctx, limit)]}
 
 
 @router.get("/events", summary="Server-Sent Events (text/event-stream): run_started, run_progress, run_finished, "
@@ -286,7 +388,8 @@ async def check_url(body: CheckIn, ctx: ApiContext = Depends(get_ctx)) -> JSONRe
 
     mon = ctx.monitor
     if mon is None or not callable(getattr(mon, "evaluate_url", None)):
-        raise ApiError(503, "unavailable", "Монитор не подключён — проверка ссылки недоступна")
+        raise ApiError(503, "unavailable", "Проверка ссылки сейчас недоступна: программа запущена без фоновых "
+                                           "проверок. Перезапусти программу")
     url = body.url.strip()
     ad_id = ad_id_from_url(url)
     if not ad_id or not url.lower().startswith(("http://", "https://")):

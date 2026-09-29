@@ -819,3 +819,58 @@
   border-color: var(--red-border);
   color: var(--red-text);
 }
+
+/* ================================================================ fix pass (UX report) */
+/* P2-3: sticky bars are opaque — scrolled text must not ghost through them */
+.appbar,
+.topbar {
+  background: var(--bg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+/* P2-30: the top search field shows a real focus ring */
+.topsearch:focus-within {
+  border-color: var(--blue-solid);
+  box-shadow: var(--ring);
+}
+
+/* P2-14: the icon rail explains itself on hover / keyboard focus */
+.sidebar.is-collapsed .side-link,
+.monitor-rail {
+  position: relative;
+}
+.sidebar.is-collapsed [data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  z-index: var(--z-tooltip);
+  left: calc(100% + 10px);
+  top: 50%;
+  transform: translate(-4px, -50%);
+  padding: 6px 10px;
+  border-radius: var(--r-sm);
+  background: var(--ink);
+  color: var(--on-ink);
+  font-size: var(--fs-caption);
+  font-weight: var(--weight-medium);
+  line-height: var(--lh-caption);
+  white-space: nowrap;
+  box-shadow: var(--shadow-md);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--d-fast) var(--ease-standard), transform var(--d-fast) var(--ease-standard);
+}
+.sidebar.is-collapsed [data-tip]:hover::after,
+.sidebar.is-collapsed [data-tip]:focus-visible::after {
+  opacity: 1;
+  transform: translate(0, -50%);
+  transition-delay: 250ms;
+}
+.topsearch {
+  width: min(360px, 40vw);
+}
+@media (pointer: coarse) {
+  .monitor-pill--compact {
+    width: 44px;
+    height: 44px;
+  }
+}

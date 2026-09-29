@@ -11,9 +11,20 @@ export {
   useRef,
   useReducer,
   useContext,
-  useId,
   useErrorBoundary,
 } from "preact/hooks";
+import { useState as useStateHook } from "preact/hooks";
+
+let uid = 0;
+/**
+ * Stable id, unique across ALL render roots. Preact's own useId restarts in every root, and our
+ * Portals (drawers, dialogs) are separate roots — so <label for> could point at a control on the
+ * page underneath (P2-24).
+ */
+export function useId() {
+  const [id] = useStateHook(() => `id-${(++uid).toString(36)}`);
+  return id;
+}
 
 export const html = htm.bind(h);
 export { h, render, Fragment, createContext, cloneElement, createRef, toChildArray };

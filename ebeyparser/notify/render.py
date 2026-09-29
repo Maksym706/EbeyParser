@@ -155,9 +155,12 @@ def format_time_left(ends_at: datetime, now: datetime | None = None) -> str:
 
 
 def _format_end_clock(ends_at: datetime, now: datetime) -> str:
-    """Auction end in the machine's local time: "сегодня в 21:30" / "завтра в 09:05" / "28.09 в 21:30"."""
-    end = _utc(ends_at).astimezone()
-    today = _utc(now).astimezone().date()
+    """Auction end in the user's time zone (general.timezone, not the host's):
+    "сегодня в 21:30" / "завтра в 09:05" / "28.09 в 21:30"."""
+    from ..timefmt import to_local
+
+    end = to_local(_utc(ends_at))
+    today = to_local(_utc(now)).date()
     if end.date() == today:
         day = "сегодня"
     elif end.date() == today + timedelta(days=1):

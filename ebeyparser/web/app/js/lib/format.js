@@ -48,6 +48,82 @@ function toDate(v) {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
+// ------------------------------------------------------------------ Berlin time
+// The program runs in Germany: every time the UI prints is Europe/Berlin, whatever the
+// browser's own time zone is (a phone abroad, a UTC container…).
+export const TZ = "Europe/Berlin";
+const fmtHM = new Intl.DateTimeFormat("ru-RU", { timeZone: TZ, hour: "2-digit", minute: "2-digit" });
+const fmtDayKey = new Intl.DateTimeFormat("en-CA", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit" });
+const fmtDM = new Intl.DateTimeFormat("ru-RU", { timeZone: TZ, day: "2-digit", month: "2-digit" });
+const fmtDMY = new Intl.DateTimeFormat("ru-RU", { timeZone: TZ, day: "2-digit", month: "2-digit", year: "numeric" });
+const fmtLong = new Intl.DateTimeFormat("ru-RU", { timeZone: TZ, day: "numeric", month: "long" });
+const fmtDT = new Intl.DateTimeFormat("ru-RU", { timeZone: TZ, day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+const fmtWeekday = new Intl.DateTimeFormat("ru-RU", { timeZone: TZ, weekday: "short" });
+
+/** "21:34" in Berlin time. */
+export function clockTime(value) {
+  const d = toDate(value);
+  return d ? fmtHM.format(d) : "";
+}
+
+/** "2026-09-29": the Berlin calendar day (for <input type=date> and "today" checks). */
+export function berlinDay(value = new Date()) {
+  const d = toDate(value);
+  return d ? fmtDayKey.format(d) : "";
+}
+
+/** Whole days between two Berlin calendar days (b − a). */
+function dayDiff(a, b) {
+  const ka = berlinDay(a);
+  const kb = berlinDay(b);
+  if (!ka || !kb) return null;
+  return Math.round((Date.parse(`${kb}T12:00:00Z`) - Date.parse(`${ka}T12:00:00Z`)) / 86400000);
+}
+
+/** "15.09" (this year) / "15.09.2025". */
+export function dateShort(value, now = new Date()) {
+  const d = toDate(value);
+  if (!d) return "";
+  return berlinDay(d).slice(0, 4) === berlinDay(now).slice(0, 4) ? fmtDM.format(d) : fmtDMY.format(d);
+}
+
+/** "в 21:34" today, "завтра в 08:10", "вчера в 19:02", "пн в 10:00" (this week), "15.09 в 21:34". */
+export function whenTime(value, now = new Date()) {
+  const d = toDate(value);
+  if (!d) return "";
+  const days = dayDiff(now, d);
+  const hm = fmtHM.format(d);
+  if (days === 0) return `в ${hm}`;
+  if (days === 1) return `завтра в ${hm}`;
+  if (days === -1) return `вчера в ${hm}`;
+  if (days > 1 && days < 7) return `${fmtWeekday.format(d)} в ${hm}`;
+  return `${dateShort(d, now)} в ${hm}`;
+}
+
+/** For «пауза до …»: "21:34" today, "завтра 03:10", "30.09 03:10". */
+export function untilTime(value, now = new Date()) {
+  const d = toDate(value);
+  if (!d) return "";
+  const days = dayDiff(now, d);
+  const hm = fmtHM.format(d);
+  if (days === 0) return hm;
+  if (days === 1) return `завтра ${hm}`;
+  return `${dateShort(d, now)} ${hm}`;
+}
+
+const ISO_RE = /\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?/g;
+
+/** Safety net for server texts: "пауза до 2026-09-29T19:34:42+00:00" → "пауза до 21:34". */
+export function localizeText(text, now = new Date()) {
+  if (text == null) return "";
+  return String(text).replace(ISO_RE, (iso) => {
+    const zoned = /(?:Z|[+-]\d{2}:?\d{2})$/.test(iso);
+    const d = toDate(zoned ? iso : `${iso.replace(" ", "T")}Z`);
+    if (!d) return iso;
+    return dayDiff(now, d) === 0 ? fmtHM.format(d) : `${dateShort(d, now)} ${fmtHM.format(d)}`;
+  });
+}
+
 /** Human span: 45 → "45 с", 600 → "10 мин", 5400 → "1 ч 30 мин", 2 days → "2 дн". */
 export function span(seconds) {
   const s = Math.max(0, Math.round(Number(seconds) || 0));
@@ -70,14 +146,12 @@ export function ago(value, now = new Date()) {
   if (diff < 45) return "только что";
   if (diff < 3600) return `${Math.max(1, Math.round(diff / 60))} мин назад`;
   if (diff < 6 * 3600) return `${Math.round(diff / 3600)} ч назад`;
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const day = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  const days = Math.round((today - day) / 86400000);
-  const hm = d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  const days = dayDiff(d, now);
+  const hm = fmtHM.format(d);
   if (days === 0) return `сегодня в ${hm}`;
   if (days === 1) return `вчера в ${hm}`;
   if (days < 7) return `${days} ${plural(days, "день", "дня", "дней")} назад`;
-  return d.toLocaleDateString("ru-RU", { day: "numeric", month: "long" });
+  return fmtLong.format(d);
 }
 
 /** "через 12 мин", "сейчас". */
@@ -92,7 +166,7 @@ export function until(value, now = new Date()) {
 export function dateTime(value) {
   const d = toDate(value);
   if (!d) return "—";
-  return d.toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  return fmtDT.format(d);
 }
 
 export function bytes(n) {

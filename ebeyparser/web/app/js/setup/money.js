@@ -52,6 +52,26 @@ export function maxBuyFor(market, { min_profit = 40, min_roi = 0.25, safety_marg
 export function ExampleBox({ pricing, market = 420, product = "iPhone 13 128 GB" }) {
   const buy = maxBuyFor(market, pricing);
   const profit = Math.round(market * (1 - (pricing.safety_margin_percent ?? 10) / 100) - buy);
+  const bad =
+    pricing.min_profit == null ||
+    pricing.min_profit < 0 ||
+    pricing.min_roi == null ||
+    pricing.min_roi < 0 ||
+    pricing.min_roi > 10 ||
+    pricing.safety_margin_percent == null ||
+    pricing.safety_margin_percent < 0 ||
+    pricing.safety_margin_percent > 50;
+  if (bad || buy <= 0) {
+    // impossible thresholds: say it plainly instead of «цена до 0 € · прибыль +378 €» (P1-9)
+    return html`<div class="example-box example-box--warn" aria-live="polite">
+      <div class="example-box__title"><${Icon} name="triangle-alert" size=${16} />С такими порогами я не найду ничего</div>
+      <p class="example-box__text">
+        ${bad
+          ? "Исправь значения, отмеченные красным: прибыль от 0 €, ROI от 0 до 1000 %, запас на риск от 0 до 50 %."
+          : html`Чтобы ${product} за ~${money(market)} прошёл по порогам, его пришлось бы отдать даром. Уменьши минимальную прибыль или ROI.`}
+      </p>
+    </div>`;
+  }
   return html`<div class="example-box" aria-live="polite">
     <div class="example-box__title"><${Icon} name="lightbulb" size=${16} />Пример</div>
     <p class="example-box__text">
@@ -87,7 +107,7 @@ export function BudgetField({ value, onChange, min = 50, max = 1500, step = 10 }
       onChange=${onChange}
     />
     <div class="budget__input">
-      <${NumberInput} value=${value} onChange=${(v) => onChange(v == null ? min : v)} min=${min} max=${max} suffix="€" aria-label="Бюджет, евро" />
+      <${NumberInput} value=${value} onChange=${(v) => onChange(v)} min=${min} max=${max} suffix="€" aria-label="Бюджет, евро" />
     </div>
   </div>`;
 }
@@ -98,15 +118,16 @@ export function ManualPricing({ pricing, onChange, errors = {} }) {
   return html`<div class="manual-pricing">
     <label class="mini-field">
       <span class="mini-field__label">Мин. прибыль<${HelpTip} title="Минимальная прибыль">Сколько евро должно остаться после продажи, чтобы я сказал «Покупай».<//></span>
-      <${NumberInput} value=${pricing.min_profit} min=${0} onChange=${(v) => set("min_profit", v ?? 0)} suffix="€" invalid=${errors.min_profit} />
+      <${NumberInput} value=${pricing.min_profit} min=${0} max=${10000} onChange=${(v) => set("min_profit", v)} suffix="€" invalid=${errors.min_profit} />
     </label>
     <label class="mini-field">
       <span class="mini-field__label">Мин. ROI<${HelpTip} title="ROI">Сколько заработаешь на каждый вложенный евро. 25 % — купил за 100 €, заработал 25 €.<//></span>
-      <${NumberInput} value=${pricing.min_roi != null ? Math.round(pricing.min_roi * 1000) / 10 : null} min=${0} max=${1000} onChange=${(v) => set("min_roi", v == null ? 0 : v / 100)} suffix="%" invalid=${errors.min_roi} />
+      <${NumberInput} value=${pricing.min_roi != null ? Math.round(pricing.min_roi * 1000) / 10 : null} min=${0} max=${1000} onChange=${(v) => set("min_roi", v == null ? null : v / 100)} suffix="%" invalid=${errors.min_roi} />
     </label>
     <label class="mini-field">
       <span class="mini-field__label">Запас на риск<${HelpTip} title="Запас на торг и риск">Насколько ниже рынка считать цену продажи: торг покупателя, время, мелкие дефекты.<//></span>
-      <${NumberInput} value=${pricing.safety_margin_percent} min=${0} max=${90} onChange=${(v) => set("safety_margin_percent", v ?? 0)} suffix="%" invalid=${errors.safety_margin_percent} />
+      <${NumberInput} value=${pricing.safety_margin_percent} min=${0} max=${50} onChange=${(v) => set("safety_margin_percent", v)} suffix="%" invalid=${errors.safety_margin_percent} />
+      ${pricing.safety_margin_percent > 30 && pricing.safety_margin_percent <= 50 && html`<span class="mini-field__warn">Больше 30 % — находок будет мало</span>`}
     </label>
   </div>`;
 }

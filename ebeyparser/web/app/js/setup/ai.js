@@ -1,7 +1,7 @@
 // «Нейросеть»: auto-detect LM Studio / Ollama, pick a vision model, test it on a sample ad
 // (POST /ai/detect, POST /ai/test). Brief §4.1.6; also used in Settings → Нейросеть.
 import { html, useEffect, useState, useRef } from "../lib/html.js";
-import { api } from "../lib/api.js";
+import { api, humanize } from "../lib/api.js";
 import { LINKS } from "../lib/links.js";
 import { useInterval } from "../lib/hooks.js";
 import { Icon, Button, Select, Skeleton, TestResult, Chip, CopyButton, Badge, ExternalLink } from "../ui/index.js";
@@ -46,9 +46,12 @@ function modelOptions(servers) {
 
 /** Result card of POST /ai/test in human words. */
 export function AiTestResult({ result, error }) {
-  if (error) return html`<${TestResult} state="fail" title="Не смог проверить" detail=${error.message} />`;
+  if (error) return html`<${TestResult} state="fail" title="Не смог проверить" detail=${error.message} details=${error.details} />`;
   if (!result) return null;
-  if (!result.ok) return html`<${TestResult} state="fail" title=${result.error_ru || result.message_ru || "Нейросеть не ответила"} detail=${!result.server_ok ? "Открой LM Studio → Developer → Start Server" : ""} />`;
+  if (!result.ok) {
+    const h = humanize(result.error_ru || result.message_ru || "Нейросеть не ответила");
+    return html`<${TestResult} state="fail" title=${h.message} detail=${!result.server_ok && !/Start Server/.test(h.message) ? "Открой LM Studio → Developer → Start Server" : ""} details=${h.details} />`;
+  }
   const v = result.verdict;
   const detail = v
     ? html`<dl class="ai-seen">
@@ -63,6 +66,13 @@ export function AiTestResult({ result, error }) {
     ${result.warning_ru && html`<${TestResult} state="warn" title=${result.warning_ru} />`}
   </div>`;
 }
+
+/** "на процессоре 1–3 минуты" → "На процессоре 1–3 минуты." */
+const sentence = (t) => {
+  const s = String(t || "").trim();
+  if (!s) return s;
+  return s[0].toUpperCase() + s.slice(1) + (/[.!?…]$/.test(s) ? "" : ".");
+};
 
 function Steps({ items }) {
   return html`<ol class="mini-steps">
@@ -96,7 +106,7 @@ const ART = {
  *   save — write provider/base_url/model on a successful test (onboarding: true)
  *   onDone(result) — called after a successful test
  */
-export function AiConnect({ save = true, onDone, current }) {
+export function AiConnect({ save = true, onDone, current, onChoice }) {
   const { loading, data, error, detect } = useAiDetect();
   const [choice, setChoice] = useState("");
   const [gpu, setGpu] = useState(null);
@@ -113,6 +123,16 @@ export function AiConnect({ save = true, onDone, current }) {
     if (!choice || !options.some((o) => o.value === choice)) setChoice((cur || sug || options.find((o) => o.vision) || options[0]).value);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data]);
+
+  // tell the onboarding which model «Дальше» would accept (a found model that sees photos)
+  useEffect(() => {
+    if (!onChoice) return;
+    if (variant !== "found" || !choice) return onChoice(null);
+    const [provider, base_url, ...rest] = choice.split("|");
+    const opt = options.find((o) => o.value === choice);
+    onChoice({ provider, base_url, model: rest.join("|"), vision: Boolean(opt && opt.vision) });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [variant, choice]);
 
   // B / C: poll every 5 s while the step is open — "как только запустишь сервер — я сам увижу"
   useInterval(() => detect(true), !loading && variant && variant !== "found" ? 5000 : null);
@@ -147,7 +167,7 @@ export function AiConnect({ save = true, onDone, current }) {
   }
   if (error && !data) {
     return html`<div class="ai-card ai-card--neutral">
-      <${TestResult} state="fail" title="Не смог проверить" detail=${error.message} />
+      <${TestResult} state="fail" title="Не смог проверить" detail=${error.message} details=${error.details} />
       <${Button} icon="refresh-cw" onClick=${() => detect()}>Ещё раз<//>
     </div>`;
   }
@@ -192,6 +212,37 @@ export function AiConnect({ save = true, onDone, current }) {
   // C: nothing found
   const presets = (data && data.gpu_presets) || [];
   const chosen = presets.find((p) => p.key === gpu);
+  // AI is set up (a saved model) but nobody answers: LM Studio is just closed — not «install it» (P1-21)
+  if (current && current.model && current.enabled) {
+    return html`<div class="ai-card ai-card--amber">
+      <div class="ai-card__head">
+        <${Icon} name="triangle-alert" size=${20} class="text-amber" />
+        <b>LM Studio не отвечает — похоже, он закрыт</b>
+      </div>
+      <${Steps}
+        items=${[
+          { title: "Открой LM Studio на этом компьютере" },
+          { title: "Developer → Start Server", body: "И включи автозапуск сервера, чтобы проверка работала после перезагрузки.", art: ART.server },
+        ]}
+      />
+      <div class="ai-card__foot">
+        <span class="ai-card__watch"><span class="status-dot status-dot--amber is-pulsing"></span>Как только сервер запустится — я сам увижу</span>
+        <${Button} size="sm" variant="ghost" icon="refresh-cw" onClick=${() => detect()}>Проверить сейчас<//>
+      </div>
+      <details class="guide">
+        <summary>LM Studio не установлен? Как поставить за 5 минут</summary>
+        <div class="guide__body">
+          <${Steps}
+            items=${[
+              { title: html`Скачай LM Studio — это бесплатно`, body: html`<${ExternalLink} href=${LINKS.lmStudio}>lmstudio.ai<//>` },
+              { title: html`Во вкладке Discover скачай <b>Qwen2.5-VL-7B</b>`, body: "Модель, которая понимает фото и немецкий текст." },
+              { title: "Developer → Start Server" },
+            ]}
+          />
+        </div>
+      </details>
+    </div>`;
+  }
   return html`<div class="ai-card ai-card--neutral">
     <div class="ai-card__head">
       <${Icon} name="server" size=${20} />
@@ -200,7 +251,7 @@ export function AiConnect({ save = true, onDone, current }) {
     <${Steps}
       items=${[
         { title: html`Скачай LM Studio — это бесплатно`, body: html`<${ExternalLink} href=${LINKS.lmStudio}>lmstudio.ai<//>`, art: ART.download },
-        { title: html`Во вкладке Discover скачай <b>${chosen ? chosen.model_ru : "Qwen2.5-VL-7B"}</b>`, body: chosen ? chosen.note_ru : "Модель, которая понимает фото и немецкий текст.", art: ART.discover },
+        { title: html`Во вкладке Discover скачай <b>${chosen ? chosen.model_ru : "Qwen2.5-VL-7B"}</b>`, body: chosen ? sentence(chosen.note_ru) : "Модель, которая понимает фото и немецкий текст.", art: ART.discover },
         { title: "Developer → Start Server", body: "И включи автозапуск сервера, чтобы проверка работала после перезагрузки.", art: ART.server },
       ]}
     />

@@ -1,6 +1,6 @@
 // German seller messages (brief §7.4): templates, category add-ons, Russian translations,
 // the default choice per deal, plus clipboard + "open the ad" helpers.
-import { humanOffer, productType } from "./deal-model.js";
+import { humanOffer, productType, actionOf } from "./deal-model.js";
 
 export const DAYS = [
   { value: "heute", label: "сегодня", ru: "сегодня" },
@@ -108,7 +108,7 @@ export const ADDONS = {
 /** Which template to start with (brief §7.4 "Composer logic"). */
 export function defaultTemplate(d) {
   if (!d) return "available";
-  const action = d.action || (d.verdict === "buy" ? "buy" : "");
+  const action = actionOf(d);
   if (action === "haggle") return "offer";
   if (action === "bid") return "condition";
   if (action === "buy" && d.price != null && d.max_buy_price != null && d.price <= d.max_buy_price * 0.8) return "buy_now";

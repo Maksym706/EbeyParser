@@ -247,13 +247,14 @@ def test_settings_patch_validates_and_keeps_comments(api) -> None:
     err = bad.json()["error"]
     assert err["code"] == "validation" and "general.max_pages" in err["fields"]
     bad = c.patch("/api/v1/settings", json={"general": {"interval_minutes": 2}})
-    assert bad.json()["error"]["fields"] == {"general.interval_minutes": "не меньше 5"}
+    assert bad.json()["error"]["fields"] == {
+        "general.interval_minutes": "Проверять можно не чаще раза в 5 минут и не реже раза в сутки"}
     bad = c.patch("/api/v1/settings", json={"notifications": {"telegram": {"bot_token": "x"}},
                                             "general": {"nope": 1}, "cloud": {}})
     fields = bad.json()["error"]["fields"]
     assert set(fields) == {"notifications.telegram.bot_token", "general.nope", "cloud"}
     bad = c.patch("/api/v1/settings", json={"notifications": {"telegram": {"enabled": True}}})
-    assert "сначала подключи бота" in bad.json()["error"]["fields"]["notifications.telegram.enabled"]
+    assert "Сначала подключи бота" in bad.json()["error"]["fields"]["notifications.telegram.enabled"]
     bad = c.patch("/api/v1/settings", json={"ai": {"base_url": "ftp://x"}})
     assert "ai.base_url" in bad.json()["error"]["fields"]
     assert load_config(path).general.interval_minutes == 20  # nothing written by failed patches
@@ -275,8 +276,8 @@ def test_settings_region_moves_searches(api) -> None:
     saved = load_config(path).searches
     assert saved[0].name == "Handy & Telefon · Leipzig 50 км" and saved[0].location == "Leipzig"
     assert saved[1].location == "Leipzig" and saved[1].radius_km == 50 and saved[1].name == "Для себя: RTX 3090"
-    assert r.json()["region"] == {"location": "Leipzig", "radius_km": 50, "radius_choices": [0, 5, 10, 20, 30, 50, 100,
-                                                                                               150, 200]}
+    assert r.json()["region"] == {"location": "Leipzig", "location_label": "Leipzig", "radius_km": 50,
+                                  "radius_choices": [0, 5, 10, 20, 30, 50, 100, 150, 200]}
 
 
 def test_secrets_go_to_env_file_only(api) -> None:
@@ -389,14 +390,16 @@ def test_deals_feed_filters_sort_and_pages(api) -> None:
                 "verdict", "score", "reasons", "red_flags", "ai_flags", "ai_checked", "status", "note",
                 "distance_km", "posted_at_text", "first_seen", "source", "search_name", "seen"):
         assert key in card, key
-    assert card["verdict_label"] == "Покупать" and card["status"] == "new" and card["seen"] is False
+    assert card["verdict_label"] == "Покупай" and card["status"] == "new" and card["seen"] is False
 
     def ids_of(**params: object) -> list[str]:
         r = c.get("/api/v1/deals", params=params)
         assert r.status_code == 200, r.text
         return [d["id"] for d in r.json()["items"]]
 
-    assert ids_of(action="haggle") == ["3000000001"]
+    # demo VB ads carry offers (RTX 3090, ThinkPad, HP Z440, eBay best offer), the auction bids
+    assert set(ids_of(action="haggle")) == {"3000000001", RTX, "2893987145", "2893655120", "ebay-205873410266"}
+    assert ids_of(action="bid") == [EBAY]
     assert set(ids_of(actionable=1)) >= {RTX, "3000000001"}
     assert set(ids_of(verdict="skip", status="any")) == {IPHONE_SKIP, "2893109876"}
     assert ids_of(status="ignored", verdict="all") == ["2893402211"]
@@ -427,7 +430,8 @@ def test_deals_feed_filters_sort_and_pages(api) -> None:
     assert not {d["id"] for d in page1["items"]} & {d["id"] for d in page2["items"]}
 
     facets = c.get("/api/v1/deals", params={"facets": 1}).json()["facets"]
-    assert facets["verdict"]["good"] == 12 and facets["action"]["haggle"] == 1 and facets["hidden"] >= 1
+    assert facets["verdict"]["good"] == 12 and facets["action"]["haggle"] == 5 and facets["hidden"] >= 1
+    assert facets["action"]["bid"] == 1 and facets["action"]["buy"] == 4
     assert facets["purpose"]["personal"] == 2 and facets["unseen"] == 12
 
     bad = c.get("/api/v1/deals", params={"verdict": "great", "sort": "random", "max_km": "far", "since": "yesterday"})
@@ -466,7 +470,7 @@ def test_deal_pipeline_statuses_and_profit(api) -> None:
     contacted = c.patch(f"/api/v1/deals/{RTX}", json={"status": "contacted", "note": "Написал, жду"}).json()
     assert contacted["contacted_at"] and contacted["note"] == "Написал, жду"
     bought = c.patch(f"/api/v1/deals/{RTX}", json={"status": "bought"}).json()
-    assert bought["bought_price"] == 450 and bought["bought_at"] and bought["pipeline"]["steps"][2]["done"]
+    assert bought["bought_price"] == 420 and bought["bought_at"]  # the suggested offer (450 € VB) and bought["pipeline"]["steps"][2]["done"]
     fail = c.patch(f"/api/v1/deals/{RTX}", json={"status": "sold"})
     assert fail.status_code == 422 and "sold_price" in fail.json()["error"]["fields"]
     sold = c.patch(f"/api/v1/deals/{RTX}", json={"status": "sold", "sold_price": 600, "extra_costs": 12.5,
@@ -614,7 +618,7 @@ def test_summary_today_and_stats(api) -> None:
     assert today["potential_profit"] > 0 and today["unseen_good"] >= today["count"]
     assert today["monitor"]["state"] == "idle" and today["setup_checklist"]["total"] == 4
     overview = c.get("/api/v1/stats/overview").json()
-    assert overview["week"]["ads_seen"] == 14 and overview["week"]["deals"] == 9
+    assert overview["week"]["ads_seen"] == 14 and overview["week"]["deals"] == 8  # the auction is a "maybe"
     assert overview["totals"]["listings_total"] == 14
     db.update_deal_state(RTX, status="sold", bought_price=400.0, sold_price=520.0, bought_at=utcnow(), sold_at=utcnow())
     week = c.get("/api/v1/stats/overview").json()["week"]
@@ -627,7 +631,7 @@ def test_summary_today_and_stats(api) -> None:
 def test_notify_preview(api) -> None:
     c, app, config, *_ = api
     p = c.get("/api/v1/notify/preview", params={"min_score": 80, "verdicts": "buy"}).json()
-    assert p["would_send"] == 7 and p["verdicts"] == ["buy"] and p["current"]["min_score"] == 70
+    assert p["would_send"] == 6 and p["verdicts"] == ["buy"] and p["current"]["min_score"] == 70
     wide = c.get("/api/v1/notify/preview", params={"min_score": 50, "verdicts": "buy,maybe"}).json()
     assert wide["would_send"] == 11 and sum(d["count"] for d in wide["per_day"]) == 11  # the hidden one excluded
     assert c.get("/api/v1/notify/preview", params={"verdicts": "great"}).status_code == 422

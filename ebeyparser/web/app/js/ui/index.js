@@ -19,11 +19,14 @@ export {
   ExternalLink,
   HelpTip,
   CopyButton,
+  Details,
 } from "./core.js";
 export {
   Field,
   Input,
   NumberInput,
+  rangeError,
+  showFieldErrors,
   SecretInput,
   Textarea,
   Select,

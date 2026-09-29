@@ -157,8 +157,7 @@ STATUS_FILTERS: list[tuple[str, str]] = [
     ("any", "Все вместе со скрытыми"),
 ]
 NO_CHANNELS_MESSAGE = (
-    "Не настроен ни один канал уведомлений. Включи email или Telegram "
-    "в config.yaml (раздел notifications) и перезапусти приложение."
+    "Не настроен ни один канал уведомлений — подключи Telegram или почту в «Настройки» → «Уведомления»."
 )
 
 
@@ -1342,6 +1341,9 @@ def create_app(
     data/categories.json for 7 days). `bind_host` (default web.host): when it is not a
     loopback address every request needs `access_token` (default: data/web_token.txt)
     and /api/docs is off. `ai_probe(url)`: JSON GET used to find LM Studio / Ollama."""
+    from ..timefmt import apply_config as apply_timezone
+
+    apply_timezone(config)
     loopback = is_loopback(bind_host if bind_host is not None else config.web.host)
     if access_token is None and not loopback:
         access_token = ensure_token(config.data_path)
@@ -1922,7 +1924,7 @@ def create_app(
     def _require_editable() -> Path:
         path = app.state.config_path
         if path is None:
-            raise HTTPException(403, "Поиски только для чтения: приложение запущено без файла config.yaml")
+            raise HTTPException(403, "Поиски сейчас только для чтения — перезапусти программу обычным способом")
         return path
 
     def _persist(searches: list[SearchConfig]) -> None:
@@ -2039,7 +2041,8 @@ def create_app(
     async def api_run() -> JSONResponse:
         mon = app.state.monitor
         if mon is None or not hasattr(mon, "run_once"):
-            raise HTTPException(503, "Монитор не подключён — запусти приложение командой `ebeyparser run`")
+            raise HTTPException(503, "Проверки сейчас недоступны: программа запущена без фоновых проверок. "
+                                     "Перезапусти программу")
         if _monitor_running(app):
             raise HTTPException(409, "Проверка уже идёт — дождись её окончания")
         app.state.run_task = asyncio.create_task(_guarded(mon.run_once(), "manual run"), name="ebeyparser-run-once")

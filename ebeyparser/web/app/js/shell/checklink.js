@@ -1,9 +1,12 @@
 // «Проверить объявление» (brief §4.8): paste a Kleinanzeigen / eBay URL → POST /check (job) → decision.
 import { html, cx, useState, useRef, useEffect } from "../lib/html.js";
 import { api } from "../lib/api.js";
-import { money, percent } from "../lib/format.js";
+import { money, percent, whenTime } from "../lib/format.js";
+import { hue } from "../lib/tones.js";
 import { navigate } from "../lib/router.js";
-import { Icon, Button, Modal, Badge, Progress, Banner, Checklist, Segmented, NumberInput, Field } from "../ui/index.js";
+import { Icon, Button, Modal, Progress, Banner, Checklist, Segmented, NumberInput } from "../ui/index.js";
+import { normalizeCard, decide, explainFlags, sourceLabel } from "../features/deal-model.js";
+import { Countdown } from "../features/deal-card.js";
 
 const URL_RE = /^https?:\/\/([a-z0-9-]+\.)*(kleinanzeigen\.de|ebay\.[a-z.]+|ebay-kleinanzeigen\.de)\//i;
 
@@ -18,17 +21,6 @@ const STAGES = [
   { key: "done", label: "Считаю выгоду" },
 ];
 
-/** Decision verb + hue for a deal card (brief §4.2.3 decision pill). */
-export function decisionOf(card) {
-  const a = card.action;
-  const personal = card.purpose === "personal";
-  if (a === "buy") return { tone: "green", icon: personal ? "piggy-bank" : "trending-up", label: "Покупай", line: card.profit != null ? `${personal ? "Экономия" : "Прибыль"} ≈ ${money(card.profit, { sign: !personal })}` : "" };
-  if (a === "haggle")
-    return { tone: "amber", icon: "hand-coins", label: "Торгуйся", line: card.offer_price != null ? `Предложи ${money(card.offer_price)}${card.profit_at_offer != null ? ` → ${money(card.profit_at_offer, { sign: true })}` : ""}` : "" };
-  if (a === "bid") return { tone: "violet", icon: "gavel", label: "Аукцион", line: card.max_buy_price != null ? `Ставь максимум ${money(card.max_buy_price)}` : "" };
-  if (a === "watch" || card.verdict === "maybe") return { tone: "neutral", icon: "eye", label: "Подумай", line: (card.reasons && card.reasons[0]) || "" };
-  return { tone: "neutral", icon: "eye-off", label: "Не выгодно", line: (card.reasons && card.reasons[0]) || "" };
-}
 
 export function CheckLinkModal({ open, onClose, initialUrl = "" }) {
   const [url, setUrl] = useState(initialUrl);
@@ -53,7 +45,7 @@ export function CheckLinkModal({ open, onClose, initialUrl = "" }) {
   async function run(target_url = url) {
     const clean = String(target_url || "").trim();
     if (!looksLikeAdUrl(clean)) {
-      setError("Это не похоже на ссылку на объявление Kleinanzeigen или eBay. Скопируй адрес из браузера целиком.");
+      setError({ message: "Это не похоже на ссылку на объявление Kleinanzeigen или eBay. Скопируй адрес из браузера целиком." });
       setState("error");
       return;
     }
@@ -76,7 +68,7 @@ export function CheckLinkModal({ open, onClose, initialUrl = "" }) {
       setResult(res);
       setState("done");
     } catch (e) {
-      setError(e.missing ? "Проверка ссылок появится в следующем обновлении программы." : e.message);
+      setError(e.missing ? { message: "Проверка ссылок появится в следующем обновлении программы." } : e);
       setState("error");
     }
   }
@@ -93,7 +85,12 @@ export function CheckLinkModal({ open, onClose, initialUrl = "" }) {
     }
   };
 
-  const d = result && decisionOf(result);
+  // the same decision as the feed and the deal page (verb, rounded offer, auction, free, personal)
+  const card = result ? normalizeCard(result) : null;
+  const d = card ? decide(card) : null;
+  const flags = card ? explainFlags(card) : [];
+  const endsAt = card && card.auction && card.auction.ends_at;
+  const personal = card && (card.purpose === "personal" || card.profit_kind === "savings");
   return html`<${Modal} open=${open} onClose=${onClose} title="Проверить объявление" subtitle="Вставь ссылку — посчитаю, выгодно ли покупать" icon="scan-search">
     <form
       class="checklink__form"
@@ -143,48 +140,52 @@ export function CheckLinkModal({ open, onClose, initialUrl = "" }) {
       <${Checklist} items=${STAGES.map((s, i) => ({ label: s.label, state: i < stage ? "done" : i === stage ? "active" : "todo" }))} />
     </div>`}
 
-    ${state === "error" && error && html`<${Banner} tone="red" class="mt-4">${error}<//>`}
+    ${state === "error" && error && html`<${Banner} tone="red" class="mt-4" details=${error.details}>${error.message}<//>`}
 
     ${state === "done" &&
-    result &&
+    card &&
     html`<div class="checklink__result">
       <div class="checklink__head">
-        ${result.image
-          ? html`<img class="checklink__img" src=${result.image} alt="" referrerpolicy="no-referrer" />`
+        ${card.image
+          ? html`<img class="checklink__img" src=${card.image} alt="" referrerpolicy="no-referrer" />`
           : html`<span class="checklink__img checklink__img--empty"><${Icon} name="image" size=${22} /></span>`}
         <div class="grow">
-          <div class="checklink__title">${result.title}</div>
-          <div class="checklink__price money">${money(result.price)}${result.negotiable ? " · VB" : ""}</div>
+          <div class="checklink__title">${card.title}</div>
+          <div class="checklink__price money">${card.is_free ? "Бесплатно" : money(card.price)}${card.negotiable ? " · VB" : ""}</div>
         </div>
       </div>
-      <div class=${cx("decision", `decision--${d.tone}`)}>
+      <div class=${cx("decision", `decision--${hue(d.tone)}`)}>
         <${Icon} name=${d.icon} size=${20} />
         <div class="grow">
-          <div class="decision__verb">${d.label}</div>
-          ${d.line && html`<div class="decision__line">${d.line}</div>`}
+          <div class="decision__verb">${d.title || d.verb}</div>
+          ${d.sub && html`<div class="decision__line">${d.sub}</div>`}
+          ${d.kind === "bid" && endsAt && html`<div class="decision__line">конец через <b><${Countdown} endsAt=${endsAt} /></b> (${whenTime(endsAt)})</div>`}
         </div>
-        ${result.score != null && html`<span class="decision__score" title=${`${result.score} из 100`}>${result.score}</span>`}
+        ${card.score != null && html`<span class="decision__score" title=${`Оценка ${card.score} из 100`}>${card.score}</span>`}
       </div>
-      ${result.red_flags && result.red_flags.length > 0 &&
-      html`<${Banner} tone="red" icon="shield-alert" title="Осторожно">${result.red_flags.slice(0, 3).join(" · ")}<//>`}
+      ${flags.length > 0 &&
+      html`<${Banner} tone=${flags.some((f) => f.scam) ? "red" : "amber"} icon="shield-alert" title=${flags.some((f) => f.scam) ? "Осторожно" : "Обрати внимание"}>${flags
+        .slice(0, 3)
+        .map((f) => f.text)
+        .join(" · ")}<//>`}
       <div class="checklink__numbers">
-        <div><span>Рынок</span><b class="money">${result.market_price != null ? "~" + money(result.market_price) : "—"}</b></div>
-        <div><span>${result.profit_kind === "savings" ? "Экономия" : "Прибыль"}</span><b class=${cx("money", result.profit > 0 ? "text-green" : result.profit < 0 && "text-red")}>${money(result.profit, { sign: true })}</b></div>
-        <div><span>ROI</span><b class="money">${percent(result.roi)}</b></div>
+        <div><span>Рынок</span><b class="money">${card.market_price != null ? "~" + money(card.market_price) : "—"}</b></div>
+        <div><span>${personal ? "Экономия" : "Прибыль"}</span><b class=${cx("money", card.profit > 0 ? "text-green" : card.profit < 0 && "text-red")}>${money(card.profit, { sign: !personal })}</b></div>
+        <div><span>ROI</span><b class="money">${personal ? "—" : percent(card.roi)}</b></div>
       </div>
-      ${result.market_source_label && html`<p class="checklink__summary">Рынок по данным: ${result.market_source_label}</p>`}
+      ${(result.market_source_label || card.market_source_label) && html`<p class="checklink__summary">Рынок по данным: ${result.market_source_label || card.market_source_label}</p>`}
       <div class="row">
-        ${result.id &&
+        ${card.id &&
         html`<${Button}
           variant="secondary"
           iconRight="arrow-right"
           onClick=${() => {
             onClose();
-            navigate(`/deal/${encodeURIComponent(result.id)}`);
+            navigate(`/deal/${encodeURIComponent(card.id)}`);
           }}
           >Открыть полностью<//
         >`}
-        ${result.url && html`<${Button} variant="ghost" icon="external-link" href=${result.url}>Объявление<//>`}
+        ${card.url && html`<${Button} variant="ghost" icon="external-link" href=${card.url}>${d.kind === "bid" ? "Открыть на eBay" : `Открыть на ${sourceLabel(card)}`}<//>`}
       </div>
     </div>`}
 

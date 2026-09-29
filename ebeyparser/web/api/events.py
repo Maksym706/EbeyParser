@@ -5,7 +5,7 @@ Event types (the SSE `event:` field; `data:` is JSON):
   run_started      {"run_id", "started_at", "searches"}
   run_finished     the RunSummary of the pass
   deal_found       {"ad_id", "search_name", "verdict", "action", "score", "card": DealCard}
-  health_alert     {"kind", "text", "at"}
+  health_alert     {"kind", "text", "text_ru" (no "⚠", for a toast), "at", "at_label" ("21:34", user's zone)}
   settings_changed {"sections": [...], "keys": [...]}
   searches_changed {"count", "ids"}
   deal_updated     {"ad_id", "card": DealCard}

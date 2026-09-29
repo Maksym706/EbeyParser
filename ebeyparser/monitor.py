@@ -54,10 +54,14 @@ from .pricing.estimator import (
 )
 from .pricing.identity import Identity, ProductKey, identify
 from .pricing.text import SEVERE_FLAGS, detect_red_flags, is_model_key, make_search_query, normalize
-from .scraper.ebay_api import EbayAPIError, EbayBrowseClient
+from .errors_ru import AI_DOWN_RU, budget_message, humanize
+from .scraper.ebay_api import EBAY_NOT_CONNECTED_RU, EbayAPIError, EbayBrowseClient
 from .scraper.ebay_sold import EbaySoldScraper
 from .scraper.http import BlockedError, PoliteClient, RateBudgetExceeded
+from .scraper.kleinanzeigen import BASE_URL as KA_BASE_URL
 from .scraper.kleinanzeigen import KleinanzeigenScraper, PageLayoutError
+from .timefmt import apply_config as apply_timezone
+from .timefmt import at_label, now_local, when_label
 
 log = logging.getLogger(__name__)
 
@@ -237,6 +241,7 @@ class Monitor:
         self.config = config
         self.db = db
         self.web_base_url = web_base_url
+        apply_timezone(config)
         self._client: PoliteClient | None = None
         self._scraper = scraper
         self._ebay = ebay
@@ -332,6 +337,7 @@ class Monitor:
         """Apply a new config; network/AI components are rebuilt lazily."""
         old_general = self.config.general
         self.config = config
+        apply_timezone(config)
         self._comps_cache.clear()
         # compare with what the client was built from: the web UI changes the shared config in place
         built_from = getattr(self, "_client_settings", None) or _request_settings(old_general)
@@ -402,7 +408,7 @@ class Monitor:
         base = {"provider": ai.provider, "base_url": ai.base_url, "model": ai.model}
         if not ai.enabled:
             return {**base, "ok": False, "enabled": False, "model_available": False,
-                    "error": "ИИ выключен в конфиге (ai.enabled: false)"}
+                    "error": "Нейросеть выключена в настройках"}
         try:
             llm = self._llm or make_llm(ai)
         except Exception as exc:
@@ -440,9 +446,29 @@ class Monitor:
                 log.exception("Monitoring run crashed")
             interval = max(1.0, self.config.general.interval_minutes) * 60
             interval *= random.uniform(0.9, 1.1)  # don't hit the site on an exact beat
-            due = utcnow() + timedelta(seconds=interval)
+            due = self._after_cooldown(utcnow() + timedelta(seconds=interval))
             self.next_run_at = due
         self.next_run_at = None
+
+    def kleinanzeigen_cooldown_end(self) -> datetime | None:
+        """When Kleinanzeigen's block cooldown ends (None = not cooling down)."""
+        client = self._client
+        if client is None:
+            return None
+        try:
+            remaining = client.cooldown_remaining(KA_BASE_URL)
+        except Exception:  # noqa: BLE001 - a test double without the method
+            return None
+        return utcnow() + timedelta(seconds=remaining) if remaining > 0 else None
+
+    def _after_cooldown(self, due: datetime) -> datetime:
+        """Only Kleinanzeigen searches and the site asked for a pause: the next pass right after
+        the pause, not a pass that would only meet it (the UI says "продолжу в 21:34")."""
+        end = self.kleinanzeigen_cooldown_end()
+        enabled = [s for s in self.config.searches if s.enabled]
+        if end is None or end <= due or not enabled or any(s.source != "kleinanzeigen" for s in enabled):
+            return due
+        return end + timedelta(seconds=random.uniform(30, 120))
 
     async def _idle(self, stop: asyncio.Event, timeout: float | None) -> None:
         """Wait for `stop`, a pause/resume poke or `timeout` seconds (None = no timeout)."""
@@ -463,7 +489,7 @@ class Monitor:
         searches = [s for s in self.config.searches if s.enabled]
         if not searches:
             summary = RunSummary(finished_at=utcnow())
-            summary.errors.append("Нет активных поисков — добавь их на странице «Поиски» или в config.yaml")
+            _add_error(summary, "Нет активных поисков — добавь их на странице «Поиски»")
             self.last_summary = summary
             self._emit("run_finished", summary.model_dump(mode="json"))
             return summary
@@ -492,36 +518,36 @@ class Monitor:
                     deals = await self._process_search(search, summary)
                 except BlockedError as exc:
                     if getattr(exc, "cooling_down", False):  # no request was sent this time
-                        summary.errors.append(f"Kleinanzeigen: пауза после блокировки{_minutes_left(exc)}")
+                        _add_error(summary, f"Kleinanzeigen попросил паузу — продолжу сам{_until_text(exc)}"
+                                   if _until_text(exc) else "Kleinanzeigen попросил паузу — продолжу сам позже",
+                                   f"{exc}{_minutes_left(exc)}")
                         log.info("Kleinanzeigen still cooling down after a block: %s", exc)
                     else:
-                        summary.errors.append(
-                            f"Kleinanzeigen ограничил запросы ({exc}). Проверка остановлена — "
-                            "увеличь general.interval_minutes и request_delay_seconds."
-                        )
+                        _add_error(summary, "Kleinanzeigen временно ограничил запросы — делаю паузу и продолжу сам"
+                                   f"{_until_text(exc)}. Чтобы это случалось реже, проверяй реже", str(exc))
                         log.warning("Blocked by Kleinanzeigen: %s", exc)
-                        await self._health("blocked", f"⚠ Kleinanzeigen ограничил запросы, пауза{_until_text(exc)}."
-                                           " Проверки продолжатся сами.", summary)
+                        await self._health("blocked", f"⚠ Kleinanzeigen попросил паузу — продолжу сам{_until_text(exc)}."
+                                           " Ничего делать не нужно.", summary)
                     break
                 except RateBudgetExceeded as exc:  # our own hourly cap: not a block, try next pass
                     self._note_rate_limit(exc, summary)
                     continue
                 except PageLayoutError as exc:
                     log.warning("Search %r: %s", search.name, exc)
-                    summary.errors.append(f"{search.name}: {exc}")
+                    _add_error(summary, f"{search.name}: {exc.message_ru}", str(exc))
                     await self._check_search_health(search, 0, summary, error=str(exc))
                     continue
                 except EbayAPIError as exc:
                     log.warning("Search %r: %s", search.name, exc)
-                    summary.errors.append(f"{search.name}: {exc}")
+                    _add_exc(summary, search.name, exc, "ebay")
                     continue
                 except httpx.HTTPError as exc:
                     log.warning("Search %r: network error %s", search.name, exc)
-                    summary.errors.append(f"{search.name}: ошибка сети — {exc}")
+                    _add_exc(summary, search.name, exc, search.source)
                     continue
                 except Exception as exc:
                     log.exception("Search %r failed", search.name)
-                    summary.errors.append(f"{search.name}: {exc}")
+                    _add_exc(summary, search.name, exc, search.source)
                     continue
                 await self._check_search_health(search, summary.listings_seen - seen_before, summary)
                 digest.extend(deals)  # instant mode: already sent while evaluating
@@ -550,7 +576,8 @@ class Monitor:
         if search_or_listing.source == "ebay":
             if self._ebay_api is None:
                 raise EbayAPIError(
-                    "Для поиска по eBay заполни ebay.client_id и ebay.client_secret в config.yaml/.env"
+                    "Для поиска по eBay заполни ebay.client_id и ebay.client_secret в config.yaml/.env",
+                    message_ru=EBAY_NOT_CONNECTED_RU, code="ebay_not_connected",
                 )
             return self._ebay_api
         assert self._scraper is not None
@@ -611,8 +638,8 @@ class Monitor:
 
         # deferred ads that have dropped off the result pages since
         on_page = {listing.ad_id for listing in listings}
-        backlog = [l for l in self._pending(search, baseline_at) if l.ad_id not in on_page]
-        todo = sorted(backlog + todo, key=lambda l: _aware(l.first_seen))  # oldest first
+        backlog = [item for item in self._pending(search, baseline_at) if item.ad_id not in on_page]
+        todo = sorted(backlog + todo, key=lambda item: _aware(item.first_seen))  # oldest first
         log.info("🔎 %s: объявлений %d, новых %d, к оценке %d%s", search.name, len(listings), new_here,
                  len(todo) - len(rechecks), f" (из очереди {len(backlog)})" if backlog else "")
 
@@ -629,7 +656,7 @@ class Monitor:
                 outcome = self._triage(listing, search, budget, recheck=recheck)
             except Exception as exc:
                 log.exception("Evaluating %s failed", listing.ad_id)
-                summary.errors.append(f"{search.name} / {listing.title[:40]}: {exc}")
+                _add_exc(summary, f"{search.name} / {listing.title[:40]}", exc, search.source)
                 continue
             if isinstance(outcome, _Candidate):
                 candidates.append(outcome)
@@ -658,7 +685,7 @@ class Monitor:
                 raise
             except Exception as exc:
                 log.exception("Evaluating %s failed", listing.ad_id)
-                summary.errors.append(f"{search.name} / {listing.title[:40]}: {exc}")
+                _add_exc(summary, f"{search.name} / {listing.title[:40]}", exc, search.source)
                 continue
             summary.evaluated += 1
             why = f" — {evaluation.reasons[0]}" if evaluation.verdict == "skip" and evaluation.reasons else ""
@@ -686,7 +713,7 @@ class Monitor:
                 " Проверь цены вручную."
             )
             log.warning(warning)
-            summary.errors.append(warning)
+            _add_error(summary, warning)
         self._log_funnel(search, summary, before, evaluated_here)
         return to_notify
 
@@ -713,7 +740,7 @@ class Monitor:
             return
         self._rate_limited[host] = getattr(exc, "retry_at", None) or utcnow()
         log.info("Hourly request budget: %s", exc)
-        summary.errors.append(f"Отложено до следующей проверки: {exc}")
+        _add_error(summary, f"Часть объявлений отложена до следующей проверки. {budget_message(exc)}", str(exc))
 
     def _expire_backlog(self, search: SearchConfig, baseline_at: datetime | None, summary: RunSummary) -> None:
         """Deferred ads the budgets never reached within PENDING_MAX_AGE: give up on them
@@ -789,7 +816,7 @@ class Monitor:
         searches — a list cut at max_price drags medians down."""
         if _price_filtered(search):
             return 0
-        rows = [(key, l) for l in listings if (key := history_key_for(l))]
+        rows = [(key, item) for item in listings if (key := history_key_for(item))]
         if not rows:
             return 0
         try:
@@ -1481,11 +1508,13 @@ class Monitor:
                     await notifier.send(todo)  # notifiers build an informative subject themselves
             except Exception as exc:
                 log.warning("Notifier %s failed: %s", name, exc)
-                summary.errors.append(f"Уведомление ({name}): {exc}")
+                human = humanize(exc, name)
+                _add_error(summary, f"Уведомление через {_channel_label(name)} не ушло: {human.message_ru}",
+                           human.details)
                 for deal in todo:
-                    self.db.note_delivery_failure(deal.listing.ad_id, name, str(exc))
-                await self._health(f"notify:{name}", f"⚠ Не удалось отправить уведомление через {name}: {exc}."
-                                   " Повторю при следующих проверках.", summary, exclude={name})
+                    self.db.note_delivery_failure(deal.listing.ad_id, name, human.message_ru)
+                await self._health(f"notify:{name}", f"⚠ Не удалось отправить уведомление через {_channel_label(name)}:"
+                                   f" {human.message_ru}. Повторю при следующих проверках.", summary, exclude={name})
                 continue
             for deal in todo:
                 self.db.mark_notified(deal.listing.ad_id, name)
@@ -1508,8 +1537,9 @@ class Monitor:
             try:
                 await notifier.send(deals)
             except Exception as exc:
+                log.info("Retry via %s failed: %s", channel, exc)
                 for deal in deals:
-                    tries = self.db.note_delivery_failure(deal.listing.ad_id, channel, str(exc))
+                    tries = self.db.note_delivery_failure(deal.listing.ad_id, channel, humanize(exc, channel).message_ru)
                     if tries >= MAX_DELIVERY_ATTEMPTS:
                         log.warning("Уведомление о %s через %s так и не ушло (%d попыток)", deal.listing.ad_id,
                                     channel, tries)
@@ -1565,7 +1595,9 @@ class Monitor:
         if last is not None and now - last < every:
             return
         self._event_alerts[kind] = now
-        self._emit("health_alert", {"kind": kind, "text": text, "at": now.isoformat()})
+        # text: as sent to Telegram / e-mail; text_ru: for a UI toast (it has its own icon, no "⚠")
+        self._emit("health_alert", {"kind": kind, "text": text, "text_ru": text.lstrip("⚠️ ").strip(),
+                                    "at": now.isoformat(), "at_label": when_label(now)})
 
     async def _send_text(self, text: str, *, exclude: set[str] | None = None) -> bool:
         sent = False
@@ -1595,8 +1627,8 @@ class Monitor:
         if streak < 2:
             return
         if error:
-            text = (f"⚠ Поиск «{search.name}»: страница Kleinanzeigen не распознаётся уже {streak} проверки"
-                    f" подряд ({error[:120]}). Возможно, сайт изменился.")
+            text = (f"⚠ Поиск «{search.name}»: страницу Kleinanzeigen не получается разобрать уже {streak} проверки"
+                    " подряд — возможно, сайт изменился. Если так и останется, обнови программу.")
         else:
             text = (f"⚠ Поиск «{search.name}» уже {streak} проверки подряд не находит ни одного объявления —"
                     " проверь ссылку и фильтры.")
@@ -1607,8 +1639,8 @@ class Monitor:
         if self._evaluator is not None and self._ai_failed and not self._ai_answered:
             tail = (" Выгодные по цене объявления присылаю с пометкой «фото не проверены»."
                     if self.config.notifications.unchecked_deals else "")
-            await self._health("ai_down", "⚠ Нейросеть недоступна — сделки не проверяются. Запущен ли LM Studio?"
-                               + tail, summary)
+            hint = "Запусти приложение Ollama" if self.config.ai.provider == "ollama" else AI_DOWN_HINT_RU
+            await self._health("ai_down", f"⚠ {AI_DOWN_RU}. {hint}." + tail, summary)
         await self._flush_alert_queue(summary)
         await self._maybe_heartbeat(summary)
 
@@ -1617,7 +1649,7 @@ class Monitor:
         hour = self.config.notifications.heartbeat_hour
         if hour is None or not self._notifiers:
             return
-        local = datetime.now().astimezone()
+        local = now_local()  # general.timezone, not the host's (UTC in Docker)
         today = local.date().isoformat()
         state = self.db.get_state("heartbeat")
         if local.hour < hour or (state is not None and state[0] == today):
@@ -1634,6 +1666,25 @@ class Monitor:
             summary.health_alerts += 1
 
 
+AI_DOWN_HINT_RU = "Открой LM Studio → Developer → Start Server"
+_CHANNEL_LABELS = {"telegram": "Telegram", "email": "почту"}
+
+
+def _channel_label(name: str) -> str:
+    return _CHANNEL_LABELS.get(name, name)
+
+
+def _add_error(summary: RunSummary, text: str, details: str = "") -> None:
+    """A run error for the web UI (plain Russian) + its technical text (for «Подробнее»)."""
+    summary.errors.append(text)
+    summary.error_details.append(details or text)
+
+
+def _add_exc(summary: RunSummary, prefix: str, exc: BaseException, service: str = "") -> None:
+    human = humanize(exc, service)
+    _add_error(summary, f"{prefix}: {human.message_ru}", human.details)
+
+
 def _deals_word(n: int) -> str:
     n = abs(n)
     if n % 10 == 1 and n % 100 != 11:
@@ -1644,7 +1695,7 @@ def _deals_word(n: int) -> str:
 
 
 def summary_buy_share(db: Database, listings: list[Listing]) -> float:
-    verdicts = [ev.verdict for l in listings if (ev := db.get_evaluation(l.ad_id)) is not None]
+    verdicts = [ev.verdict for item in listings if (ev := db.get_evaluation(item.ad_id)) is not None]
     return sum(v == "buy" for v in verdicts) / len(verdicts) if verdicts else 0.0
 
 
@@ -1751,7 +1802,7 @@ def _until_text(exc: BaseException) -> str:
     until = getattr(exc, "cooldown_until", None)
     if not isinstance(until, datetime):
         return ""
-    return " до " + _aware(until).astimezone().strftime("%H:%M")
+    return " " + at_label(until)  # " в 21:34" in the user's time zone (general.timezone), not the host's
 
 
 def _severe_title(title: str) -> bool:

@@ -3,11 +3,11 @@
 // Sub-routes (params.rest): "new" → chooser, "new/<kind>" → new search, "<id>" → edit.
 import { html, cx, useState, useEffect } from "../lib/html.js";
 import { useAsync, useNow } from "../lib/hooks.js";
-import { api } from "../lib/api.js";
+import { api, humanize } from "../lib/api.js";
 import { onEvent } from "../lib/events.js";
 import { navigate } from "../lib/router.js";
-import { ago, number } from "../lib/format.js";
-import { Icon, Button, PageHeader, EmptyState, ErrorState, Skeleton, Toggle, Tooltip, Banner, Meter, toast } from "../ui/index.js";
+import { ago, number, everyLabel, localizeText } from "../lib/format.js";
+import { Icon, Button, PageHeader, EmptyState, ErrorState, Skeleton, Toggle, Tooltip, Banner, Meter, Modal, Details, toast } from "../ui/index.js";
 import { useTopbar } from "../shell/topbar.js";
 import "../features/icons-extra.js";
 import { Menu, Popover } from "../features/popover.js";
@@ -125,11 +125,14 @@ export default function SearchesScreen({ params = {} }) {
       actions=${html`<${Button} variant="primary" icon="plus" onClick=${() => navigate("/searches/new", { scroll: false })} disabled=${!editable}>Новый поиск<//>`}
     />
     ${!editable && list.data && html`<${Banner} tone="haggle" title="Не могу сохранить настройки">Нет доступа к файлу настроек — поиски можно только посмотреть.<//>`}
-    ${data.estimate && html`<${LoadMeter} est=${data.estimate} />`}
+    ${data.estimate && data.estimate.searches !== 0 && items.some((s) => s.enabled && s.source !== "ebay") && html`<${LoadMeter} est=${data.estimate} />`}
     ${body}
     <${KindChooser} open=${chooser} onClose=${close} ebayConfigured=${data.ebay_configured} onPick=${(k) => navigate(`/searches/new/${k}`, { replace: true, scroll: false })} />
+    ${newKind === "ebay" &&
+    data.ebay_configured === false &&
+    html`<${EbayMissing} onClose=${close} />`}
     <${SearchEditor}
-      open=${Boolean(newKind) || Boolean(editing)}
+      open=${(Boolean(newKind) && !(newKind === "ebay" && data.ebay_configured === false)) || Boolean(editing)}
       search=${editing}
       kind=${newKind}
       base=${base.config || {}}
@@ -145,8 +148,17 @@ export default function SearchesScreen({ params = {} }) {
   </div>`;
 }
 
+/** «Нагрузка на Kleinanzeigen»: a meter and one plain sentence; the maths stays in «Как это работает?». */
 function LoadMeter({ est }) {
-  const tone = { ok: "green", warn: "amber", danger: "red" }[est.level];
+  const tone = { ok: "green", warn: "amber", danger: "red" }[est.level] || "green";
+  const every = everyLabel(est.interval_minutes);
+  const sentence = est.short_ru
+    ? `${est.short_ru}${/^Безопасно/.test(est.short_ru) ? ` · проверяю ${every}` : ""}`
+    : tone === "red"
+      ? "Слишком много поисков — есть риск блокировки. Выключи ненужные."
+      : tone === "amber"
+        ? `Нагрузка высокая — проверяю ${every}, чтобы не заблокировали.`
+        : `Проверяю ${every} — безопасно, блокировки маловероятны.`;
   return html`<div class="loadcard">
     <${Meter}
       label="Нагрузка на Kleinanzeigen"
@@ -154,8 +166,8 @@ function LoadMeter({ est }) {
       max=${est.cap_per_hour || 150}
       marker=${0.4}
       tone=${tone}
-      valueText=${`~${number(est.pages_per_hour || 0)} из ${number(est.cap_per_hour || 0)} страниц в час · проверка каждые ${Math.round(est.interval_minutes)} мин`}
-      hint=${est.text_ru}
+      valueText=${est.pages_label_ru || `~${number(est.pages_per_hour || 0)} из ${number(est.cap_per_hour || 150)} страниц в час`}
+      hint=${sentence}
     />
     <${Popover}
       label="Как это работает"
@@ -165,16 +177,44 @@ function LoadMeter({ est }) {
         <b>Почему не чаще</b>
         <p>Kleinanzeigen блокирует тех, кто открывает слишком много страниц. Я держу нагрузку ниже безопасной отметки (чёрточка на шкале) и сам делаю паузы.</p>
         <p>Больше категорий — реже проверка каждой. Выключи ненужные поиски, чтобы проверять остальные чаще.</p>
-        ${est.text_ru && html`<p class="muted loadcard__detail">${est.text_ru}</p>`}
-        ${est.suggested_interval && html`<p class="muted">Рекомендую проверять не чаще раза в ${est.suggested_interval} мин.</p>`}
+        ${est.suggested_interval && est.suggested_interval > est.interval_minutes && html`<p class="muted">Рекомендую проверять не чаще, чем ${everyLabel(est.suggested_interval)}.</p>`}
+        ${est.text_ru && html`<${Details} text=${est.text_ru} label="Подробный расчёт" />`}
       </div>
     <//>
   </div>`;
 }
 
+/** /searches/new/ebay without eBay keys: say what to do instead of opening an editor that can't work. */
+function EbayMissing({ onClose }) {
+  return html`<${Modal} open=${true} onClose=${onClose} title="Сначала подключи eBay" icon="gavel" size="sm"
+    footer=${html`<${Button} variant="ghost" onClick=${onClose}>Не сейчас<//><${Button} variant="primary" icon="key-round" href="/settings/ebay">Подключить eBay<//>`}>
+    <p class="muted-line">Поиск по eBay работает через официальный бесплатный доступ. Добавь ключи в настройках — это 5 минут, и сюда можно будет вернуться.</p>
+  <//>`;
+}
+
+// postal code → "Neukölln, Berlin" for the cards (cached for the session)
+const placeNames = new Map();
+function usePlaceName(value) {
+  const plz = /^\d{5}$/.test(String(value || "").trim()) ? String(value).trim() : null;
+  const [, force] = useState(0);
+  useEffect(() => {
+    if (!plz || placeNames.has(plz)) return;
+    placeNames.set(plz, null);
+    api
+      .get("/locations", { params: { q: plz, limit: 3 } })
+      .then((r) => {
+        const hit = ((r && r.items) || []).find((p) => p.plz === plz && p.kind !== "plz") || null;
+        placeNames.set(plz, hit ? hit.label || hit.name : null);
+        force((n) => n + 1);
+      })
+      .catch(() => {});
+  }, [plz]);
+  return plz ? placeNames.get(plz) || null : null;
+}
+
 function stateOf(s) {
   const st = s.stats || {};
-  if (st.errors && st.errors.length) return { tone: "danger", icon: "circle-alert", label: "Ошибка", tip: st.errors[0] };
+  if (st.errors && st.errors.length) return { tone: "danger", icon: "circle-alert", label: "Ошибка", tip: humanize(localizeText(st.errors[0])).message };
   if (!s.enabled) return { tone: "neutral", icon: "power-off", label: "Выключен", tip: "Не проверяется и не тратит запросы" };
   if (st.learning === "pending") return { tone: "info", icon: "hourglass", label: "Обучение", tip: "Первая проверка только изучает цены" };
   if (st.learning === "learned") return { tone: "info", icon: "hourglass", label: "Цены изучены", tip: st.learning_ru };
@@ -186,11 +226,15 @@ function SearchCard({ s, now, icon, editable, onToggle, onDuplicate, onDelete })
   const st = s.stats || {};
   const state = stateOf(s);
   const cfg = s.config || {};
+  const place = cfg.location_label || usePlaceName(cfg.location) || cfg.location;
   const chips = [];
-  if (s.source === "ebay") chips.push(cfg.local_pickup_only ? `Самовывоз ${cfg.location || ""} · ${cfg.radius_km || 0} км` : "вся Германия");
-  else if (cfg.location) chips.push(`${cfg.location}${cfg.radius_km ? ` · ${cfg.radius_km} км` : ""}`);
-  if (s.purpose === "personal") chips.push(cfg.target_price ? `Для себя до ${number(cfg.target_price)} €` : "Для себя");
-  if (cfg.min_price != null || cfg.max_price != null)
+  if (s.source === "ebay") chips.push(cfg.local_pickup_only ? `Самовывоз ${place || ""} · ${cfg.radius_km || 0} км` : "вся Германия");
+  else if (place) chips.push(`${place}${cfg.radius_km ? ` · ${cfg.radius_km} км` : " · только город"}`);
+  if (s.purpose === "personal") {
+    // «Для себя до 600 € · до 500 €» read as nonsense: one clear chip per number
+    chips.push(cfg.target_price ? `Хочу за ${number(cfg.target_price)} €` : "Для себя");
+    if (cfg.max_price != null && cfg.max_price !== cfg.target_price) chips.push(`показывать до ${number(cfg.max_price)} €`);
+  } else if (cfg.min_price != null || cfg.max_price != null)
     chips.push(cfg.min_price != null && cfg.max_price != null ? `${number(cfg.min_price)}–${number(cfg.max_price)} €` : cfg.max_price != null ? `до ${number(cfg.max_price)} €` : `от ${number(cfg.min_price)} €`);
   if (cfg.query && s.kind !== "wishlist") chips.push(`«${cfg.query}»`);
   const href = `/searches/${encodeURIComponent(s.id)}`;
@@ -209,7 +253,7 @@ function SearchCard({ s, now, icon, editable, onToggle, onDuplicate, onDelete })
       ${chips.map((c) => html`<span class="tag">${c}</span>`)}
       <span class=${cx("tag", s.source === "ebay" && "tone-bid")}>${s.source_label || (s.source === "ebay" ? "eBay" : "Kleinanzeigen")}</span>
     </div>
-    ${st.errors && st.errors.length > 0 && html`<p class="scard__err"><${Icon} name="circle-alert" size=${14} />${st.errors[0]}</p>`}
+    ${st.errors && st.errors.length > 0 && html`<p class="scard__err"><${Icon} name="circle-alert" size=${14} />${humanize(localizeText(st.errors[0])).message}</p>`}
     <div class="scard__stats">
       <div><span>Новых за 24 ч</span><b class="num">${number(st.ads_24h || 0)}</b></div>
       <div><span>Выгодных</span><b class=${cx("num", st.deals > 0 && "t-green")}>${number(st.deals || 0)}</b></div>

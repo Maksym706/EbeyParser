@@ -37,6 +37,7 @@ export function LocationPicker({ value, label, onChange, invalid, autoFocus, pla
   const [text, setText] = useState(shown);
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [picked, setPicked] = useState(Boolean(value)); // the text is a place from the list
   const q = useDebounced(text, 250);
   useEffect(() => setText(shown), [shown]);
   useEffect(() => {
@@ -46,11 +47,15 @@ export function LocationPicker({ value, label, onChange, invalid, autoFocus, pla
       .get("/locations", { params: { q, limit: 7 } })
       .then((res) => {
         if (!alive) return;
-        const list = (res && res.items) || [];
+        // a bare "plz" row without a town is just the typed number echoed back: not a real place (P2-7)
+        const list = ((res && res.items) || []).filter((p) => p.kind !== "plz" || p.state || p.parent);
         setItems(list);
         const typed = String(q).trim().toLowerCase();
         const exact = list.find((p) => p.value.toLowerCase() === typed || p.name.toLowerCase() === typed || displayName(p).toLowerCase() === typed);
-        if (exact && q === text) onChange({ location: exact.value, label: displayName(exact), confirmed: true });
+        if (exact && q === text) {
+          setPicked(true);
+          onChange({ location: exact.value, label: displayName(exact), confirmed: true });
+        }
       })
       .catch(() => alive && setItems([]))
       .finally(() => alive && setLoading(false));
@@ -74,13 +79,18 @@ export function LocationPicker({ value, label, onChange, invalid, autoFocus, pla
     icon="map-pin"
     loading=${loading && text.length > 0}
     options=${options}
-    emptyText="Не нашёл такой город — попробуй почтовый индекс"
+    emptyText=${picked
+      ? null // the chosen place itself (e.g. «Neukölln, Berlin»): nothing to complain about
+      : /^\d+$/.test(text.trim()) ? (text.trim().length === 5 ? "Не нашёл такой индекс — проверь цифры" : "Почтовый индекс — это 5 цифр") : "Не нашёл такой город — попробуй почтовый индекс"}
     onInput=${(t) => {
       setText(t);
-      onChange({ location: t, label: t, confirmed: /^\d{5}$/.test(t.trim()) });
+      setPicked(false);
+      // confirmed only when the list knows the place (see the effect above)
+      onChange({ location: t, label: t, confirmed: false });
     }}
     onSelect=${(o) => {
       const p = o.place;
+      setPicked(true);
       setText(displayName(p));
       onChange({ location: p.value, label: displayName(p), confirmed: true });
     }}

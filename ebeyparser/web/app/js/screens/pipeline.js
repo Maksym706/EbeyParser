@@ -142,7 +142,7 @@ function Tiles({ summary, loading }) {
       <div class="overline">Вложено сейчас</div>
       <div class="tile__value">${money(s.invested || 0)}</div>
       <div class="tile__sub">
-        в ${s.in_stock || 0} ${plural(s.in_stock || 0, "вещи", "вещах", "вещах")}
+        ${s.in_stock ? `в ${s.in_stock} ${plural(s.in_stock, "вещи", "вещах", "вещах")}` : "пока ничего не куплено"}
         ${s.stale_stock ? html` · <span class="t-amber">${s.stale_stock} залежалось</span>` : ""}
       </div>
     </div>
@@ -152,9 +152,10 @@ function Tiles({ summary, loading }) {
       <div class="tile__sub">если продашь по рынку</div>
     </div>
     <div class="tile">
-      <div class="overline">
-        <${Tooltip} text="Сравниваю прибыль, которую я обещал, с тем, сколько ты реально заработал. Нужно минимум 3 продажи.">
-          <span class="dotted">Точность прогноза</span>
+      <div class="overline tile__label">
+        Точность прогноза
+        <${Tooltip} text="Сравниваю прибыль, которую я обещал, с тем, сколько ты реально заработал. Нужно минимум 3 продажи." placement="bottom-end">
+          <span class="tile__help" tabindex="0" aria-label="Что это"><${Icon} name="circle-help" size=${14} /></span>
         <//>
       </div>
       ${acc
@@ -306,14 +307,14 @@ function PipeCard({ deal, col, now, ...drag }) {
     body = html`<span class="pcard__line">купил за <b class="num">${money(paid)}</b>${deal.market_price != null ? html` · продать ~<b class="num">${money(deal.market_price)}</b>` : ""}</span>
       ${stockDays != null &&
       html`<span class=${cx("pcard__line", stale && "t-amber")}>
-        ${stale ? html`<span class="pcard__chip"><${Icon} name="hourglass" size=${12} />залежалось</span>` : ""} в наличии ${stockDays} ${plural(stockDays, "день", "дня", "дней")}
+        ${stale ? html`<span class="pcard__chip"><${Icon} name="hourglass" size=${12} />залежалось</span>` : ""} ${stockDays > 0 ? `в наличии ${stockDays} ${plural(stockDays, "день", "дня", "дней")}` : "куплено сегодня"}
       </span>`}`;
     actions = html`<button type="button" class="pcard__btn pcard__btn--main" onClick=${stop(() => markSold(deal))}><${Icon} name="banknote" size=${15} />Продал</button>`;
   } else if (col === "sold") {
     body = html`<span class="pcard__line num">${money(paid)} → ${money(deal.sold_price)}</span>
       ${real != null && html`<span class=${cx("pcard__profit num", real >= 0 ? "t-green" : "t-red")}>${money(real, { sign: true })}</span>`}
       <span class="pcard__line muted">
-        ${deal.profit != null ? `прогноз ${money(deal.profit, { sign: true })}` : ""}${real != null ? ` · факт ${money(real, { sign: true })}` : ""}${soldDays != null ? ` · продано за ${soldDays} ${plural(soldDays, "день", "дня", "дней")}` : ""}
+        ${deal.profit != null ? `прогноз ${money(deal.profit, { sign: true })}` : ""}${real != null ? ` · факт ${money(real, { sign: true })}` : ""}${soldDays != null ? (soldDays > 0 ? ` · продано за ${soldDays} ${plural(soldDays, "день", "дня", "дней")}` : " · продано в тот же день") : ""}
       </span>`;
   }
   const d = decide(deal);

@@ -50,6 +50,7 @@ export const ICONS = {
   "circle": '<circle cx="12" cy="12" r="10"/>',
   "circle-alert": '<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>',
   "circle-check": '<circle cx="12" cy="12" r="10"/><path d="m16 9-5.5 5.5L8 12"/>',
+  "circle-minus": '<circle cx="12" cy="12" r="10"/><path d="M8 12h8"/>',
   "circle-dollar-sign": '<circle cx="12" cy="12" r="10"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/><path d="M12 18V6"/>',
   "circle-dot": '<circle cx="12" cy="12" r="1"/><circle cx="12" cy="12" r="10"/>',
   "circle-pause": '<circle cx="12" cy="12" r="10"/><line x1="10" x2="10" y1="15" y2="9"/><line x1="14" x2="14" y1="15" y2="9"/>',

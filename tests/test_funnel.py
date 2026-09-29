@@ -154,14 +154,14 @@ async def test_ai_budget_defers_and_next_runs_pick_up_the_rest():
     monitor, db, source, ebay, evaluator, _ = build(listings, general={"max_ai_per_run": 1})
     first = await monitor.run_once()
     assert first.ai_calls == 1 and first.deferred == 2 and first.evaluated == 1
-    assert [db.get_evaluation(l.ad_id) is None for l in listings].count(True) == 2  # pending
+    assert [db.get_evaluation(item.ad_id) is None for item in listings].count(True) == 2  # pending
     source.listings = []  # the deferred ads dropped off the first result page meanwhile
     second = await monitor.run_once()
     assert second.ai_calls == 1 and second.deferred == 1 and second.evaluated == 1
     third = await monitor.run_once()
     assert third.evaluated == 1 and third.deferred == 0
     assert sorted(evaluator.calls) == ["10", "11", "12"]
-    assert all(db.get_evaluation(l.ad_id).verdict == "buy" for l in listings)
+    assert all(db.get_evaluation(item.ad_id).verdict == "buy" for item in listings)
 
 
 async def test_detail_budget_defers():
@@ -250,10 +250,10 @@ async def test_category_scan_with_empty_query():
     # every ad gets its own product key / comparables query; with no comparables at all it also
     # tries the title's own words once (identity's canonical phrase may not be how sellers write)
     expected: list[str] = []
-    for l in listings:
-        expected.append(product_query(l.title))
-        if make_search_query(l.title) != expected[-1]:
-            expected.append(make_search_query(l.title))
+    for item in listings:
+        expected.append(product_query(item.title))
+        if make_search_query(item.title) != expected[-1]:
+            expected.append(make_search_query(item.title))
     assert source.comps_queries == ebay.queries == expected
     assert "iphone 13 128gb" in expected[0] and any("s21 ultra 256gb" in q for q in expected)
     assert db.get_listing("1").search_name == "Handys"
@@ -410,7 +410,8 @@ async def test_hourly_budget_on_ad_pages_defers_without_counting_a_request():
     summary = await monitor.run_once()
     assert summary.deferred == 2 and summary.evaluated == 0 and summary.details_fetched == 0
     assert db.get_evaluation("1") is None and db.get_evaluation("2") is None
-    assert sum("лимит 150 страниц" in e for e in summary.errors) == 1  # said once, not a block
+    assert sum("лимит 150 страниц" in d for d in summary.error_details) == 1  # said once, not a block
+    assert sum("Лимит запросов к сайту на этот час исчерпан" in e for e in summary.errors) == 1
     assert not any("ограничил" in e for e in summary.errors)
     source.fetch_detail = real_fetch  # next pass: the hour is over
     again = await monitor.run_once()
@@ -433,7 +434,8 @@ async def test_hourly_budget_on_the_search_page_skips_only_that_search():
     source.search = first_limited
     summary = await monitor.run_once()
     assert calls["n"] == 2 and summary.evaluated == 1  # search B still ran
-    assert any("лимит 150 страниц" in e for e in summary.errors)
+    assert any("лимит 150 страниц" in d for d in summary.error_details)
+    assert any("Лимит запросов" in e for e in summary.errors)
 
 
 async def test_comparables_blocked_by_hourly_budget_defer_the_ad():
@@ -462,7 +464,8 @@ async def test_cooldown_after_a_block_is_a_short_note():
 
     source.search = cooling
     summary = await monitor.run_once()
-    assert len(summary.errors) == 1 and summary.errors[0].startswith("Kleinanzeigen: пауза после блокировки ещё")
+    assert len(summary.errors) == 1 and summary.errors[0].startswith("Kleinanzeigen попросил паузу — продолжу сам ")
+    assert "ещё" in summary.error_details[0]
     assert "увеличь" not in summary.errors[0]
 
 

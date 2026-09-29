@@ -19,6 +19,9 @@ export const SETTINGS_SECTIONS = [
   { key: "about", label: "О программе", icon: "info", description: "Тема, версия, лицензии", component: AboutSection, standalone: true },
 ];
 
+/** Old or guessed section slugs → real ones (links from notifications, older builds). */
+const ALIASES = { search: "region", location: "region", where: "region", interval: "region", pricing: "money", notify: "notifications", telegram: "notifications", email: "notifications", backup: "data", access: "access", phone: "access" };
+
 /** Amber dots in the sub-nav: what still needs setting up. */
 function useAttention() {
   const app = useStore(appStore, (s) => s.app);
@@ -59,7 +62,7 @@ export default function SettingsScreen({ params }) {
   const form = useSettingsForm();
   useUnsavedGuard(form);
   const attention = useAttention();
-  const key = params.section || (phone ? null : "region");
+  const key = (params.section && (ALIASES[params.section] || params.section)) || (phone ? null : "region");
   const section = SETTINGS_SECTIONS.find((s) => s.key === key);
 
   if (phone && !section) {

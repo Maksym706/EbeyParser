@@ -25,18 +25,21 @@ from ...scraper.categories import (
     answers_from_searches,
     builtin_by_id,
     builtin_categories,
+    FALLBACK_NOTE,
     describe_error,
     estimate_requests,
     is_category_scan,
     load_cached_categories,
+    merge_plan,
     merge_searches,
     save_cached_categories,
     searches_from_answers,
     snap_radius,
+    suggest_interval,
 )
 from .context import ApiContext, get_ctx
 from .errors import validation_error
-from .locations import search_places
+from .locations import place_label, search_places
 from .presenters import iso, search_ids, search_view
 from .schemas import ERRORS, EstimateOut, SetupIn
 from .validation import search_problems
@@ -57,10 +60,13 @@ PRESETS: dict[str, dict[str, Any]] = {
                    "min_profit": 25.0, "min_roi": 0.15, "safety_margin_percent": 7.0, "min_comparables": 4,
                    "notify_min_score": 60.0},
 }
-WISHLIST_SUGGESTIONS = [
-    {"item": "RTX 3090", "max_price": 550}, {"item": "RTX 3060 12GB", "max_price": 200},
-    {"item": "DDR4 ECC 64GB", "max_price": 90}, {"item": "Ryzen 9 5950X", "max_price": 250},
-    {"item": "Netzteil 1000W", "max_price": 80}, {"item": "Server Gehäuse", "max_price": 60},
+WISHLIST_SUGGESTIONS = [  # search words stay German (that is what sellers write); hint_ru explains them
+    {"item": "RTX 3090", "max_price": 550, "hint_ru": "видеокарта"},
+    {"item": "RTX 3060 12GB", "max_price": 200, "hint_ru": "видеокарта"},
+    {"item": "DDR4 ECC 64GB", "max_price": 90, "hint_ru": "серверная память"},
+    {"item": "Ryzen 9 5950X", "max_price": 250, "hint_ru": "процессор"},
+    {"item": "Netzteil 1000W", "max_price": 80, "hint_ru": "блок питания 1000 Вт"},
+    {"item": "Server Gehäuse", "max_price": 60, "hint_ru": "серверный корпус"},
 ]
 CATEGORY_ICONS = {
     173: "smartphone", 278: "laptop", 279: "gamepad-2", 225: "cpu", 245: "camera", 172: "headphones",
@@ -108,12 +114,14 @@ async def categories_for(ctx: ApiContext, location: str, radius_km: int, *, live
         if not isinstance(result, CategoryList):
             result = CategoryList(result or builtin_categories())
         if not len(result):
-            result = CategoryList(builtin_categories(), error=result.error or "список категорий пуст")
+            result = CategoryList(builtin_categories(), error=result.error or "Сайт не прислал список категорий — "
+                                                                             "показываю обычный")
     except asyncio.TimeoutError:
-        result = CategoryList(builtin_categories(), error=f"kleinanzeigen.de не ответил за {DISCOVERY_TIMEOUT:g} с")
+        result = CategoryList(builtin_categories(),
+                              error="Kleinanzeigen не ответил вовремя — показываю обычный список категорий")
     except Exception as exc:  # noqa: BLE001 - discovery never breaks onboarding
         log.warning("category discovery failed: %s", exc)
-        result = CategoryList(builtin_categories(), error=describe_error(exc))
+        result = CategoryList(builtin_categories(), error=describe_error(exc) + FALLBACK_NOTE)
     if result.live:
         cache[key] = result
         save_cached_categories(data_dir, location, radius_km, result)
@@ -168,9 +176,21 @@ def estimate_view(est: RequestEstimate) -> dict[str, Any]:
         level = "warn"
     else:
         level = "danger"
+    if not est.searches:
+        short = "Поисков пока нет — нагрузки на сайт нет"
+    elif level == "ok":
+        short = "Безопасно — блокировки маловероятны"
+    elif level == "warn":
+        short = "Нагрузка заметная — лучше проверять реже"
+    else:
+        short = f"Слишком часто — возможна блокировка. Проверяй раз в {est.suggested_interval} мин"
     return {
         "interval_minutes": est.interval_minutes,
         "suggested_interval": est.suggested_interval,
+        "searches": est.searches,
+        # one wording everywhere: "~N из 150 страниц в час" (result pages; the rest of the cap evaluates ads)
+        "pages_label_ru": f"~{est.pages_per_hour} из {cap} страниц в час" if cap else f"~{est.pages_per_hour} страниц в час",
+        "short_ru": short,
         "category_scans": est.category_scans,
         "keyword_searches": est.keyword_searches,
         "pages_per_hour": est.pages_per_hour,
@@ -185,12 +205,20 @@ def estimate_view(est: RequestEstimate) -> dict[str, Any]:
     }
 
 
-def config_estimate(ctx: ApiContext, interval: float | None = None) -> dict[str, Any]:
-    cfg = ctx.config
-    enabled = [s for s in cfg.searches if s.enabled and s.source == "kleinanzeigen"]
+def load_counts(searches: list[SearchConfig]) -> tuple[int, int]:
+    """(category scans, keyword searches) among the enabled Kleinanzeigen searches — what the
+    load on the site depends on (eBay goes through its own API)."""
+    enabled = [s for s in searches if s.enabled and s.source == "kleinanzeigen"]
     scans = sum(1 for s in enabled if is_category_scan(s))
-    est = estimate_requests(scans, interval or cfg.general.interval_minutes, cfg.general,
-                            keyword_searches=len(enabled) - scans)
+    return scans, len(enabled) - scans
+
+
+def config_estimate(ctx: ApiContext, interval: float | None = None,
+                    searches: list[SearchConfig] | None = None) -> dict[str, Any]:
+    """The load card of «Поиски» (and of the wizard's preview for the searches it will leave)."""
+    cfg = ctx.config
+    scans, words = load_counts(cfg.searches if searches is None else searches)
+    est = estimate_requests(scans, interval or cfg.general.interval_minutes, cfg.general, keyword_searches=words)
     return estimate_view(est)
 
 
@@ -206,8 +234,6 @@ async def setup_estimate(
         return config_estimate(ctx, interval)
     cats, words = categories or 0, keywords or 0
     general = ctx.config.general
-    from ...scraper.categories import suggest_interval
-
     chosen = interval or float(max(suggest_interval(cats, general, keyword_searches=words), 5))
     return estimate_view(estimate_requests(cats, chosen, general, keyword_searches=words))
 
@@ -230,6 +256,7 @@ async def setup_options(ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
         "recommended_category_ids": list(RECOMMENDED_IDS),
         "current": {
             "location": answers.location,
+            "location_label": place_label(answers.location),
             "radius_km": answers.radius_km,
             "category_ids": list(answers.category_ids) if cfg.searches else list(RECOMMENDED_IDS),
             "purpose": "personal" if personal_scans else answers.purpose,
@@ -320,12 +347,18 @@ def build_searches(body: SetupIn, ctx: ApiContext) -> tuple[list[SearchConfig], 
 
 
 def _preview(body: SetupIn, ctx: ApiContext) -> dict[str, Any]:
+    """Exactly what POST /setup with the same body will do: the searches it creates (category
+    scans + wishlist), which existing ones it updates / keeps / replaces, the interval and the
+    load of the resulting config (the same numbers the «Поиски» load card will show)."""
     cfg = ctx.config
     searches, answers, problems = build_searches(body, ctx)
-    suggested = answers.suggested_interval(cfg.general)
+    final = merge_searches(cfg.searches, searches, replace_all=body.replace)
+    scans, words = load_counts(final)
+    suggested = suggest_interval(scans, cfg.general, keyword_searches=words)
     interval = body.interval_minutes or float(max(suggested, 5))
-    estimate = estimate_view(answers.estimate(interval, cfg.general))
+    estimate = estimate_view(estimate_requests(scans, interval, cfg.general, keyword_searches=words))
     ids = search_ids(searches)
+    plan = merge_plan(cfg.searches, searches, replace_all=body.replace)
     return {
         "searches": [search_view(s, sid, None, baseline_first_run=cfg.general.baseline_first_run)
                      for s, sid in zip(searches, ids)],
@@ -338,9 +371,33 @@ def _preview(body: SetupIn, ctx: ApiContext) -> dict[str, Any]:
         "pricing": _pricing_values(body, ctx),
         "existing_count": len(cfg.searches),
         "replace": body.replace,
+        **plan,  # created / updated / kept / replaced: lists of search names
+        "result_count": len(final),
+        "summary_ru": _plan_text(plan, len(searches)),
         "problems": problems,
         "valid": not problems,
     }
+
+
+def _plan_text(plan: dict[str, list[str]], new: int) -> str:
+    """«Добавлю 3 поиска, 2 текущих останутся» / «Заменю твои 4 поиска на 3 новых»."""
+    from ...scraper.categories import _plural
+
+    def n(count: int) -> str:
+        return f"{count} {_plural(count, 'поиск', 'поиска', 'поисков')}"
+
+    if plan["replaced"]:
+        return f"Заменю твои {n(len(plan['replaced']) + len(plan['updated']))} на новые"
+    parts = []
+    if plan["created"]:
+        parts.append(f"добавлю {n(len(plan['created']))}")
+    if plan["updated"]:
+        parts.append(f"обновлю {n(len(plan['updated']))}")
+    kept = len(plan["kept"])
+    if kept:
+        parts.append(f"{kept} {_plural(kept, 'текущий останется', 'текущих останутся', 'текущих останутся')}")
+    text = ", ".join(parts) or "ничего не изменится"
+    return text[:1].upper() + text[1:]
 
 
 @router.post("/setup/preview", responses=ERRORS,
@@ -356,6 +413,7 @@ async def _apply(body: SetupIn, ctx: ApiContext) -> dict[str, Any]:
         raise validation_error(preview["problems"], "Проверь ответы")
     searches, _, _ = build_searches(body, ctx)
     cfg = ctx.config
+    plan = merge_plan(cfg.searches, searches, replace_all=body.replace)
     merged = merge_searches(cfg.searches, searches, replace_all=body.replace)
     ctx.save_searches(merged, backup=True, reason="setup")
     updates: dict[str, Any] = dict(preview["pricing"])
@@ -369,24 +427,31 @@ async def _apply(body: SetupIn, ctx: ApiContext) -> dict[str, Any]:
     ctx.mark_done(*steps)
     if body.complete_onboarding:
         ctx.update_onboarding(completed=True)
-    started = False
-    if body.start_run:
-        from .routes_monitor import start_run
+    from .routes_monitor import cooldown_view, http_hosts, only_kleinanzeigen, start_run
 
-        started = start_run(ctx, strict=False)
+    cooldown = cooldown_view(await http_hosts(ctx))
+    started = False
+    if body.start_run and not (cooldown is not None and only_kleinanzeigen(ctx)):
+        started = start_run(ctx, strict=False)  # during a site's pause the monitor starts right after it
     ids = search_ids(merged)
+    message = (f"Сохранено поисков: {len(searches)}. Первая проверка только изучит цены — "
+               "уведомления начнутся со следующей." if cfg.general.baseline_first_run
+               else f"Сохранено поисков: {len(searches)}.")
+    if cooldown is not None:
+        message += f" {cooldown['text_ru']} — первая проверка начнётся после паузы."
     stats = ctx.db.search_stats()
     return {
         "saved": len(searches),
         "searches": [search_view(s, sid, stats.get(s.name), baseline_first_run=cfg.general.baseline_first_run)
                      for s, sid in zip(merged, ids)],
         "interval_minutes": ctx.config.general.interval_minutes,
-        "estimate": preview["estimate"],
+        "estimate": config_estimate(ctx),  # == the «Поиски» load card from now on
+        **plan,  # created / updated / kept / replaced (names); replaced only when replace=true
+        "summary_ru": preview["summary_ru"],
         "applied": sorted(updates),
         "run_started": started,
-        "message_ru": (f"Сохранено поисков: {len(searches)}. Первая проверка только изучит цены — "
-                       "уведомления начнутся со следующей." if cfg.general.baseline_first_run
-                       else f"Сохранено поисков: {len(searches)}."),
+        "cooldown": cooldown,  # a site asked for a pause: the launch message must say so
+        "message_ru": message,
     }
 
 

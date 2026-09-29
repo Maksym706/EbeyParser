@@ -37,12 +37,19 @@ def _setup_logging(verbose: bool) -> None:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    from .timefmt import LocalFormatter
+
+    for handler in logging.getLogger().handlers:  # times in the user's zone, not the host's
+        handler.setFormatter(LocalFormatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", "%H:%M:%S"))
     for noisy in ("httpx", "httpcore", "uvicorn.access"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def _open(config_path: Path) -> tuple[AppConfig, Database]:
+    from .timefmt import apply_config
+
     config = load_config(config_path)
+    apply_config(config)
     if not config_path.is_file():
         print(f"⚠  {config_path} не найден — работаю с настройками по умолчанию. "
               "Создай конфиг командой: python -m ebeyparser init")

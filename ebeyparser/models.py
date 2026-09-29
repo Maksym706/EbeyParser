@@ -166,7 +166,8 @@ class RunSummary(BaseModel):
     evaluated: int = 0
     deals_found: int = 0  # verdict == "buy"
     notified: int = 0
-    errors: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)  # plain Russian, shown in the web UI as is
+    error_details: list[str] = Field(default_factory=list)  # the technical text behind them (for «Подробнее»)
     # funnel (v0.2): how much work the pass did and what it saved
     prefiltered: int = 0  # dropped by free checks (keywords, wanted ad, below min price)
     early_skips: int = 0  # market known without requests and no deal -> no ad page / AI

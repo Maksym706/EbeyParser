@@ -5,7 +5,7 @@ import { navigate } from "../../lib/router.js";
 import { useStore } from "../../lib/store.js";
 import { api } from "../../lib/api.js";
 import { useMediaQuery } from "../../lib/hooks.js";
-import { Icon, IconButton, Button, Glyph, Skeleton, confirm } from "../../ui/index.js";
+import { Icon, IconButton, Button, Glyph, Skeleton, confirm, toast } from "../../ui/index.js";
 import { Logo } from "../../shell/shell.js";
 import { draftStore, loadDraft, updateDraft } from "./draft.js";
 import { WelcomeStep, WhereStep, WhatStep, MoneyStep, WishlistStep } from "./steps-basic.js";
@@ -48,10 +48,22 @@ function isDone(key, d) {
   }
 }
 
-/** Can the user press «Дальше» (and with what hint when not)? */
-function gate(key, d) {
+/** Can the user press «Дальше» (and with what hint when not)? Impossible numbers are never clamped silently. */
+function gate(key, d, options) {
   if (key === "where" && !(d.location && d.location.trim())) return "Укажи город или почтовый индекс";
-  if (key === "where" && !d.location_confirmed) return "Выбери город из подсказок";
+  if (key === "where" && !d.location_confirmed) return "Выбери город или индекс из подсказок";
+  if (key === "money") {
+    const r = (options && options.budget_range) || { min: 50, max: 1500 };
+    if (d.max_price == null || d.max_price < r.min || d.max_price > r.max) return `Бюджет на одну вещь — от ${r.min} до ${r.max.toLocaleString("ru-RU")} €`;
+    const p = d.pricing || {};
+    if (d.purpose !== "personal") {
+      if (p.min_profit == null || p.min_profit < 0 || p.min_profit > 10000) return "Минимальная прибыль — от 0 до 10 000 €";
+      if (p.min_roi == null || p.min_roi < 0 || p.min_roi > 10) return "Минимальный ROI — от 0 до 1000 %";
+      if (p.safety_margin_percent == null || p.safety_margin_percent < 0 || p.safety_margin_percent > 50) return "Запас на риск — от 0 до 50 %";
+    }
+  }
+  if (key === "wishlist" && (d.wishlist || []).some((w) => w.max_price != null && (w.max_price <= 0 || w.max_price > 100000)))
+    return "Цена в списке «для себя» — больше 0 €";
   return null;
 }
 
@@ -63,10 +75,10 @@ function Stepper({ index, draft, onGo }) {
         const done = isDone(s.key, draft) && n !== index;
         const current = n === index;
         const reachable = n <= index || done || isDone(STEPS[n - 1].key, draft);
-        const skipped = s.optional && draft && draft[s.key] && draft[s.key].skipped;
-        return html`<li key=${s.key} class=${cx("onb-stepper__item", current && "is-current", done && "is-done")}>
+        const skipped = s.optional && draft && ((draft[s.key] && draft[s.key].skipped && !draft[s.key].done) || (s.key === "wishlist" && draft.wishlist_skipped && !(draft.wishlist || []).some((w) => w.item)));
+        return html`<li key=${s.key} class=${cx("onb-stepper__item", current && "is-current", done && !skipped && "is-done", done && skipped && "is-skipped")}>
           <button type="button" disabled=${!reachable || current} onClick=${() => onGo(s.key)} aria-current=${current ? "step" : undefined}>
-            <span class="onb-stepper__dot">${done ? html`<${Icon} name="check" size=${12} stroke=${3} />` : n}</span>
+            <span class="onb-stepper__dot">${done ? html`<${Icon} name=${skipped ? "minus" : "check"} size=${12} stroke=${3} />` : n}</span>
             <span class="onb-stepper__text">
               <span class="onb-stepper__label">${s.title}</span>
               ${s.optional && html`<span class="onb-stepper__hint">${skipped ? "пропущено" : "необязательно"}</span>`}
@@ -79,7 +91,7 @@ function Stepper({ index, draft, onGo }) {
 }
 
 export default function OnboardingScreen({ params }) {
-  const { draft, loaded } = useStore(draftStore);
+  const { draft, loaded, options } = useStore(draftStore);
   const phone = useMediaQuery("(max-width: 599px)");
   const key = params.step || "welcome";
   const index = Math.max(0, STEPS.findIndex((s) => s.key === key));
@@ -127,6 +139,15 @@ export default function OnboardingScreen({ params }) {
 
   const onNext = async () => {
     if (step.key === "money") updateDraft({ money_seen: true });
+    // AI found with a model that sees photos: «Дальше» accepts it — no «Продолжить без нейросети?» (P1-6)
+    if (step.key === "ai" && !draft.ai.done && draft.ai.found && draft.ai.found.vision) {
+      const f = draft.ai.found;
+      updateDraft({ ai: { ...draft.ai, done: true, skipped: false, model: f.model, auto: true } });
+      api.patch("/settings", { ai: { enabled: true, provider: f.provider, base_url: f.base_url, model: f.model } }).catch((e) =>
+        toast.error("Не получилось включить нейросеть — включишь её потом в «Настройки → Нейросеть»", { details: e.details || e.message }),
+      );
+      return next();
+    }
     // optional steps: «Дальше» without finishing = skip (with the AI warning)
     if (step.optional && !isDone(step.key, draft) && !(step.key === "wishlist" && (draft.wishlist || []).some((w) => w.item))) return skip();
     next();
@@ -143,9 +164,14 @@ export default function OnboardingScreen({ params }) {
     return html`<div class="onb onb--welcome"><${Comp} draft=${draft} onNext=${next} /></div>`;
   }
 
-  const blocked = gate(step.key, draft);
+  const blocked = gate(step.key, draft, options);
   const isLast = step.key === "done";
   const nextLabel = "Дальше";
+  // «Лучше на почту» turns the Telegram step into the e-mail one: the heading follows (P1-24)
+  const emailMode = step.key === "telegram" && draft.notify_channel === "email";
+  const heading = emailMode ? "Уведомления на почту" : step.heading || step.title;
+  const subtitle = emailMode ? "Письмо с фото, ценой и ссылкой — если Telegram неудобен" : step.subtitle;
+  const icon = emailMode ? "mail" : step.icon;
   return html`<div class="onb">
     <div class="onb-card">
       <aside class="onb-rail">
@@ -158,7 +184,6 @@ export default function OnboardingScreen({ params }) {
       </aside>
       <section class="onb-main">
         <header class="onb-progress">
-          ${phone && html`<${IconButton} icon="chevron-left" label="Назад" size="sm" onClick=${back} />`}
           <div class="onb-progress__text">Шаг ${index} из ${COUNTED}</div>
           ${step.optional && phone && !isDone(step.key, draft) && html`<button type="button" class="onb-progress__skip" onClick=${skip}>Пропустить</button>`}
           <div class="onb-progress__bar"><span style=${{ width: `${(index / COUNTED) * 100}%` }}></span></div>
@@ -166,16 +191,18 @@ export default function OnboardingScreen({ params }) {
         <div class="onb-scroll" ref=${scroller}>
           <div class=${cx("onb-content", dir < 0 && "is-back")} key=${step.key}>
             <div class="onb-head">
-              <${Glyph} icon=${step.icon} tone=${step.tone || "green"} />
-              <h1 class="onb-head__title">${step.heading || step.title}</h1>
-              <p class="onb-head__subtitle">${step.subtitle}</p>
+              <${Glyph} icon=${icon} tone=${step.tone || "green"} />
+              <h1 class="onb-head__title">${heading}</h1>
+              <p class="onb-head__subtitle">${subtitle}</p>
             </div>
             <${Comp} draft=${draft} onNext=${next} go=${go} busy=${busy} setBusy=${setBusy} />
           </div>
         </div>
         ${!isLast &&
         html`<footer class="onb-footer">
-          ${!phone && html`<${Button} variant="ghost" icon="arrow-left" onClick=${back}>Назад<//>`}
+          ${phone
+            ? html`<${IconButton} icon="arrow-left" label="Назад" size="lg" variant="secondary" class="onb-footer__back" onClick=${back} />`
+            : html`<${Button} variant="ghost" icon="arrow-left" onClick=${back}>Назад<//>`}
           <span class="onb-footer__hint">${blocked || ""}</span>
           ${step.optional && !phone && !isDone(step.key, draft) && html`<${Button} variant="ghost" onClick=${skip}>${step.key === "telegram" ? "Настрою позже" : "Пропустить"}<//>`}
           <${Button} variant="primary" size=${phone ? "lg" : "md"} block=${phone} iconRight="arrow-right" disabled=${Boolean(blocked)} onClick=${onNext}>${nextLabel}<//>

@@ -1045,7 +1045,38 @@ def demo_deals() -> list[tuple[Listing, Evaluation]]:
         ],
     })
 
-    return deals
+    # what to do, as the real estimator sets it (the feed's «Купить сразу» / «Торг» / «Аукционы»
+    # chips filter on it): VB ads get a concrete offer, the auction a maximum bid
+    finished: list[tuple[Listing, Evaluation]] = []
+    for listing, ev in deals:
+        action, offer, verdict = _DEMO_ACTIONS.get(listing.ad_id, ("", None, None))
+        update: dict[str, Any] = {"action": action or ("buy" if ev.verdict == "buy" else
+                                                       "skip" if ev.verdict == "skip" else "watch")}
+        if offer is not None:
+            update["offer_price"] = offer
+        if verdict:
+            update["verdict"] = verdict
+        finished.append((listing, ev.model_copy(update=update)))
+    return finished
+
+
+# ad_id -> (action, offer_price, verdict override)
+_DEMO_ACTIONS: dict[str, tuple[str, float | None, str | None]] = {
+    "2894410057": ("buy", None, None),  # free monitor: take it
+    "2894398213": ("haggle", 420.0, None),  # RTX 3090, 450 € VB: offer 420
+    "2894311780": ("buy", None, None),  # Mac mini: the price is already good
+    "2894102266": ("watch", None, None),  # RTX 3060: maybe
+    "2893987145": ("haggle", 135.0, None),  # ThinkPad, 150 € VB
+    "2893876502": ("skip", None, None),  # iCloud-locked iPhone
+    "2893790331": ("buy", None, None),  # personal: DDR4 ECC under the limit
+    "2893655120": ("haggle", 160.0, None),  # personal: HP Z440, 180 € VB
+    "2893540987": ("buy", None, None),  # Dyson
+    "2893402211": ("watch", None, None),  # Bosch: maybe (hidden)
+    "2893280764": ("watch", None, None),  # PS5: maybe
+    "2893109876": ("skip", None, None),  # overpriced bike
+    "ebay-306512349871": ("bid", None, "maybe"),  # auction: bid up to max_buy_price, never "buy"
+    "ebay-205873410266": ("haggle", 270.0, None),  # eBay best offer (Preisvorschlag)
+}
 
 
 # user state for a few demo deals: ad_id -> (status, note)

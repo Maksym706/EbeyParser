@@ -658,9 +658,14 @@ class AIEvaluator:
         return verdict
 
     def _unavailable(self, error: str) -> AIVerdict:
+        """The model did not answer: the deal view shows this reasoning, so it is plain Russian
+        with the fix (the technical error is in the log)."""
+        from ..errors_ru import ai_problem
+
+        why = ai_problem(self.cfg.provider, getattr(self.cfg, "base_url", ""), self.cfg.model, error, server_ok=None)
         return AIVerdict(
             verdict="maybe",
             confidence=0.0,
-            reasoning=f"ИИ-проверка не выполнена: модель недоступна ({error})",
+            reasoning=f"Нейросеть не проверила фото: {why}",
             model=self.cfg.model,
         )

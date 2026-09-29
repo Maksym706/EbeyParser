@@ -148,10 +148,24 @@ async def search_duplicate(search_id: str, ctx: ApiContext = Depends(get_ctx)) -
 
 @router.post("/searches/parse-url", responses=ERRORS,
              summary="Разобрать ссылку поиска Kleinanzeigen: категория, место, радиус, цены, слова")
-async def search_parse_url(body: ParseUrlIn) -> dict[str, Any]:
+async def search_parse_url(body: ParseUrlIn, ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
+    """422 {fields: {url}} with a plain message for anything that is not a search page of
+    Kleinanzeigen (or eBay); an eBay link becomes an eBay keyword search (not a URL search)."""
     try:
         parsed = parse_search_url(body.url)
     except ValueError as exc:
-        raise validation_error({"url": str(exc)}) from None
-    return {**parsed, "search": {"name": parsed["suggested_name"], "source": "kleinanzeigen", "url": body.url.strip(),
-                                 "category_id": parsed["category_id"], "category_name": parsed["category_name"]}}
+        raise ApiError(422, "not_a_search_url", str(exc), fields={"url": str(exc)}) from None
+    if parsed["source"] == "ebay":
+        search: dict[str, Any] = {
+            "name": parsed["suggested_name"], "source": "ebay", "query": parsed["query"],
+            "ebay_category_ids": parsed["ebay_category_ids"], "buying_options": parsed["buying_options"],
+            "min_price": parsed["min_price"], "max_price": parsed["max_price"]}
+        parsed["ebay_connected"] = ctx.config.ebay.configured
+        if not ctx.config.ebay.configured:
+            parsed["warning_ru"] = "eBay ещё не подключён — поиск сохранится, но заработает после подключения eBay"
+    else:
+        search = {"name": parsed["suggested_name"], "source": "kleinanzeigen", "url": body.url.strip(),
+                  "category_id": parsed["category_id"], "category_name": parsed["category_name"],
+                  "location": parsed["location"], "radius_km": parsed["radius_km"],
+                  "min_price": parsed["min_price"], "max_price": parsed["max_price"]}
+    return {**parsed, "search": search}

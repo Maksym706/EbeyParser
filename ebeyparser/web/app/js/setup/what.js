@@ -87,7 +87,7 @@ export function LoadMeter({ categories = 0, keywords = 0, interval = null, onEst
     max=${est.cap_per_hour || 150}
     marker=${0.4}
     tone=${tone}
-    valueText=${`~${number(est.pages_per_hour)} из ${number(est.cap_per_hour)} стр. в час`}
+    valueText=${`~${number(est.pages_per_hour)} из ${number(est.cap_per_hour)} страниц в час`}
     hint=${hint}
   />`;
 }
