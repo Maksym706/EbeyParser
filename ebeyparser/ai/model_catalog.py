@@ -48,7 +48,9 @@ class ModelChoice:
     lmstudio: str | None  # LM Studio catalog id or HF repo (`lms get <this>`), pick the quant in the app
     llamacpp: str | None  # `llama-server -hf <this>` (Hugging Face repo:quant)
     file_gb: float  # model file(s) at `quant`, incl. the vision projector when vision=True
-    min_ram_gb: float  # RAM of the model process on CPU: weights + 8k-token KV cache + buffers
+    min_ram_gb: float  # anonymous RAM of the model process on CPU (weights + 8k KV cache + buffers,
+    # measured without mmap: llama-server --load-mode none / older --no-mmap); mmap'd file pages come on top
+    # as reclaimable page cache
     min_vram_gb: float  # 0 = CPU is fine; else VRAM needed to keep it fully on the GPU
     vision: bool
     arm_ok: bool  # runs on ARM64 (Raspberry Pi 5, Apple Silicon) with llama.cpp/Ollama
@@ -81,7 +83,7 @@ MODELS: dict[str, ModelChoice] = {m.key: m for m in (
     ModelChoice(
         key="qwen3.5-2b", task="triage", name="Qwen3.5 2B", params_b=1.9, active_b=None,
         quant="Q4_K_M", ollama="qwen3.5:2b-q4_K_M", lmstudio="qwen/qwen3.5-2b",
-        llamacpp="unsloth/Qwen3.5-2B-GGUF:Q4_K_M", file_gb=1.3, min_ram_gb=3.1, min_vram_gb=0,
+        llamacpp="unsloth/Qwen3.5-2B-GGUF:Q4_K_M", file_gb=1.3, min_ram_gb=2.0, min_vram_gb=0,
         vision=True, arm_ok=True, context_k=262, license="Apache-2.0",
         sec_per_ad={"T0": 6.0, "T1": 2.5, "T2": 0.5, "T3": 0.4},
         label_ru="Для слабого сервера",
@@ -90,7 +92,7 @@ MODELS: dict[str, ModelChoice] = {m.key: m for m in (
     ModelChoice(
         key="qwen3.5-4b", task="triage", name="Qwen3.5 4B", params_b=4.0, active_b=None,
         quant="Q4_K_M", ollama="qwen3.5:4b-q4_K_M", lmstudio="qwen/qwen3.5-4b",
-        llamacpp="unsloth/Qwen3.5-4B-GGUF:Q4_K_M", file_gb=2.7, min_ram_gb=4.8, min_vram_gb=0,
+        llamacpp="unsloth/Qwen3.5-4B-GGUF:Q4_K_M", file_gb=2.7, min_ram_gb=4.0, min_vram_gb=0,
         vision=True, arm_ok=True, context_k=262, license="Apache-2.0",
         sec_per_ad={"T0": 15.5, "T1": 6.0, "T2": 0.8, "T3": 0.5},
         label_ru="Сбалансированная",
@@ -99,7 +101,7 @@ MODELS: dict[str, ModelChoice] = {m.key: m for m in (
     ModelChoice(
         key="qwen3.5-9b", task="triage", name="Qwen3.5 9B", params_b=9.0, active_b=None,
         quant="Q4_K_M", ollama="qwen3.5:9b-q4_K_M", lmstudio="qwen/qwen3.5-9b",
-        llamacpp="unsloth/Qwen3.5-9B-GGUF:Q4_K_M", file_gb=6.6, min_ram_gb=8.5, min_vram_gb=8,
+        llamacpp="unsloth/Qwen3.5-9B-GGUF:Q4_K_M", file_gb=6.6, min_ram_gb=7.5, min_vram_gb=8,
         vision=True, arm_ok=True, context_k=262, license="Apache-2.0",
         sec_per_ad={"T1": 15.0, "T2": 1.5, "T3": 0.8},
         label_ru="Для видеокарты 8–12 ГБ",
@@ -118,7 +120,7 @@ MODELS: dict[str, ModelChoice] = {m.key: m for m in (
     ModelChoice(
         key="qwen3.5-2b-vision", task="vision", name="Qwen3.5 2B + mmproj", params_b=2.3, active_b=None,
         quant="Q4_K_M + F16 mmproj", ollama="qwen3.5:2b-q4_K_M", lmstudio="qwen/qwen3.5-2b",
-        llamacpp="unsloth/Qwen3.5-2B-GGUF:Q4_K_M", file_gb=1.9, min_ram_gb=4.0, min_vram_gb=0,
+        llamacpp="unsloth/Qwen3.5-2B-GGUF:Q4_K_M", file_gb=1.9, min_ram_gb=2.7, min_vram_gb=0,
         vision=True, arm_ok=True, context_k=262, license="Apache-2.0",
         label_ru="Фото на процессоре",
         desc_ru="Проверка фото без видеокарты: читает экран блокировки, наклейки и серийники, ~40 с на фото.",
@@ -126,7 +128,7 @@ MODELS: dict[str, ModelChoice] = {m.key: m for m in (
     ModelChoice(
         key="qwen3.5-0.8b-vision", task="vision", name="Qwen3.5 0.8B + mmproj", params_b=1.0, active_b=None,
         quant="Q4_K_M + F16 mmproj", ollama="qwen3.5:0.8b-q4_K_M", lmstudio="qwen/qwen3.5-0.8b",
-        llamacpp="unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M", file_gb=0.75, min_ram_gb=2.0, min_vram_gb=0,
+        llamacpp="unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M", file_gb=0.75, min_ram_gb=1.4, min_vram_gb=0,
         vision=True, arm_ok=True, context_k=262, license="Apache-2.0",
         label_ru="Фото, минимальная",
         desc_ru="Для 4–5 ГБ RAM: хорошо читает текст на фото (блокировка, наклейки), но о дефектах судит слабо.",
@@ -134,7 +136,7 @@ MODELS: dict[str, ModelChoice] = {m.key: m for m in (
     ModelChoice(
         key="qwen3.5-4b-vision", task="vision", name="Qwen3.5 4B + mmproj", params_b=4.6, active_b=None,
         quant="Q4_K_M + F16 mmproj", ollama="qwen3.5:4b-q4_K_M", lmstudio="qwen/qwen3.5-4b",
-        llamacpp="unsloth/Qwen3.5-4B-GGUF:Q4_K_M", file_gb=3.4, min_ram_gb=5.5, min_vram_gb=6,
+        llamacpp="unsloth/Qwen3.5-4B-GGUF:Q4_K_M", file_gb=3.4, min_ram_gb=4.7, min_vram_gb=6,
         vision=True, arm_ok=True, context_k=262, license="Apache-2.0",
         label_ru="Фото, баланс",
         desc_ru="Проверка фото на сервере с 16+ ГБ или на видеокарте 6 ГБ.",
@@ -142,7 +144,7 @@ MODELS: dict[str, ModelChoice] = {m.key: m for m in (
     ModelChoice(
         key="qwen3.5-9b-vision", task="vision", name="Qwen3.5 9B", params_b=9.9, active_b=None,
         quant="Q4_K_M + F16 mmproj", ollama="qwen3.5:9b-q4_K_M", lmstudio="qwen/qwen3.5-9b",
-        llamacpp="unsloth/Qwen3.5-9B-GGUF:Q4_K_M", file_gb=6.6, min_ram_gb=9.5, min_vram_gb=8,
+        llamacpp="unsloth/Qwen3.5-9B-GGUF:Q4_K_M", file_gb=6.6, min_ram_gb=8.5, min_vram_gb=8,
         vision=True, arm_ok=True, context_k=262, license="Apache-2.0",
         label_ru="Фото на видеокарте",
         desc_ru="Для видеокарты 8–12 ГБ: дефекты, iCloud-блокировка, стоковые фото — за секунды.",
@@ -194,7 +196,7 @@ MODELS: dict[str, ModelChoice] = {m.key: m for m in (
     ModelChoice(
         key="qwen3.5-9b-think", task="second_opinion", name="Qwen3.5 9B (thinking)", params_b=9.0,
         active_b=None, quant="Q4_K_M", ollama="qwen3.5:9b-q4_K_M", lmstudio="qwen/qwen3.5-9b",
-        llamacpp="unsloth/Qwen3.5-9B-GGUF:Q4_K_M", file_gb=6.6, min_ram_gb=9.5, min_vram_gb=8,
+        llamacpp="unsloth/Qwen3.5-9B-GGUF:Q4_K_M", file_gb=6.6, min_ram_gb=8.5, min_vram_gb=8,
         vision=True, arm_ok=True, context_k=262, license="Apache-2.0",
         label_ru="Второе мнение",
         desc_ru="Перепроверяет лучшие находки дня с рассуждением; на процессоре 16 ГБ — пару минут на сделку.",
@@ -380,12 +382,18 @@ def find_catalog_model(available_id: str, task: str | None = None) -> ModelChoic
 
 def best_installed(available_ids: list[str], task: str = "triage", ram_gb: float | None = None,
                    vram_gb: float = 0.0) -> str | None:
-    """From ids a server reports (/ai/detect), the one the catalog ranks best for `task` that
-    still fits the given hardware (when known). None if nothing suitable is installed."""
-    order = [key for tier in reversed(TIERS) for t, key in PICKS[tier].items() if t == task and key]
-    order += [key for key, m in MODELS.items() if m.task == task and key not in order]
+    """From ids a server reports (/ai/detect), the one to use for `task`, or None if nothing
+    suitable is installed. With the hardware known, the tier's own pick and its fallbacks come
+    first (on a weak CPU a bigger model may fit in RAM but be too slow), then the rest by
+    quality; without it, simply the strongest catalog model."""
+    order: list[str] = []
+    tier = tier_for(ram_gb, vram_gb) if ram_gb is not None else None
+    if tier is not None:
+        order += [m.key for m in _chain(PICKS[tier].get(task))]
+    order += [key for t in reversed(TIERS) for m in _chain(PICKS[t].get(task)) for key in [m.key]]
+    order += [key for key, m in MODELS.items() if m.task == task]
     if task == "vision":  # every multimodal triage model can also look at photos
-        order += [key for key, m in MODELS.items() if m.vision and key not in order]
+        order += [key for key, m in MODELS.items() if m.vision]
     rank = {key: i for i, key in enumerate(dict.fromkeys(order))}
     candidates: list[tuple[int, str]] = []
     for model_id in available_ids:
@@ -394,10 +402,8 @@ def best_installed(available_ids: list[str], task: str = "triage", ram_gb: float
             continue
         if task == "vision" and not model.vision:
             continue
-        if ram_gb is not None:
-            tier = tier_for(ram_gb, vram_gb)
-            if not _fits(model, tier, ram_gb, vram_gb, False, 0.0):
-                continue
+        if tier is not None and not _fits(model, tier, float(ram_gb or 0), vram_gb, False, 0.0):
+            continue
         candidates.append((rank[model.key], model_id))
     return min(candidates)[1] if candidates else None
 

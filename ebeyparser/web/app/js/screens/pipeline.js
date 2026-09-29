@@ -15,6 +15,9 @@ import { normalizeCard, STATUS, PIPELINE, decide } from "../features/deal-model.
 import { applyUpdate, moveTo, markBought, markSold, setStatus, writeToSeller } from "../features/deal-actions.js";
 import { DealImage, DecisionPill } from "../features/deal-card.js";
 import { openAd } from "../features/messages.js";
+import { useStore } from "../lib/store.js";
+import { DealsSwitch, projectsStore } from "../features/projects-common.js";
+import { badgeFrom } from "../features/projects-live.js";
 
 const HINTS = {
   starred: "Нажимай ☆ на находках — они соберутся здесь",
@@ -85,8 +88,10 @@ export default function PipelineScreen({ params = {} }) {
   }, [p.summary]);
 
   const csv = api.url("/export/deals.csv", authToken() ? { token: authToken() } : null);
+  const builds = useStore(projectsStore, (s) => badgeFrom(s.cards)); // phone: «Сделки · Сборки» (no 6th tab)
 
   return html`<div class="pipe-screen">
+    ${isPhone && html`<${DealsSwitch} value="deals" count=${builds} />`}
     <${PageHeader}
       title="Мои сделки"
       subtitle="От находки до продажи — и сколько ты реально заработал"

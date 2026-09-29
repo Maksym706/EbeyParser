@@ -11,14 +11,14 @@ history (see AI_SCOUT.md §1). Section 7 lists the other risks.
 
 ## 1. Recommendations per tier
 
-Speeds are for batched triage: 10 ads per call, about 120 prompt and 50 output tokens per ad, the compact prompt from §5,
+Speeds are for batched triage: 5–10 ads per call, about 120 prompt and 50 output tokens per ad, the compact prompt from §5,
 and a strict JSON schema. "Measured" means our benchmark in §4 on a shared 4-vCPU VM, which is roughly N100 class. The
 other speeds are extrapolated from memory bandwidth and published GPU numbers (§4.4), with an error of ±50 %.
 
 | Tier | Hardware | Triage (every ad) | Vision (top candidates) | Embeddings (always on the server) | Second opinion (1–2 deals/day) |
 |---|---|---|---|---|---|
-| **T0** | CPU 2–4 cores, 4–8 GB (N100, old laptop, Pi 5 8 GB) | **Qwen3.5 2B** Q4_K_M, **batch 5**. Needs ~2.5–3 GB RAM. **~6 s/ad → ~600 ads/h** (measured). No model under 2B is usable for triage | Same model plus its vision projector (+0.7 GB), loaded on demand. **~38 s/photo** (measured, §4.3). With 4–5 GB RAM: Qwen3.5 0.8B + projector, 16 s/photo, good at reading text only. Better: the PC | **Qwen3-Embedding 0.6B** Q8_0 (~1 GB). With 4–5 GB RAM: EmbeddingGemma 300M | None locally. Use the PC, or Claude (already supported as `ai.second_opinion`) |
-| **T1** | CPU 8 cores, 16–32 GB | **Qwen3.5 4B** Q4_K_M. Needs ~5 GB. ~6 s/ad → ~600 ads/h (est.; 15.5 s/ad measured on T0) | Qwen3.5 4B + projector (same download) | Qwen3-Embedding 0.6B | Qwen3.5 9B, thinking on. Minutes per deal, which is fine for 1–2 a day |
+| **T0** | CPU 2–4 cores, 4–8 GB (N100, old laptop, Pi 5 8 GB) | **Qwen3.5 2B** Q4_K_M, **batch 5**. Needs ~2 GB RAM (measured, no mmap). **~6 s/ad → ~600 ads/h** (measured). No model under 2B is usable for triage | Same model plus its vision projector (+0.7 GB), loaded on demand. **~38 s/photo** (measured, §4.3). With ≤4.5 GB RAM: Qwen3.5 0.8B + projector, 16 s/photo, good at reading text only. Better: the PC | **Qwen3-Embedding 0.6B** Q8_0 (~1 GB). Below 4 GB RAM: EmbeddingGemma 300M | None locally. Use the PC, or Claude (already supported as `ai.second_opinion`) |
+| **T1** | CPU 8 cores, 16–32 GB | **Qwen3.5 4B** Q4_K_M. Needs ~4 GB. ~6 s/ad → ~600 ads/h (est.; 15.5 s/ad measured on T0) | Qwen3.5 4B + projector (same download) | Qwen3-Embedding 0.6B | Qwen3.5 9B, thinking on. Minutes per deal, which is fine for 1–2 a day |
 | **T2** | GPU 8–12 GB (RTX 3060 12 GB / 4060 8 GB) | **Qwen3.5 9B** Q4_K_M (5.7 GB + 0.9 GB projector). ~1.5 s/ad → ~2,400 ads/h | Same model, one load for text and photos | Qwen3-Embedding 0.6B (server CPU) | Same 9B with thinking on. No model swap |
 | **T3** | GPU 24 GB (RTX 3090 / 4090) | **Qwen3.6 35B-A3B** MoE UD-Q4_K_M (~22 GB). ~0.5 s/ad, >100 tok/s on a 3090 | Same model (native vision) | Qwen3-Embedding 0.6B (server CPU) | **Qwen3.8 27B** Q4_K_M (17 GB), loaded on demand |
 | **Split** (recommended) | T0/T1 server 24/7 + T2/T3 gaming PC, sometimes off | Server: T0/T1 pick | PC: T2/T3 pick. When the PC is off, photos wait in `vision_queue`, or go to the server's small model if the user allows it | Server only. Vectors are comparable only within one model, so the embedder must never move | PC. When it is off, Claude or skip |
@@ -27,10 +27,10 @@ other speeds are extrapolated from memory bandwidth and published GPU numbers (�
 
 | Model | Ollama | LM Studio (`lms get …`) | llama.cpp (`llama-server -hf …`) | File at quant | RAM on CPU* | VRAM |
 |---|---|---|---|---|---|---|
-| Qwen3.5 0.8B (photos only) | `qwen3.5:0.8b-q4_K_M` | `qwen/qwen3.5-0.8b` | `unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M` + `mmproj-F16.gguf` | 0.53 GB + 0.2 GB | 2.0 GB with projector (measured) | 1.5 GB |
-| Qwen3.5 2B | `qwen3.5:2b-q4_K_M` (1.9 GB incl. vision) | `qwen/qwen3.5-2b` | `unsloth/Qwen3.5-2B-GGUF:Q4_K_M` (+ `mmproj-F16.gguf` for photos) | 1.28 GB + 0.67 GB projector | 3.1 GB measured | 2.5 GB |
-| Qwen3.5 4B | `qwen3.5:4b-q4_K_M` | `qwen/qwen3.5-4b` | `unsloth/Qwen3.5-4B-GGUF:Q4_K_M` | 2.74 GB + 0.67 GB | 4.8 GB (6.6 GB peak RSS measured, incl. mmap page cache) | 4 GB |
-| Qwen3.5 9B | `qwen3.5:9b-q4_K_M` (6.6 GB) | `qwen/qwen3.5-9b` | `unsloth/Qwen3.5-9B-GGUF:Q4_K_M` | 5.68 GB + 0.92 GB | ~9 GB | 8 GB |
+| Qwen3.5 0.8B (photos only) | `qwen3.5:0.8b-q4_K_M` | `qwen/qwen3.5-0.8b` | `unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M` + `mmproj-F16.gguf` | 0.53 GB + 0.2 GB | ~1.4 GB with projector (2.0 GB peak with mmap) | 1.5 GB |
+| Qwen3.5 2B | `qwen3.5:2b-q4_K_M` (1.9 GB incl. vision) | `qwen/qwen3.5-2b` | `unsloth/Qwen3.5-2B-GGUF:Q4_K_M` (+ `mmproj-F16.gguf` for photos) | 1.28 GB + 0.67 GB projector | **1.94 GB measured** (2.7 GB with projector) | 2.5 GB |
+| Qwen3.5 4B | `qwen3.5:4b-q4_K_M` | `qwen/qwen3.5-4b` | `unsloth/Qwen3.5-4B-GGUF:Q4_K_M` | 2.74 GB + 0.67 GB | ~4 GB (6.6 GB peak RSS with mmap) | 4 GB |
+| Qwen3.5 9B | `qwen3.5:9b-q4_K_M` (6.6 GB) | `qwen/qwen3.5-9b` | `unsloth/Qwen3.5-9B-GGUF:Q4_K_M` | 5.68 GB + 0.92 GB | ~7.5 GB (8.5 with projector) | 8 GB |
 | Qwen3.6 35B-A3B | `qwen3.6:35b-a3b-q4_K_M` (24 GB: partial CPU offload on a 24 GB card) | `qwen/qwen3.6-35b-a3b` | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` (fits 24 GB) | ~22 GB | – | 24 GB |
 | Qwen3.8 27B | `qwen3.8:27b` (18 GB, q4_K_M) | `qwen/qwen3.8-27b` | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` | 16.5 GB + 0.93 GB | – | 20 GB |
 | Qwen3-Embedding 0.6B | `qwen3-embedding:0.6b` (639 MB) | `Qwen/Qwen3-Embedding-0.6B-GGUF` | `Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0` + `--embedding` | 0.64 GB | ~1 GB | – |
@@ -38,9 +38,13 @@ other speeds are extrapolated from memory bandwidth and published GPU numbers (�
 | Qwen3-Reranker 0.6B | – (Ollama has no rerank API) | – | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF` + `--reranking` | 0.64 GB | ~1 GB | – |
 | TranslateGemma 4B | `translategemma:4b` (3.3 GB) | from HF search | – | 3.3 GB | ~4.5 GB | 4 GB |
 
-\* RAM of the model process: weights, plus an 8k-token KV cache, plus compute buffers. Qwen3.5's 248k-token vocabulary
-makes the logits buffer large, so the process uses 2–2.5× the file size. `--no-mmap` avoids counting the file twice.
-The app itself needs about 1 GB on top.
+\* Anonymous RAM of the model process: weights, plus an 8k-token KV cache, plus compute buffers. Measured without
+mmap: `llama-server --load-mode none`, called `--no-mmap` in older builds.
+* With mmap (the default in llama.cpp, Ollama and LM Studio), peak RSS also counts the file's page cache. That is
+  1.3–1.6× higher but reclaimable: 3.1 GB for the 2B, 6.6 GB for the 4B.
+* `-ub 128` vs 512 made no difference (1.93 vs 1.94 GB).
+* The app itself plus a minimal Linux needs about 1 GB on top. So a **4 GB box runs the 2B plus Qwen3-Embedding**,
+  with photos via the 0.8B.
 
 LM Studio ids are catalog ids. The quant is chosen in the app (Q4_K_M is the default).
 
@@ -194,10 +198,11 @@ LM Studio ids are catalog ids. The quant is chosen in the app (Q4_K_M is the def
 | **Qwen3.5 4B** | v2 compact | 10 | **100 %** | **97 %** | **87 %** | **100 %** | 80 % | **100 %** | 0.63 | 55 | 3.9 | **15.5** | 6.6 GB† |
 | Qwen3.5 0.8B | v2 compact | 10 | 33 % | 30 % | 20 % | 30 % | 27 % | 3 % | 0.43 | 59 | 15.8 | 4.5 | 1.7 GB |
 | Granite 4.2 3B | v2 compact | 10 | aborted: returned 1 of 10 items and echoed the example reason; then 0.2–0.5 tok/s under CPU contention | | | | | | | | | | 5.0 GB |
-| Gemma 4 E4B | v2 compact | 10 | GEMMA_ROW |
+| Gemma 4 E4B | v2 compact | 10 | **100 %** | **97 %** | **93 %** | 90 % | **87 %** | **100 %** | 0.58 | 57 | 4.1 | **16.1** (3 threads) | 8.3 GB† |
 
-† Peak RSS counts the mmap'd file pages and llama.cpp's repacked CPU copy of the weights. `--no-mmap` lowers it to
-about the file size plus 1–2 GB.
+† Peak RSS with mmap counts the file's page cache on top of llama.cpp's repacked CPU copy of the weights. Without mmap
+(`--load-mode none`) the 2B needs 1.94 GB instead of 3.1 GB. Expect about 0.6× these figures for real memory
+pressure.
 
 ‡ Batch 5 was scored on the first 25 ads (5 of 6 batches). The last batch hit a period of heavy CPU steal on the
 shared VM (0.4–1 tok/s) and was stopped. Its s/ad is from the uncontended batch (1.9 s prompt + 26.8 s generation for
@@ -215,6 +220,12 @@ What the errors look like:
   * One product string, "Crucial Ballistix DDR4 32GB 2x16GB", missed the "3200".
   * `interest` separates gems weakly (AUC 0.63).
   * **Every scam was caught**, including "Kleinanzeigen Sicher bezahlen: send me the link".
+* **Gemma 4 E4B:**
+  * Best kinds (93 %) and bundles (87 %), products 97 %.
+  * **Missed 3 of 6 scams**: the Spain/PayPal-F&F MacBook, the prepayment-only AirPods, the e-mail-only RTX 4090.
+  * Rates everything high (mean interest 6.3–7.1).
+  * About the same speed as Qwen3.5 4B, but more RAM (8 GB stored weights behind 4.5B effective).
+  * A good second family to A/B against. Qwen3.5 4B stays the pick for its scam recall and lighter footprint.
 * **Naive prompt:** the model pretty-printed the JSON (120 tokens/ad) and hit `max_tokens` in batch 1. From ad 11
   onward the kinds collapsed into runs ("wanted, wanted, wanted…"). **The format fix alone made it 2.4× faster and
   kind accuracy 6× better.**
@@ -335,7 +346,7 @@ After=network-online.target
 [Service]
 User=ebey
 ExecStart=/opt/llama/llama-server -m /opt/models/Qwen3.5-2B-Q4_K_M.gguf \
-  --host 127.0.0.1 --port 8080 -c 8192 -t 4 --parallel 1 --no-mmap \
+  --host 127.0.0.1 --port 8080 -c 8192 -t 3 --parallel 1 --load-mode none \
   --chat-template-kwargs '{"enable_thinking":false}' --alias qwen3.5-2b
 Restart=always
 Nice=10
@@ -348,6 +359,9 @@ WantedBy=multi-user.target
 * A second unit serves the embedder:
   `llama-server -m Qwen3-Embedding-0.6B-Q8_0.gguf --embedding --pooling last --port 8081 -c 2048`.
 * `CPUQuota`/`Nice` keep the monitor and the web UI responsive: `-t` = cores − 1.
+* Oversubscription is the worst case for llama.cpp. In our runs, 4 threads plus one busy foreign process dropped
+  generation from ~9 to 0.4–1 tok/s.
+* `--load-mode none` is `--no-mmap` in builds before ~2026-09.
 * `-hf unsloth/Qwen3.5-2B-GGUF:Q4_K_M` downloads directly when Hugging Face is reachable.
 * For photos on the server, add `--mmproj mmproj-F16.gguf`.
 
@@ -444,5 +458,6 @@ below come from web-search result summaries (URLs listed), from the Docker Hub `
 * Nemotron 3.5 Lightning 30B-A3B (2026-08-11, Mamba-2 + MoE hybrid, text). https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
 * Structured outputs: Ollama https://docs.ollama.com/capabilities/structured-outputs ; a small-LLM JSON benchmark (Gemma 3 4B 100 % parse, Llama 3.2 3B ~50 %) https://ascentcore.com/2026/04/01/small-llm-performance-benchmark/
 
-The benchmark scripts and raw answers were kept outside the repo (agent scratchpad). The test set is 30 German ads with
-gold labels and can be turned into `tests/fixtures/triage_eval.json` if the scout needs a regression set.
+The benchmark scripts (`ads.py`: 30 German ads with gold labels; `bench_triage.py`; `bench_vision.py`), the logs and the
+raw model answers are outside the repo, in the session scratchpad (`…/scratchpad/models/`). The ad set can become
+`tests/fixtures/triage_eval.json` if the scout needs a regression set.

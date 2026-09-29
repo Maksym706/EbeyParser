@@ -65,9 +65,10 @@ function Empty() {
       tone="brand"
       title="Собери компьютер из б/у деталей по лучшей цене"
       message="Скажи, что нужно — я составлю план, проверю совместимость и поймаю каждую деталь дешевле рынка"
-      action=${html`<${Button} variant="primary" icon="plus" href="/projects/new">Новая сборка<//>`}
     >
+      <div class="pj-empty__cta"><${Button} variant="primary" icon="plus" href="/projects/new">Новая сборка<//></div>
       <div class="pj-empty__starters" role="group" aria-label="Шаблоны">
+        <span class="pj-empty__or">или начни с шаблона</span>
         ${STARTERS.map((s) => html`<${Chip} key=${s.key} icon=${s.icon} onClick=${() => navigate(`/projects/new?template=${s.key}`)}>${s.label}<//>`)}
       </div>
     <//>

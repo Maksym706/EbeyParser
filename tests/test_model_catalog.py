@@ -61,14 +61,14 @@ def test_recommend_weak_cpu_server():
 
 
 def test_recommend_tiny_ram_falls_back_to_smaller_models():
-    four = mc.recommend(ram_gb=4.5, vram_gb=0)
+    four = mc.recommend(ram_gb=4, vram_gb=0)
     assert four["tier"] == "T0"
     assert four["triage"]["key"] == "qwen3.5-2b"
-    assert four["triage"]["min_ram_gb"] + four["embed"]["min_ram_gb"] + mc.APP_RAM_GB <= 4.5
+    assert four["triage"]["min_ram_gb"] + four["embed"]["min_ram_gb"] + mc.APP_RAM_GB <= 4
     assert four["vision"]["key"] == "qwen3.5-0.8b-vision"  # 2B + projector does not fit next to the embedder
-    five = mc.recommend(ram_gb=5, vram_gb=0)
-    assert five["triage"]["key"] == "qwen3.5-2b"
-    assert five["embed"]["key"] == "embeddinggemma-300m"  # the embedding model steps down first
+    tight = mc.recommend(ram_gb=3.6, vram_gb=0)
+    assert tight["triage"]["key"] == "qwen3.5-2b"
+    assert tight["embed"]["key"] == "embeddinggemma-300m"  # the embedding model steps down first
     nothing = mc.recommend(ram_gb=3, vram_gb=0)  # no triage model under 2B is good enough
     assert nothing["triage"] is None and nothing["notes_ru"]
     assert nothing["embed"]["key"] == "qwen3-embedding-0.6b"
@@ -131,7 +131,8 @@ def test_find_catalog_model(reported, key):
 def test_best_installed_prefers_stronger_model_that_fits():
     available = ["qwen/qwen3.5-2b", "qwen/qwen3.5-4b", "text-embedding-nomic-embed-text-v1.5"]
     assert mc.best_installed(available, "triage") == "qwen/qwen3.5-4b"
-    assert mc.best_installed(available, "triage", ram_gb=5) == "qwen/qwen3.5-2b"
+    assert mc.best_installed(available, "triage", ram_gb=8) == "qwen/qwen3.5-2b"  # T0: 4B fits but is too slow
+    assert mc.best_installed(available, "triage", ram_gb=32) == "qwen/qwen3.5-4b"
     assert mc.best_installed(available, "vision") == "qwen/qwen3.5-4b"
     assert mc.best_installed(["llama3.2:3b"], "triage") is None
     assert mc.best_installed(["qwen3.5:0.8b"], "triage") is None  # too weak to read ads
