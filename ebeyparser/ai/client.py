@@ -179,7 +179,9 @@ def _model_missing(body: str) -> bool:
 
 VISION_HINTS = ("vl", "vision", "llava", "gemma-3", "gemma3", "minicpm-v", "minicpmv", "pixtral",
                 "moondream", "internvl", "molmo", "multimodal", "mistral-small-3", "glm-4.1v",
-                "glm-4.5v", "kimi-vl", "qwen3-vl", "qwen2.5-omni", "llama-4")
+                "glm-4.5v", "kimi-vl", "qwen3-vl", "qwen2.5-omni", "llama-4",
+                # natively multimodal families (docs/design/AI_MODELS.md): photos need the vision projector
+                "qwen3.5", "qwen3.6", "qwen3.8", "gemma-4", "gemma4")
 
 
 def looks_like_vision_model(name: str) -> bool:

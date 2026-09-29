@@ -37,7 +37,7 @@ export function TotalsBar({ p }) {
   const t = p.totals || {};
   const budget = p.budget || t.budget;
   const complete = t.best_complete && t.best_total != null;
-  const main = complete ? money(t.best_total) : approx(t.estimated_total);
+  const main = complete ? money(t.best_total) : t.estimated_total ? approx(t.estimated_total) : "—";
   const tone = t.fits_budget === true ? "t-green" : t.over_budget > 0 ? "t-amber" : "";
   const ratio = budget ? (t.estimated_total || 0) / budget : null;
   const over = ratio != null && ratio > 1;
@@ -53,8 +53,8 @@ export function TotalsBar({ p }) {
         ${!complete && (t.missing_offers || []).length > 0 && html`<p class="pj-totals__caption">для части деталей — по рынку: ${t.missing_offers.map(lower).join(", ")}</p>`}
       </div>
       <div class="pj-totals__ring">
-        <${Ring} value=${p.progress || 0} size=${52} stroke=${5} tone="brand"><span class="num">${t.slots_done ?? p.slots_done}</span><//>
-        <span>${ru(p.progress_label)}</span>
+        <${Ring} value=${p.progress || 0} size=${52} stroke=${5} tone="brand"><span class="num">${t.slots_done ?? p.slots_done}/${t.slots_total ?? p.slots_total}</span><//>
+        <span class="pj-totals__progress">${ru(p.progress_label)}</span>
       </div>
     </div>
     ${ratio != null &&
@@ -132,7 +132,7 @@ export function OfferRow({ offer, label, onBought, onDeal, compact = false, gpu 
   const meta = [
     offer.distance_km != null ? `${number(offer.distance_km, offer.distance_km < 10 ? 1 : 0)} км` : null,
     offer.location,
-    offer.first_seen_label ? `с ${offer.first_seen_label}` : null,
+    offer.first_seen_label ? `нашёл ${/^\d/.test(offer.first_seen_label) ? "в " : ""}${offer.first_seen_label}` : null,
     offer.source === "ebay" ? offer.source_label : null,
   ].filter(Boolean);
   const vsTone = offer.under_target ? "t-green" : "t-amber";
@@ -140,7 +140,7 @@ export function OfferRow({ offer, label, onBought, onDeal, compact = false, gpu 
     <${DealImage} src=${offer.image} class="pj-offer__img" />
     <div class="pj-offer__main">
       ${label && html`<span class="pj-offer__label">${label}</span>`}
-      <a class="pj-offer__title" href=${offer.url} target="_blank" rel="noopener noreferrer">${offer.title}</a>
+      <a class="pj-offer__title" href=${offer.url} target="_blank" rel="noopener noreferrer"><span>${offer.title}</span></a>
       <div class="pj-offer__meta">
         <${VerdictPill} offer=${offer} />
         ${meta.length > 0 && html`<span>${meta.join(" · ")}</span>`}
@@ -201,7 +201,7 @@ export function TrackSlot({ p, slot, handlers = {}, busy, justStarted, interval,
       </p>
     </div>
     <span class=${cx("pj-slot__status", `st-${slot.status}`, tracking && slot.status === "open" && p.status === "tracking" && "is-live")}>${slot.status_label}</span>
-    ${!off && !bought && slot.trend && html`<${Trend} trend=${slot.trend} />`}
+    ${!off && !bought && slot.trend && !(phone && slot.trend.direction === "unknown" && !(slot.trend.points || []).length) && html`<${Trend} trend=${slot.trend} />`}
   </header>`;
 
   // bought / have / skipped: one quiet row with «Отменить»
@@ -617,7 +617,7 @@ export function AlertsList({ p, onDeal }) {
               ${a.price != null && html`<span class="num">${money(a.price)}</span>`}
               <span class="muted">${a.sent_at_label}</span>
             </div>
-            <p class="pj-alert__text">${ru(a.text)}</p>
+            <p class="pj-alert__text">${alertLine(a.text)}</p>
             <div class="pj-alert__foot">
               <span class=${cx("pj-alert__delivered", !a.delivered && "muted")}><${Icon} name=${a.delivered ? "send" : "smartphone"} size=${12} />${a.delivered_label}</span>
               ${!a.delivered && !channel && html`<a href="/settings/notifications" class="linkish">Настроить Telegram</a>`}
@@ -628,6 +628,15 @@ export function AlertsList({ p, onDeal }) {
       )}
     </ul>
   </section>`;
+}
+
+/** A stored alert is the whole Telegram message (several lines, links): the first line is the news. */
+function alertLine(text) {
+  const first = String(text || "")
+    .split(/\n/)
+    .map((l) => l.trim())
+    .find(Boolean);
+  return ru((first || "").replace(/https?:\/\/\S+/g, "").replace(/\s{2,}/g, " "));
 }
 
 // ================================================================== side sheets

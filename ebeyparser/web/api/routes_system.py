@@ -173,7 +173,7 @@ async def health(ai: bool = Query(True, description="проверять нейр
         add("error", f"{AI_DOWN_RU}. {ai_info.get('error_ru') or ''}".strip(),
             {"label_ru": "Настройки нейросети", "href": "/settings/ai"}, str(ai_info.get("details") or ""))
     scout = mon.get("scout") or {}
-    if scout.get("enabled") and scout.get("state") == "down":
+    if scout.get("enabled") and scout.get("state") in ("down", "too_small"):
         add("warn", scout.get("text_ru") or "Разведчик не отвечает", {"label_ru": "Настройки нейросети",
                                                                        "href": "/settings/ai"})
     if (scout.get("vision_queue") or {}).get("waiting"):  # the photo model is offline: deals wait for it

@@ -97,7 +97,8 @@ def dig(data: Any, dotted: str) -> Any:
 
 class ApiContext:
     """One per app (app.state.api). Test hooks: http_transport (httpx transport for Telegram,
-    eBay and the AI server), smtp_factory (EmailNotifier), ai_probe (LM Studio / Ollama probe)."""
+    eBay and the AI server), smtp_factory (EmailNotifier), ai_probe (LM Studio / Ollama probe),
+    host_probe (this machine's hardware for /ai/recommend)."""
 
     def __init__(
         self,
@@ -115,6 +116,7 @@ class ApiContext:
         self.bind_host = bind_host
         self.http_transport: Any = None
         self.smtp_factory: Any = None
+        self.host_probe: Any = None  # () -> this machine's hardware (ai.hardware.detect_host); tests set a fake
         self.check_lock = asyncio.Lock()
         self.started_at = utcnow()
 

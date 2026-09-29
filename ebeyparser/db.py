@@ -779,8 +779,9 @@ class Database:
 
     def scout_backlog(self, since: datetime, *, min_interest: int = 0, limit: int = 100) -> list[Listing]:
         """Ads the script dismissed (free checks / market data) since `since` that the scout has not
-        read yet (or whose reading failed: source "script"), or read as interesting (>= min_interest)
-        without a second look so far — the scout's "second look" when there is time left in a pass."""
+        read yet (or whose reading failed: source "script"), or read by the model (interest >= min_interest;
+        0 = every reading: the interest is only a weak signal) without a second look so far — the scout's
+        "second look" when there is time left in a pass."""
         rows = self._query(
             "SELECT l.data FROM listings l JOIN evaluations e ON e.ad_id = l.ad_id"
             " LEFT JOIN scout_triage t ON t.ad_id = l.ad_id"

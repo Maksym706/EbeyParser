@@ -67,12 +67,12 @@ function makeActions(p, setView, { setBusy, setReadOnly }) {
         await patch({ slots: { [key]: body } });
         const slot = (p.slots || []).find((s) => s.key === key) || { label: "Часть" };
         if (body.status) {
-          const text = { have: "Отметил: уже есть", skipped: "Отметил: не нужно", open: "Снова ищу эту часть" }[body.status];
-          toast.success(`${slot.label}: ${lower(text)}`, {
+          const text = { have: "уже есть", skipped: "не нужно", open: "снова ищу" }[body.status];
+          toast.success(`${slot.label}: ${text}`, {
             message: body.status === "open" ? "" : "Больше не ищу её и не считаю в сумме",
             action: undoOf ? { label: "Отменить", onClick: () => patch({ slots: { [key]: { status: undoOf } } }).catch((e) => toast.error(e)) } : null,
           });
-        } else if (body.target_price) toast.success(`${slot.label}: своя цель ${money(body.target_price)}`, { message: "Поиски проверяют объявления до 30 % дороже цели" });
+        } else if (body.target_price) toast.success(`${slot.label}: своя цель ${money(body.target_price)}`, { message: "Проверяю объявления до 30 % дороже цели — с продавцом можно поторговаться" });
         else if (body.auto_target) toast.success(`${slot.label}: цель снова считаю сам`);
         else if (body.note !== undefined) toast.success(body.note ? "Заметка сохранена" : "Заметка убрана");
         return true;
@@ -282,7 +282,7 @@ export default function ProjectPage({ id, slotKey, query = {} }) {
     ${readOnly && html`<${Banner} tone="haggle" title="Не могу сохранить настройки" details=${readOnly.details} onClose=${() => setReadOnly(null)}>${readOnly.message}<//>`}
     ${!writable && !done && !readOnly && html`<${Banner} tone="haggle" title="Не могу сохранить настройки">Нет доступа к файлу настроек — сборку можно смотреть, но поиски для неё не запустятся.<//>`}
     ${paused &&
-    html`<${Banner} tone="neutral" icon="pause" title="Сборка на паузе — поиски не работают" action=${html`<${Button} size="sm" variant="primary" icon="play" loading=${busy === "status"} onClick=${() => actions.onStatus("tracking")}>Продолжить<//>`}>
+    html`<${Banner} tone="neutral" icon="pause" title="Сборка на паузе — поиски не работают" action=${html`<${Button} size="sm" variant="secondary" icon="play" loading=${busy === "status"} onClick=${() => actions.onStatus("tracking")}>Продолжить<//>`}>
       Предложения ниже — те, что я видел до паузы.
     <//>`}
     ${done && html`<${DoneCard} p=${p} reload=${load} />`}
@@ -307,9 +307,9 @@ export default function ProjectPage({ id, slotKey, query = {} }) {
 
     ${draft &&
     phone &&
-    html`<div class="savebar pj-savebar" role="region" aria-label="Начать отслеживание">
+    html`<div class="savebar pj-savebar pj-draftbar" role="region" aria-label="Начать отслеживание">
       <div class="savebar__inner">
-        <span class="savebar__text">Черновик — поиски ещё не созданы</span>
+        <span class="savebar__text">Черновик: поиски ещё не созданы</span>
         <div class="savebar__actions"><${Button} variant="primary" icon="radar" disabled=${!writable} onClick=${() => setSheet("track")}>Начать отслеживание<//></div>
       </div>
     </div>`}
@@ -421,7 +421,7 @@ function BudgetDialog({ open, value, onClose, onSave }) {
 function DoneCard({ p, reload }) {
   const active = (p.searches_list || []).filter((s) => s.exists).length;
   return html`<section class="pj-done">
-    <span class="pj-done__icon"><${Icon} name="party-popper" size=${28} /></span>
+    <span class="pj-done__icon"><${Icon} name="package-check" size=${26} /></span>
     <div class="grow">
       <h2 class="pj-done__title">Всё собрано 🎉</h2>
       <p class="pj-done__text">Потрачено <b class="num">${money(p.spent || 0)}</b>${p.budget ? html` из <b class="num">${money(p.budget)}</b>` : ""}${p.budget && p.spent <= p.budget ? html` — <span class="t-green">уложился в бюджет</span>` : ""}</p>

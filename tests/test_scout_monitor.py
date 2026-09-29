@@ -145,6 +145,34 @@ async def test_scout_ranks_junk_last():
     assert monitor._evaluator.calls == ["B"] and summary.deferred == 1  # the interesting one gets the AI call
 
 
+async def test_scout_never_promotes_what_the_code_flags():
+    """A small model missed the WhatsApp-only scam; the code's own red flags stop the promotion."""
+    pc = make_listing("1", "Alter Rechner vom Dachboden", 150.0, description=PC_TEXT + " Kontakt nur per WhatsApp.")
+    engine, _ = scout_engine({"Alter Rechner vom Dachboden": PC_ITEM})  # no risk tag from the model
+    monitor, db, _, notifier = build(cfg(), [pc], verdict=PC_AI, scout=engine)
+    teach(db, "rtx|3080", "RTX 3080", 560.0)
+    summary = await monitor.run_once()
+    ev = db.get_evaluation("1")
+    assert ev.verdict == "skip" and ev.found_by != "ai_scout" and summary.scout_promoted == 0
+    assert summary.scout_read == 1 and notifier.sent == []
+
+
+async def test_scout_refuses_a_model_under_2b_and_shows_the_expected_speed():
+    pc = make_listing("1", "Alter Rechner vom Dachboden", 150.0, description=PC_TEXT)
+    tiny = cfg(ai={"scout": {"enabled": True, "base_url": "http://nas:8080/v1", "model": "qwen3.5:0.8b"}})
+    monitor, db, _, _ = build(tiny, [pc.model_copy()], verdict=PC_AI)
+    summary = await monitor.run_once()
+    assert monitor._scout is None and not monitor.scout_enabled and summary.scout_read == 0
+    assert db.get_evaluation("1").stage == "prefilter"  # the old pipeline, untouched
+    status = monitor.scout_status()
+    assert status["state"] == "too_small" and "слишком маленькая" in status["text_ru"] and status["speed_ru"] == ""
+    assert monitor.config.ai.scout.model == "qwen3.5:0.8b"  # the user's model stays as configured
+    ok = cfg(ai={"scout": {"enabled": True, "base_url": "http://nas:8080/v1", "model": "qwen3.5:2b-q4_K_M"}})
+    monitor, _, _, _ = build(ok, [], verdict=PC_AI)
+    status = monitor.scout_status()  # not measured yet: the model research's speed (a remote box: T0)
+    assert status["speed_expected"] and status["speed_ru"].startswith("Ожидается ≈ 6.0 с на объявление")
+
+
 async def test_scout_down_is_the_old_pipeline():
     pc = make_listing("1", "Alter Rechner vom Dachboden", 150.0, description=PC_TEXT)
     engine, _ = scout_engine({}, down=True)

@@ -89,9 +89,9 @@ RANGES: dict[str, tuple[float | None, float | None]] = {
     "ai.scout.timeout_seconds": (5, 1800),
     "ai.scout.temperature": (0, 2),
     "ai.scout.max_tokens": (200, 16000),
-    "ai.scout.batch_size": (1, 32),
+    "ai.scout.batch_size": (0, 32),  # 0 = by the model's size
     "ai.scout.min_batch": (1, 32),
-    "ai.scout.max_batch": (1, 32),
+    "ai.scout.max_batch": (0, 32),  # 0 = by the model's size
     "ai.scout.max_per_hour": (0, 20000),
     "ai.scout.pass_share": (0.05, 1),
     "ai.scout.min_interest": (0, 10),
@@ -221,7 +221,8 @@ def _problems(cfg: AppConfig, keys: list[str]) -> dict[str, str]:
     if touched & {"ai.scout.base_url", "ai.scout.enabled"} and ai.scout.base_url.strip() \
             and urlsplit(ai.scout.base_url).scheme not in ("http", "https"):
         problems["ai.scout.base_url"] = "адрес должен начинаться с http://, например http://127.0.0.1:8080/v1"
-    if touched & {"ai.scout.min_batch", "ai.scout.max_batch"} and ai.scout.min_batch > ai.scout.max_batch:
+    if touched & {"ai.scout.min_batch", "ai.scout.max_batch"} and ai.scout.max_batch \
+            and ai.scout.min_batch > ai.scout.max_batch:
         problems["ai.scout.min_batch"] = "минимум не может быть больше максимума"
     if "ai.model" in touched and not ai.model.strip():
         problems["ai.model"] = "укажи модель, например qwen/qwen2.5-vl-7b"

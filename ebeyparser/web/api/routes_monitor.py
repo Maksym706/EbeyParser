@@ -237,6 +237,7 @@ def scout_view(ctx: ApiContext) -> dict[str, Any]:
     """The AI scout (docs/design/AI_SCOUT.md): on/off, "успевает смотреть N из M новых объявлений
     в час", speed, mode, the vision queue; from the running monitor or the last stored snapshot."""
     from ...ai.scout import status_view
+    from ...ai.triage import expected_sec_per_ad, too_small_for_triage
 
     fn = getattr(ctx.monitor, "scout_status", None)
     if callable(fn):
@@ -247,10 +248,13 @@ def scout_view(ctx: ApiContext) -> dict[str, Any]:
         except Exception:  # noqa: BLE001 - a status tile never breaks the page
             log.exception("scout status failed")
     sc = ctx.config.ai.scout
+    model = sc.model or ctx.config.ai.model
     return status_view(enabled=sc.enabled, mode_setting=sc.mode, provider=sc.provider,
-                       base_url=sc.base_url or ctx.config.ai.base_url, model=sc.model or ctx.config.ai.model,
+                       base_url=sc.base_url or ctx.config.ai.base_url, model=model,
                        own_endpoint=bool(sc.base_url.strip()), snap={}, vision_waiting=0,
-                       vision_wait_minutes=ctx.config.ai.vision_wait_minutes)
+                       vision_wait_minutes=ctx.config.ai.vision_wait_minutes,
+                       expected_sec_per_ad=expected_sec_per_ad(model), pass_share=sc.pass_share,
+                       max_per_hour=sc.max_per_hour, too_small=sc.enabled and too_small_for_triage(model))
 
 
 async def monitor_view(ctx: ApiContext, *, with_hosts: bool = True) -> dict[str, Any]:

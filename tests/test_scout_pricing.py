@@ -180,6 +180,51 @@ def test_worth_a_look_rules():
     assert not scout.worth_a_look(priced, deal_math=lambda e: False, min_interest=6)  # history says no deal
 
 
+def test_interest_is_only_a_tie_breaker():
+    ad = listing("Handy", 100.0, "Google Pixel 7 128GB")
+    low = scout.plan(ad, TriageItem(kind="single", product="Google Pixel 7 128GB", query="pixel 7 128gb", interest=0),
+                     lookup_from({}))
+    high = scout.plan(ad, low.item.model_copy(update={"interest": 10}), lookup_from({}))
+    # a weak model's score filters nothing by default: the comparables lookup decides
+    assert scout.worth_a_look(low, deal_math=lambda e: False) and scout.worth_a_look(high, deal_math=lambda e: False)
+    assert high.priority(ad) < low.priority(ad) and low.priority(ad) - high.priority(ad) <= 0.03
+    priced = scout.plan(ad, low.item, lookup_from({"pixel|7": 220.0}))
+    assert priced.priority(ad) < high.priority(ad)  # a real price beats any interest
+    # a lot with nothing to price: no data, no promotion — whatever the interest says
+    lot = scout.plan(listing("Kiste vom Dachboden", 40.0, "Alte Kabel, eine Lampe und Spielzeug"),
+                     TriageItem(kind="lot", contents=["Kabel", "Lampe"], interest=10), lookup_from({}))
+    assert lot.usable and not scout.worth_a_look(lot, deal_math=lambda e: True)
+
+
+@pytest.mark.parametrize("text", [
+    "RTX 3080 10GB, Kontakt nur per WhatsApp",
+    "RTX 3080 10GB, schreib mir auf Telegram",
+    "RTX 3080 10GB, bitte an max.muster@gmail.com schreiben",
+    "RTX 3080 10GB. Sicher bezahlen: ich schicke dir den Link",
+    "RTX 3080 10GB, Zahlung per Vorkasse",
+    "RTX 3080 10GB, nur PayPal Freunde",
+    "RTX 3080 10GB, Western Union",
+    "RTX 3080 10GB, nur Versand",
+])
+def test_code_red_flags_back_up_the_model(text):
+    """A 2B missed the WhatsApp / e-mail / «Sicher bezahlen» scams: the code's own rules block them."""
+    clean = TriageItem(kind="single", product="NVIDIA RTX 3080", query="rtx 3080", interest=9)  # no risk tag
+    ad = listing("Grafikkarte", 200.0, text)
+    plan = scout.plan(ad, clean, lookup_from({"rtx|3080": 600.0}))
+    assert plan.blocked.startswith("признаки") and not plan.usable
+    assert not scout.worth_a_look(plan, deal_math=lambda e: True) and plan.priority(ad) == scout.DEMOTED_PRIORITY
+
+
+def test_code_red_flags_leave_honest_ads_and_ebay_shipping_alone():
+    clean = TriageItem(kind="single", product="NVIDIA RTX 3080", query="rtx 3080", interest=9)
+    honest = scout.plan(listing("Grafikkarte", 200.0, "RTX 3080 10GB, Abholung in Berlin, Sicher bezahlen möglich"),
+                        clean, lookup_from({"rtx|3080": 600.0}))
+    assert not honest.blocked and scout.worth_a_look(honest, deal_math=lambda e: True)
+    ebay = Listing(ad_id="2", url="https://www.ebay.de/itm/2", title="Grafikkarte", price=200.0, source="ebay",
+                   description="RTX 3080 10GB, nur Versand")
+    assert not scout.plan(ebay, clean, lookup_from({"rtx|3080": 600.0})).blocked  # eBay ships, buyer protection
+
+
 def test_vision_normalisation_and_disagreement():
     ad = listing("Alter PC", 150.0, "RTX 3080 drin")
     pc = scout.plan(ad, TriageItem(kind="pc", contents=["RTX 3080"], interest=9), lookup_from({"rtx|3080": 400.0}))
@@ -240,6 +285,15 @@ def test_status_view_texts():
     assert on["state"] == "behind" and on["text_ru"] == "Успевает смотреть 90 из 120 новых объявлений в час"
     assert on["speed_ru"] == "≈ 5.0 с на объявление, до 360 объявлений в час" and on["mode"] == "candidates"
     assert on["vision_queue"]["waiting"] == 2 and "2" in on["vision_queue"]["text_ru"]
+    assert not on["speed_expected"] and not on["too_small"]
+    # not measured yet: the model research's speed for this model
+    fresh = scout.status_view(enabled=True, snap={}, expected_sec_per_ad=6.0, pass_share=0.5, max_per_hour=600,
+                              **common)
+    assert fresh["speed_expected"] and fresh["speed_ru"] == (
+        "Ожидается ≈ 6.0 с на объявление, до 300 объявлений в час (пока не измерено)")
+    small = scout.status_view(enabled=True, snap={}, too_small=True, **{**common, "model": "qwen3.5:0.8b"})
+    assert small["state"] == "too_small" and "слишком маленькая" in small["text_ru"] and "qwen3.5:0.8b" in small["text_ru"]
+    assert small["speed_ru"] == ""
     down = scout.status_view(enabled=True, snap={**snap, "last_error": "x", "last_error_at": 10.0, "last_ok_at": 5.0},
                              **common)
     assert down["state"] == "down" and "не отвечает" in down["text_ru"]

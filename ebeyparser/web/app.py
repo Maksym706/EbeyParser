@@ -28,7 +28,6 @@ from fastapi.templating import Jinja2Templates
 from markupsafe import Markup
 from pydantic import BaseModel, ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .. import __version__
 from ..config import AppConfig, ConfigError, SearchConfig, load_config
@@ -66,6 +65,7 @@ from .security import (
     COOKIE_NAME,
     TOKEN_HEADER,
     TOKEN_PARAM,
+    HostGuard,
     ensure_token,
     is_loopback,
     token_matches,
@@ -1478,9 +1478,10 @@ def create_app(
         }, 401)
 
     extra_hosts = getattr(config.web, "allowed_hosts", None) or []
-    app.add_middleware(TrustedHostMiddleware,
+    app.add_middleware(HostGuard,  # network mode: plain IP addresses pass too (the token guards)
                        allowed_hosts=trusted_hosts(bind_host if bind_host is not None else config.web.host,
-                                                   extra_hosts))
+                                                   extra_hosts),
+                       allow_ip_literals=not loopback)
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error(request: Request, exc: StarletteHTTPException) -> Response:

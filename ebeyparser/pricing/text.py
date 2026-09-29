@@ -313,11 +313,12 @@ FLAG_RENT = "Рассрочка/аренда"
 FLAG_MISSING = "Нет комплектующих"
 FLAG_SIMLOCK = "Привязка к оператору (SIM-lock)"
 FLAG_UNTESTED = "Не проверено продавцом"
-FLAG_WHATSAPP = "Просит связь через WhatsApp"
+FLAG_WHATSAPP = "Просит связь через WhatsApp/Telegram"
+FLAG_EMAIL = "Просит писать на e-mail"
 FLAG_RESERVED = "Возможно, уже зарезервировано"
 FLAG_DELETED = "Объявление удалено"
 FLAG_TOO_GOOD = "Подозрительно дёшево и только пересылка — похоже на развод"
-FLAG_BAIT = "Подозрительно дёшево и уводит в WhatsApp / предоплату — похоже на развод"
+FLAG_BAIT = "Подозрительно дёшево и уводит в WhatsApp / Telegram / e-mail или на предоплату — похоже на развод"
 
 SEVERE_FLAGS: frozenset[str] = frozenset(
     {FLAG_WANTED, FLAG_DEFECT, FLAG_BOX_ONLY, FLAG_LOCKED, FLAG_FAKE, FLAG_SCAM, FLAG_SWAP, FLAG_RENT,
@@ -526,6 +527,13 @@ _RULES: tuple[_Rule, ...] = (
             r"(?:versand|versende|verschicke) (?:nur )?(?:ins|aus dem|vom) ausland",
             r"(?:ueberweisung|zahlung|bezahlung) " + _GAP2 + r"(?:vorab|im voraus|vorraus)",
             r"(?:vorab|im voraus) (?:per )?(?:ueberweis\w*|bezahl\w*|zahl\w*)",
+            # Kleinanzeigen's own "Sicher bezahlen" happens in the app: a link, an e-mail or a
+            # messenger next to it is the phishing trick ("schick mir deine E-Mail, ich sende den Link")
+            r"sicher bezahlen (?:[^\s.!?]+ ){0,10}(?:link\w*|whatsapp|whats app|telegram|formular\w*|"
+            r"(?:deine|ihre|your) (?:e mail|email|mail)\w*)",
+            r"(?:link\w*|whatsapp|whats app|telegram|formular\w*|(?:deine|ihre|your) (?:e mail|email|mail)\w*) "
+            r"(?:[^\s.!?]+ ){0,10}sicher bezahlen",
+            r"(?:zahlungs|bezahl|kauf|sicherheits)link\w*",
         ],
     ),
     _rule(
@@ -612,7 +620,12 @@ _RULES: tuple[_Rule, ...] = (
             r"funktion (?:ist )?(?:unbekannt|nicht bekannt|ungeprueft)",
         ],
     ),
-    _rule(FLAG_WHATSAPP, [r"whats ?app", r"wa nummer"]),
+    _rule(FLAG_WHATSAPP, [r"whats ?app", r"wa nummer", r"telegram\w*", r"tg nummer"]),
+    _rule(  # moving the talk off the platform: the e-mail-only scam
+        FLAG_EMAIL,
+        [r"(?:schreib\w*|melde\w*|kontakt\w*|anfrage\w*|antwort\w*|nachricht\w*|schick\w*|write|contact) "
+         r"(?:[^\s.!?]+ ){0,5}(?:e mail|email|mail)(?:adresse)?"],
+    ),
     _rule(FLAG_RESERVED, [r"reserviert"]),
 )
 
@@ -747,7 +760,16 @@ def detect_red_flags(text: str) -> list[str]:
     for rule in _RULES:
         if rule.label not in flags and _rule_hits(rule, s):
             flags.append(rule.label)
+    if FLAG_EMAIL not in flags and _EMAIL_ADDRESS_RE.search(text):
+        flags.append(FLAG_EMAIL)
     return flags
+
+
+# "max.muster@gmail.com", "max (at) web.de", "max[at]gmx.de"
+_EMAIL_ADDRESS_RE = re.compile(
+    r"[\w.+-]+\s*(?:@|\(\s*(?:at|ät)\s*\)|\[\s*(?:at|ät)\s*\])\s*[\w-]+\s*(?:\.|\(\s*dot\s*\)|\[\s*dot\s*\])\s*[a-z]{2,6}\b",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------

@@ -10,16 +10,20 @@ import httpx
 import pytest
 
 from ebeyparser.ai.client import LLMError, VisionLLM
-from ebeyparser.ai.prompts_triage import KINDS, SYSTEM_PROMPT, TRIAGE_SCHEMA, ad_block, build_user_prompt
+from ebeyparser.ai.prompts_triage import PROMPT_KINDS, SYSTEM_PROMPT, TRIAGE_SCHEMA, ad_block, build_user_prompt
 from ebeyparser.ai.triage import (
     TriageEngine,
     TriageItem,
+    batch_for_model,
     blind_spot,
     check_sample,
+    expected_sec_per_ad,
+    model_params_b,
     parse_triage,
     sample_ads,
     scout_priority,
     script_item,
+    too_small_for_triage,
 )
 from ebeyparser.config import LLMSettings, parse_config
 from ebeyparser.models import Listing
@@ -45,11 +49,21 @@ def test_schema_is_strict_and_flat():
     assert set(items["required"]) == set(items["properties"]) == {"i", "k", "p", "n", "c", "q", "z", "h", "x", "s", "r"}
     # flat: no nested objects inside an item (small models get lost in them)
     assert all(p["type"] != "object" for p in items["properties"].values())
-    assert items["properties"]["k"]["enum"] == list(KINDS)
+    # the model sees "sale" as the explicit default kind; the parser maps it to the internal "single"
+    assert items["properties"]["k"]["enum"] == list(PROMPT_KINDS) and PROMPT_KINDS[0] == "sale"
+    assert "single" not in PROMPT_KINDS
+
+
+def test_prompt_names_the_default_kind_and_the_german_trigger_words():
+    for words in ("Default: sale", "wanted = Suche, Suche nach", "swap = Tausche, Tausch", "für Bastler",
+                  "Ersatzteil", "box = nur OVP, nur Karton", "Konvolut, Sammlung", "Paket", "at most 8 words",
+                  "Never copy German text", "minified JSON on one line", '"k":"sale"'):
+        assert words in SYSTEM_PROMPT, words
+    assert '"k":"single"' not in SYSTEM_PROMPT
 
 
 def test_prompt_never_asks_for_prices_and_numbers_the_ads():
-    assert "do not" in SYSTEM_PROMPT and "guess prices" in SYSTEM_PROMPT
+    assert "never" in SYSTEM_PROMPT and "guess prices" in SYSTEM_PROMPT
     assert "estimated" not in SYSTEM_PROMPT.lower() and "market price" not in SYSTEM_PROMPT.lower()
     listings = [ad("1", "Alter PC", 150, "RTX 3070 drin", negotiable=True), ad("2", "Sofa", None, price_text="VB"),
                 ad("3", "Stuhl", None, is_free=True)]
@@ -124,6 +138,17 @@ def test_parse_coerces_sloppy_values():
     assert parse_triage(json.dumps({"items": [item(0, s=0.7)]}), 1)[0].interest == 7
     assert parse_triage(json.dumps({"items": [item(0, s=85)]}), 1)[0].interest == 8
     assert parse_triage(json.dumps({"items": [item(0, k="spaceship")]}), 1)[0].kind == "other"
+
+
+def test_parse_sale_kind_and_russian_reason_only():
+    got = parse_triage(json.dumps({"items": [
+        item(0, k="sale", r="iPhone 13, опечатка в названии"),
+        item(1, r="Akku 87 %, kleine Kratzer am Rahmen"),  # German text copied from the ad
+        item(2, r="очень " * 20 + "длинная причина"),
+    ]}), 3)
+    assert got[0].kind == "single" and got[0].reason == "iPhone 13, опечатка в названии"
+    assert got[1].reason == ""  # not Russian: dropped (the UI builds its own line)
+    assert len(got[2].reason.split()) == 12
 
 
 def test_script_item_and_priority():
@@ -250,6 +275,43 @@ async def test_engine_stops_when_the_model_is_down():
     run = await engine.triage(ads(6))
     assert run.error and run.items == {} and len(run.overflow) == 6
     assert engine.stats.last_error and engine.stats.snapshot(share=0.5, max_per_hour=600)["last_error"]
+
+
+def test_model_size_decides_the_batch():
+    assert model_params_b("qwen3.5:2b-q4_K_M") == 2.0 and model_params_b("Qwen2.5-1.5B-Instruct") == 1.5
+    assert model_params_b("qwen3.6-35b-a3b") == 35.0 and model_params_b("unsloth/Qwen3.5-9B-GGUF:Q4_K_M") == 9.0
+    assert model_params_b("qwen/qwen3.5-4b") == 4.0 and model_params_b("fake-scout") is None
+    assert batch_for_model("qwen/qwen3.5-2b") == (5, 5) and batch_for_model("qwen3.5:4b-q4_K_M") == (10, 16)
+    assert batch_for_model("llama3.2:3b") == (8, 10) and batch_for_model("") == (8, 16)
+    assert too_small_for_triage("qwen3.5:0.8b-q4_K_M") and too_small_for_triage("Qwen2.5-1.5B-Instruct")
+    assert not too_small_for_triage("qwen/qwen3.5-2b") and not too_small_for_triage("") \
+        and not too_small_for_triage("gpt-4o")
+    # the measured / catalog speed shown before the scout measured its own
+    assert expected_sec_per_ad("qwen3.5:2b-q4_K_M") == 6.0 and expected_sec_per_ad("qwen/qwen3.5-4b") == 15.5
+    assert expected_sec_per_ad("qwen/qwen3.5-4b", "T1") == 6.0 and expected_sec_per_ad("qwen/qwen3.5-2b", "T1") == 2.5
+    assert expected_sec_per_ad("qwen3.5:0.8b") is None and expected_sec_per_ad("my-model") is None
+
+
+async def test_engine_from_config_batch_by_model_size_and_halving():
+    base = parse_config({}).ai.scout
+    assert base.batch_size == 0 and base.max_batch == 0 and base.min_interest == 0  # 0 = by the model
+    small = TriageEngine.from_config(FakeLLM(good), base.model_copy(update={"model": "qwen3.5:2b-q4_K_M"}))
+    assert (small.batch_size, small.max_batch) == (5, 5)
+    big = TriageEngine.from_config(FakeLLM(good), base.model_copy(update={"model": "qwen/qwen3.5-4b"}))
+    assert (big.batch_size, big.max_batch) == (10, 15)  # 16, but the answer must fit max_tokens 1800
+    unknown = TriageEngine.from_config(FakeLLM(good), base.model_copy(update={"model": "my-model"}))
+    assert (unknown.batch_size, unknown.max_batch) == (8, 15)
+    mine = TriageEngine.from_config(FakeLLM(good), base.model_copy(update={"model": "qwen3.5:2b", "batch_size": 8}))
+    assert (mine.batch_size, mine.max_batch) == (8, 8)  # a set value wins
+
+    def half(n, user):  # a 2B loses track: the adaptive halving still works
+        return json.dumps({"items": [item(i) for i in range(min(n, 2))]})
+
+    clock = Clock()
+    engine = TriageEngine.from_config(FakeLLM(half, clock=clock), base.model_copy(update={"model": "qwen/qwen3.5-2b"}),
+                                      clock=clock, wall=clock)
+    run = await engine.triage(ads(5))
+    assert engine.batch_size == 2 and run.ai_count == 5
 
 
 def test_engine_caps_batch_by_answer_tokens():

@@ -121,7 +121,8 @@ export default function CreateProject({ query = {} }) {
         flash: slotKey,
         what: (view) => {
           const s = (view.slots || []).find((x) => x.key === slotKey);
-          return `${s ? s.label : "Часть"}: ${ru(shortOption(s ? s.chosen_label : optionKey))}`;
+          const label = ru(shortOption(s ? s.chosen_label : optionKey));
+          return `${s ? s.label : "Часть"}: ${s && label.toLowerCase().startsWith(s.label.toLowerCase() + " ") ? label.slice(s.label.length + 1) : label}`;
         },
       }),
     );
@@ -151,7 +152,7 @@ export default function CreateProject({ query = {} }) {
           </label>
           <p class="pj-head__sub">${ru(preview.template_label)}${preview.budget ? ` · бюджет ${money(preview.budget)}` : ""}</p>
         </div>
-        <span class="pj-status tone-neutral"><${Icon} name="eye" size=${12} />Предпросмотр</span>
+        <div class="pj-head__side"><span class="pj-status tone-neutral"><${Icon} name="eye" size=${12} />Предпросмотр — ещё не сохранено</span></div>
       </header>
       <${PlanBody} plan=${preview} mode="preview" handlers=${{ onPick: pickInPreview, onFix: fixInPreview }} busy=${busy} />
       <div class="savebar pj-savebar" role="region" aria-label="Сохранить сборку">
@@ -203,7 +204,7 @@ export default function CreateProject({ query = {} }) {
             <div class="pj-budget__slider">
               <${Slider} value=${budget ?? 1000} min=${100} max=${5000} step=${50} onChange=${(v) => setBudget(v)} format=${(v) => money(v)} label="Бюджет" tone="green" marks=${false} />
             </div>
-            <div class="pj-budget__input"><${NumberInput} id=${id} value=${budget} onChange=${setBudget} min=${1} max=${100000} suffix="€" invalid=${Boolean(errors.budget)} placeholder="1 500" /></div>
+            <div class="pj-budget__input"><${NumberInput} id=${id} value=${budget} onChange=${setBudget} min=${1} max=${100000} suffix="€" invalid=${Boolean(errors.budget)} placeholder="не задан" /></div>
           </div>`}
         <//>
       </div>
@@ -212,8 +213,7 @@ export default function CreateProject({ query = {} }) {
         ${ai.available
           ? html`<span class="pj-ai-chip tone-info"><${Icon} name="bot" size=${14} />Нейросеть поможет понять цель своими словами</span>
               <${Toggle} checked=${useAi} onChange=${setUseAi} label="С нейросетью" size="sm" />`
-          : html`<span class="pj-ai-chip"><${Icon} name="bot" size=${14} />Нейросеть выключена — составлю план по правилам</span>
-              <a class="linkish" href="/settings/ai">Включить</a>`}
+          : html`<span class="pj-ai-chip"><${Icon} name="bot" size=${14} /><span>Нейросеть выключена — составлю план по правилам. <a class="linkish" href="/settings/ai">Включить</a></span></span>`}
       </div>
 
       ${state.error &&
@@ -231,7 +231,13 @@ export default function CreateProject({ query = {} }) {
 
 /** The AI can take up to 2 minutes: skeleton + an honest label + «без нейросети» after 20 s. */
 function PlanWaiting({ slow, onSkip }) {
-  return html`<section class="pj-waiting" aria-live="polite" aria-busy="true">
+  const ref = useRef(null);
+  useEffect(() => {
+    const el = ref.current;
+    const motion = !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (el && el.getBoundingClientRect().top > window.innerHeight - 120) el.scrollIntoView({ block: "start", behavior: motion ? "smooth" : "auto" });
+  }, []);
+  return html`<section class="pj-waiting" aria-live="polite" aria-busy="true" ref=${ref}>
     <p class="pj-waiting__label"><${Icon} name="bot" size=${18} /><span>Нейросеть читает цель и выбирает детали…</span></p>
     ${slow &&
     html`<div class="pj-waiting__slow">

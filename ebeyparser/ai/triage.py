@@ -54,6 +54,70 @@ GROW_AFTER = 3  # full successes in a row before the batch grows
 
 Source = Literal["ai", "script"]
 
+# ---------------------------------------------------------------------------
+# Model size: batch size and the "too small" guard (docs/design/AI_MODELS.md §4-5)
+# ---------------------------------------------------------------------------
+
+# Qwen3.5 "2B" has 1.9B parameters. The 0.8B renumbered ads and copied their text (kind 20 %):
+# nothing under ~2B is used for triage.
+MIN_TRIAGE_PARAMS_B = 1.8
+SMALL_MODEL_PARAMS_B = 2.5  # up to here batch 5: the 2B reads kinds at 80 % in 5s, 63 % in 10s
+BIG_MODEL_PARAMS_B = 4.0  # from here batch 10
+DEFAULT_BATCH = (8, 16)  # size unknown: (start, max)
+_SIZE_RE = re.compile(r"(?<![0-9.])(\d+(?:\.\d+)?)b(?![a-z0-9])")
+
+
+def model_params_b(model_id: str) -> float | None:
+    """Total parameters in billions: from the id ("qwen3.5:2b-q4_K_M" -> 2, "Qwen2.5-1.5B-Instruct"
+    -> 1.5, "qwen3.6-35b-a3b" -> 35), else from the model catalog; None = unknown."""
+    text = (model_id or "").strip().lower()
+    sizes = [float(m.group(1)) for m in _SIZE_RE.finditer(text.rsplit("/", 1)[-1])]
+    if sizes:
+        return max(sizes)
+    if not text:
+        return None
+    try:
+        from .model_catalog import find_catalog_model
+
+        found = find_catalog_model(model_id, "triage")
+    except Exception:  # noqa: BLE001 - only a hint
+        found = None
+    return float(found.params_b) if found is not None else None
+
+
+def too_small_for_triage(model_id: str) -> bool:
+    size = model_params_b(model_id)
+    return size is not None and size < MIN_TRIAGE_PARAMS_B
+
+
+def expected_sec_per_ad(model_id: str, tier: str = "T0") -> float | None:
+    """Seconds per ad the model research measured (T0: a shared 4-vCPU box, N100 class) or
+    extrapolated for a hardware tier (model_catalog sec_per_ad): the scout's speed before it has
+    measured its own. None = not a catalog triage model or no number for that tier."""
+    if not (model_id or "").strip():
+        return None
+    try:
+        from .model_catalog import find_catalog_model
+
+        found = find_catalog_model(model_id, "triage")
+    except Exception:  # noqa: BLE001 - only an estimate
+        return None
+    if found is None or found.task != "triage":
+        return None
+    return found.sec_per_ad.get(tier) or None
+
+
+def batch_for_model(model_id: str) -> tuple[int, int]:
+    """(first batch size, largest batch) for a model: 5/5 for ~2B, 8/10 for 3B, 10/16 for 4B+."""
+    size = model_params_b(model_id)
+    if size is None:
+        return DEFAULT_BATCH
+    if size <= SMALL_MODEL_PARAMS_B:
+        return (5, 5)
+    if size < BIG_MODEL_PARAMS_B:
+        return (8, 10)
+    return (10, 16)
+
 
 class TriageItem(BaseModel):
     """What the scout says about one ad."""
@@ -103,6 +167,7 @@ _KEY_ALIASES = {
 _ITEM_KEYS = frozenset({"i", "k", "p", "n", "c", "q", "z", "h", "x", "s", "r"})
 
 _KIND_ALIASES = {
+    "sale": "single", "for_sale": "single", "verkauf": "single", "angebot": "single",
     "item": "single", "product": "single", "einzel": "single", "einzeln": "single", "one": "single",
     "set": "bundle", "paket": "bundle", "kit": "bundle",
     "computer": "pc", "complete_pc": "pc", "rechner": "pc", "desktop": "pc", "gaming_pc": "pc",
@@ -306,6 +371,19 @@ def _contents(value: Any) -> list[str]:
     return out[:MAX_CONTENTS]
 
 
+_CYRILLIC_RE = re.compile(r"[а-яё]", re.IGNORECASE)
+REASON_MAX_WORDS = 12  # the prompt asks for 8; a little slack, then cut
+
+
+def _reason(value: Any) -> str:
+    """The Russian one-liner. Small models copy the German ad text into it (AI_MODELS.md §5):
+    a reason without a single Cyrillic letter is dropped (the UI then builds its own line)."""
+    text = _text(value, 140)
+    if not _CYRILLIC_RE.search(text):
+        return ""
+    return " ".join(text.split()[:REASON_MAX_WORDS])
+
+
 def _to_item(raw: dict, *, model: str) -> TriageItem:
     data = _canon(raw)
     cond = _text(data.get("z"), 20).lower().replace(" ", "_")
@@ -323,7 +401,7 @@ def _to_item(raw: dict, *, model: str) -> TriageItem:
         hidden=_tags(data.get("h"), HIDDEN_TAGS),
         risks=_tags(data.get("x"), RISK_TAGS),
         interest=_interest(data.get("s")),
-        reason=_text(data.get("r"), 140),
+        reason=_reason(data.get("r")),
         source="ai",
         model=model,
     )
@@ -564,9 +642,13 @@ class TriageEngine:
 
     @classmethod
     def from_config(cls, llm: ChatModel, cfg: Any, **kwargs: Any) -> "TriageEngine":
-        return cls(llm, model=str(getattr(cfg, "model", "") or ""), batch_size=cfg.batch_size,
-                   min_batch=cfg.min_batch, max_batch=cfg.max_batch, max_tokens=cfg.max_tokens,
-                   max_per_hour=cfg.max_per_hour,
+        """batch_size / max_batch 0 = by the model's size (batch_for_model); a set value wins."""
+        model = str(getattr(cfg, "model", "") or "")
+        start, cap = batch_for_model(model)
+        batch = int(cfg.batch_size or 0) or start
+        max_batch = int(cfg.max_batch or 0) or max(cap, batch)
+        return cls(llm, model=model, batch_size=batch, min_batch=cfg.min_batch, max_batch=max_batch,
+                   max_tokens=cfg.max_tokens, max_per_hour=cfg.max_per_hour,
                    target_call_seconds=min(TARGET_CALL_SECONDS, 0.6 * float(cfg.timeout_seconds)), **kwargs)
 
     # -- capacity ---------------------------------------------------------------

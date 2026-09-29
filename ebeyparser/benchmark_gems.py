@@ -19,7 +19,8 @@ traps  gem_pc_no_gpu   "Gaming PC ohne Grafikkarte (RTX 3080 ausgebaut)"
 The real Monitor runs twice on the same world: without the scout (today's pipeline) and with
 it, the scout's text model simulated by `SimTriageLLM` — it returns JSON TEXT through the real
 TriageEngine (batching, broken/partial JSON, index shifts, retries, script fallback) — at three
-qualities: oracle, noisy and a "weak 7B-like" model that hallucinates models and components.
+qualities: oracle, noisy and a weak small model that hallucinates models and components and whose
+interest score is pure noise (as measured for Qwen3.5 2B, docs/design/AI_MODELS.md §4).
 Speed is simulated too (tokens/s of a GPU or a 4-core CPU): overflow, the hourly cap and the
 "candidates" mode are exercised. Stage C (photos) is a gem-aware oracle vision fake.
 
@@ -89,6 +90,9 @@ HARDWARE: dict[str, tuple[float, float]] = {
     "cpu_1.5b": (110.0, 20.0),  # 1.5B Q4 on a 4-core desktop CPU
 }
 MODE_HARDWARE = {"oracle": "gpu_7b", "noisy": "gpu_7b", "weak": "cpu_3b"}
+# the model research (AI_MODELS.md §4): a small model's interest barely separates gems from junk
+# (AUC 0.43 for Qwen3.5 2B) — the weak model's interest is pure noise here
+INTEREST_IS_NOISE = frozenset({"weak"})
 
 # parts of old PCs that our history never prices (so the engine's value is a lower bound)
 _CPUS = (("Intel Core i7-8700K", 90.0), ("Intel Core i5-9600K", 60.0), ("AMD Ryzen 5 3600", 55.0),
@@ -414,6 +418,8 @@ class SimTriageLLM:
         noise = rng.randint(-q[5], q[5]) if q[5] else 0
 
         def interest(v: int) -> int:
+            if self.mode in INTEREST_IS_NOISE:
+                return rng.randint(0, 10)
             return max(0, min(10, v + noise))
 
         if info is not None:  # a gem or a gem trap

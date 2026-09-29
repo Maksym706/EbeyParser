@@ -51,7 +51,7 @@ scrape → store → remember prices
   │     • kind-vetoed PC/bundle/lot, or early-skipped where the scout saw ANOTHER product,
   │       whose plan shows a possible deal  → PROMOTED  (found_by = "ai_scout")
   │     • script candidate with unknown market → gets the scout's price (found_by = "ai_scout" if the
-  │       scout identified a different product) or its interest as rank; junk ranks last
+  │       scout identified a different product); interest only breaks ties; blocked readings rank last
   │
   ├─ C  PAID: ad page → re-ground on the FULL text (drops «ohne Grafikkarte» cases) →
   │     comparables via the scout's key/phrase or for ≤ 2 unpriced bundle parts →
@@ -62,7 +62,7 @@ scrape → store → remember prices
         alert: «🔥 Супер-находка» at once past the hourly cap; others as before; «Топ за день» digest.
 
 end of pass: SCOUT RESCUE — scout time left over → read recent dismissed ads it didn't reach, re-plan
-             stored interesting readings (history grows) → promote → paid stage.
+             stored readings (history grows) → promote by data → paid stage.
 start of pass: VISION QUEUE — would-be deals whose photos the offline PC couldn't check.
 ```
 
@@ -73,7 +73,7 @@ sometimes (LAN/Tailscale).
 
 | role | runs on | model | config |
 |---|---|---|---|
-| **scout** (stage A) | the always-on server's CPU | 1–4B text model, e.g. Qwen3.5 2B / 4B (see catalog) | `ai.scout.*` (own `base_url`, `model`) |
+| **scout** (stage A) | the always-on server's CPU | 2–4B text model: Qwen3.5 2B (T0) / 4B (T1), see the catalog; nothing under 2B | `ai.scout.*` (own `base_url`, `model`) |
 | **vision** (stage C) + second look | the PC when it's on | 7B+ vision model | `ai.*` |
 
 An empty `ai.scout.base_url`/`model` means the scout uses the `ai` endpoint.
@@ -85,7 +85,10 @@ never waits for it.
 
 ## 3. The triage prompt (small-model friendly)
 
-`ai/prompts_triage.py`. The design targets 1.5–4B models on a CPU; a 7B only gets better.
+`ai/prompts_triage.py`. The design targets 2–4B models on a CPU; bigger ones only get better. **Models under 2B are
+refused** (`triage.too_small_for_triage`, e.g. Qwen3.5 0.8B, Qwen2.5 1.5B): in the model research the 0.8B renumbered
+ads and copied their text (kind 20 %). The monitor then leaves the scout off (the user's model stays as configured),
+the status says «Модель … слишком маленькая для разведчика», and `POST /ai/scout/test` suggests a catalog model.
 
 * **One flat object per ad, one-letter keys, enums**: `i, k, p, n, c, q, z, h, x, s, r`. Nesting and free text are
   where small models derail; one-letter keys also cut output tokens by ~40 %. Output tokens are the whole cost on CPU.
@@ -106,14 +109,20 @@ never waits for it.
 * Adopted from the model research's CPU measurements (`AI_MODELS.md` §5):
   * **minified one-line JSON** is demanded, since schema grammars allow whitespace and indentation was over half the
     output tokens;
-  * **`single` is the explicit default kind**, and the other kinds list their German trigger words (Suche/Kaufe,
-    Tausche, für Bastler / iCloud gesperrt, nur OVP);
+  * **`sale` is the explicit default kind** (the parser maps it to the internal `single`), and every other kind lists
+    its German trigger words: Suche / Suche nach / Kaufe → wanted, Tausche / Tausch → swap, defekt / für Bastler /
+    iCloud gesperrt → defect, Ersatzteil → part, nur OVP / nur Karton → box, Paket / Set → bundle, Konvolut /
+    Sammlung / Nachlass → lot;
+  * the Russian reason is **at most 8 words, in the model's own words, never copied German text**. The parser drops a
+    reason without a single Cyrillic letter (the UI then builds its own line) and cuts it at 12 words;
   * model numbers and sizes are **copied verbatim**;
   * **thinking is off** for the scout's calls (`make_scout_llm`: `chat_template_kwargs.enable_thinking=false`,
     Ollama `think=false`);
-  * batches of 8–10 are right for ≥ 2B; ≤ 5 is better for smaller models (`ai.scout.batch_size`).
+  * **batch size by model size** (`triage.batch_for_model`, from the model id or the catalog): ~2B starts at 5 and
+    stays ≤ 5 (the 2B read kinds at 80 % in batches of 5 vs 63 % in 10); 3B 8 (≤ 10); 4B+ 10 (≤ 16); unknown 8
+    (≤ 16). `ai.scout.batch_size` / `max_batch` = 0 means "by the model"; a set value wins.
 
-Keys: `k` kind ∈ single·bundle·pc·lot·part·acc·box·wanted·swap·service·defect·other; `p` "Brand Model Variant
+Keys: `k` kind ∈ sale·bundle·pc·lot·part·acc·box·wanted·swap·service·defect·other; `p` "Brand Model Variant
 Storage" or ""; `n` quantity; `c` contents of bundle/pc/lot ("2x DualSense Controller"); `q` German search phrase;
 `z` condition; `h` hidden-value tags (typo, vague, unknown_model, pc_parts, lot, bundle, wrong_category, cheap); `x`
 risk tags (scam, defect, locked, fake, missing, reserved, rent); `s` interest; `r` reason in Russian, ≤ 8 words.
@@ -129,7 +138,8 @@ risk tags (scam, defect, locked, fake, missing, reserved, rent); `s` interest; `
 | ads missing from the answer | retried in halves, then singly (2 levels); still failing → `script_item` (identity's reading, `source="script"`, never promotes) |
 | server down / refused (`LLMError`) | the run stops, the rest is overflow (script path), one health alert «Нейросеть-разведчик не отвечает…» per 6 h |
 
-**Adaptive batch** (default 8, 2–16): halves when < 70 % of a batch parses, grows by 2 after 3 full successes. It is
+**Adaptive batch** (start and maximum by model size, see above; minimum 2): halves when < 70 % of a batch parses,
+grows by 2 after 3 full successes. It is
 also capped so one call stays under `min(120 s, 0.6 × timeout)` at the measured seconds/ad, and so the answer fits
 `max_tokens` (110 tokens/ad + 60).
 
@@ -159,10 +169,13 @@ llama.cpp. Output tokens dominate on CPU. The table shows 100 % duty and the def
 | 4-vCPU VM ≈ N100 (T0), **measured** | Qwen3.5 2B / 4B | **~6 / ~15.5** | 600 / 230 | **300 / 115** |
 | 4-core CPU (T0) | 7B | ~15–20 | ~200 | **~100** |
 
-The CPU rows are the model research's measurements on this sandbox (`AI_MODELS.md` §4, `model_catalog.MODELS[*]
-.sec_per_ad`): batched triage, strict schema, llama.cpp. For quality, Qwen3.5 4B read product 97 %, kind 87 %,
-scam 100 % and JSON 100 % on that test set; 2B read product 60 %, kind 63 %, JSON 100 %. The GPU rows are
-generation-speed extrapolations. Output tokens dominate on CPU: the minified, one-letter-key format is worth ~2–3×.
+The T0 row is the model research's measurement on this sandbox (`AI_MODELS.md` §4: **2B 6 s/ad, 4B 15.5 s/ad**);
+the T1 row (**2B ~2.5 s/ad, 4B ~6 s/ad**) and the GPU rows are extrapolated from memory bandwidth. The same numbers
+are `model_catalog.MODELS[*].sec_per_ad`, and the status line shows them («Ожидается ≈ 6.0 с на объявление, до 300
+объявлений в час (пока не измерено)») until the scout has measured its own speed. Quality on the research's test set:
+Qwen3.5 4B read product 97 %, kind 87 %, scam 100 %, JSON 100 %; the 2B at batch 5 read product 72 %, kind 80 %,
+scam 88 %, JSON 100 %. Their `interest` barely separates gems from junk (AUC 0.43 for 2B, 0.63 for 4B), so it
+decides nothing (§6). Output tokens dominate on CPU: the minified, one-letter-key format is worth ~2–3×.
 
 **Conclusions**
 
@@ -222,7 +235,11 @@ model-numbered parts. With no market price at all, the old rule holds: the visio
 A dismissed ad comes back only if **all** of these hold:
 
 * the reading is a real AI answer (`source="ai"`) and not blocked: its kind is not in `wanted, swap, service, box,
-  defect, other, acc, part`, and it has no risk tag in `scam, locked, fake, rent, defect, missing, reserved`;
+  defect, other, acc, part`, it has no risk tag in `scam, locked, fake, rent, defect, missing, reserved`, and **the
+  code's own red flags** (`scout.code_red_flags`, `pricing/text.py`) find nothing on the ad text: no severe flag
+  (Vorkasse, PayPal Freunde, Western Union, «Sicher bezahlen» + link/e-mail/messenger, wanted, swap, defect, lock, …),
+  no WhatsApp / Telegram / e-mail contact, and on Kleinanzeigen no "nur Versand / keine Abholung". The 2B missed exactly
+  these scams in the model research, so the code backs it up;
 * the product, or at least one bundle part, is grounded;
 * the dismissal was one of two things, and nothing else:
   * a **kind veto the scout may overrule** (`SCOUT_OVERRULES`): `complete_pc` only when the scout read the ad as a
@@ -231,16 +248,19 @@ A dismissed ad comes back only if **all** of these hold:
   * an **early skip** where the scout saw a different product (`_scout_sees_other`).
 
   Stop words, include keywords, price ranges, `min_listing_price` and severe flags are never overruled either;
-* the math on the scout's price says "possible deal" (`evaluate()` without AI is not a no-deal). Or there is no price
-  yet and the interest is high: ≥ `min_interest` for identified singles (a comps lookup follows), ≥ `min_interest+1`
-  for bundles with unpriced model parts, ≥ `min_interest+2` for bundles with no priced part.
+* **data decides, not the model's interest**: the math on the scout's history price says "possible deal"
+  (`evaluate()` without AI is not a no-deal), or there is something concrete for the paid stage to price: an identified
+  single product the history doesn't know (a comparables lookup with the scout's key/phrase follows), or a bundle's
+  model-numbered parts without a price yet. A bundle with nothing priceable is not promoted, whatever the interest.
+  `min_interest` [0] is only a weak veto for users of bigger models; at 0 the interest never filters.
 
 The paid stage re-grounds on the full ad text. If the reason is gone («ohne Grafikkarte» further down), the script's
 original decision is stored.
 
 **The scout never drops an ad on its own.** A script candidate whose scout price says "no deal" (a weak model may have
-read a cheaper variant) is ranked after the unknown ones but keeps the script's own path. Junk readings (interest ≤ 2,
-blocked kinds) only rank last. **A PC/bundle/lot is never priced by the vision model's search phrase**, which names one
+read a cheaper variant) is ranked after the unknown ones but keeps the script's own path. Ranking in the paid stage
+is by data too: cost / market when priced; unpriced ones rank together and the interest only breaks ties
+(±0.01 around the unknown rank); blocked readings rank last. **A PC/bundle/lot is never priced by the vision model's search phrase**, which names one
 part («rtx 3070») and would price the whole thing as that part. Without real part prices it stays at most «maybe».
 
 ## 7. Stages C/D
@@ -273,12 +293,13 @@ disagreement cap. Scout failure modes and what stops them:
 | invents a pricier model/variant/storage («3070» → «3080», «13» → «13 Pro», «128» → «256») | grounding (exact tokens, variant words, storage) |
 | lists a removed part («ohne Grafikkarte (RTX 3080 ausgebaut)») | clause negation; full-text re-grounding |
 | reads a wish as content («suche eigentlich was mit RTX 3080») | want-word negation |
-| misses a defect/scam/lock | the script's own red flags on title+text, the vision veto, too-cheap/bait rules (unchanged) |
+| misses a defect/scam/lock (the 2B missed WhatsApp / e-mail / «Sicher bezahlen» scams) | the code's red flags block the promotion (`code_red_flags`); the script's red flags on every evaluated ad (new: Telegram, e-mail address or "schreib mir eine E-Mail", «Sicher bezahlen» + link/e-mail/messenger, Zahlungslink); e-mail/Telegram contact counts as bait when far too cheap; the vision veto |
 | broken JSON / wrong index | parser; grounding rejects a shifted item |
 | over-values a bundle | lower-bound valuation, pc/bundle discount, thin-data caps |
 | misses «nur Tablet» / «ohne Akku» (missing parts) and names the full product | the `part` kind veto is never overruled |
 | an unpriced PC that the vision model prices by one part | no vision-phrase pricing for PC/bundle/lot plans |
 | under-claims a variant (cheaper model) → "no deal" | the scout never drops an ad; the script path still runs |
+| a weak model's interest score (near random for a 2B) | nothing depends on it: promotion needs a grounded product and price data; interest only breaks ties |
 
 ## 9. Learning loop
 
@@ -305,10 +326,10 @@ Next steps:
 | `provider` [openai], `base_url` [""], `model` [""], `api_key` | its own endpoint; empty means the `ai` endpoint |
 | `timeout_seconds` [180], `temperature` [0.1], `max_tokens` [1800] | one batch call |
 | `mode` [auto] | `auto` \| `all` \| `candidates` (see §4) |
-| `batch_size` [8], `min_batch` [2], `max_batch` [16] | adaptive batch |
+| `batch_size` [0], `min_batch` [2], `max_batch` [0] | adaptive batch; 0 = by the model's size (5/5 for ~2B, 10/16 for 4B+) |
 | `max_per_hour` [600] | hard cap of ads read per hour |
 | `pass_share` [0.5] | share of the check interval the scout may use per pass |
-| `min_interest` [6] | the promotion threshold (see §6) |
+| `min_interest` [0] | a weak veto only: below it the scout doesn't promote; 0 = interest never filters (§6) |
 | `backlog_hours` [6] | how long dismissed ads stay eligible for the rescue |
 | `bundle_discount` [0.15], `pc_discount` [0.25], `min_priced_share` [0.5] | bundle valuation |
 | `learn_from_feedback` [true] | preference hints in the prompt |
@@ -335,18 +356,28 @@ Backend (done):
 
 * **Deal card** (`presenters.deal_card`): `found_by` ("script" | "ai_scout"), `found_by_label` («Нашла нейросеть»),
   `scout_reason` (the scout's one line), `tier` (super|deal|unchecked|maybe|skip), `tier_label` («🔥 Супер-находка» …).
-* **`GET /api/v1/monitor`** → `scout`: `{enabled, state (off|idle|ok|behind|down), text_ru («Успевает смотреть 90 из
-  120 новых объявлений в час»), speed_ru («≈ 5.0 с на объявление, до 360 объявлений в час»), mode, mode_setting,
-  mode_ru, provider, base_url, model, own_endpoint, seen_last_hour, read_last_hour, overflow_last_hour,
-  failed_last_hour, sec_per_ad, capacity_per_hour, batch_size, vision_queue {waiting, max_wait_minutes, text_ru}}`.
-* **`GET /api/v1/health`**: the same `scout` block. The banner warns when the scout is down or deals wait for the photo
-  check.
+* **`GET /api/v1/monitor`** → `scout`: `{enabled, state (off|idle|ok|behind|down|too_small), text_ru («Успевает
+  смотреть 90 из 120 новых объявлений в час»), speed_ru («≈ 5.0 с на объявление, до 360 объявлений в час»; before the
+  first measurement «Ожидается ≈ 6.0 с …, до 300 … (пока не измерено)» from the catalog), speed_expected, too_small,
+  mode, mode_setting, mode_ru, provider, base_url, model, own_endpoint, seen_last_hour, read_last_hour,
+  overflow_last_hour, failed_last_hour, sec_per_ad, capacity_per_hour, batch_size, vision_queue {waiting,
+  max_wait_minutes, text_ru}}`.
+* **`GET /api/v1/health`**: the same `scout` block. The banner warns when the scout is down, its model is too small,
+  or deals wait for the photo check.
 * **`GET/PATCH /api/v1/settings`**: `ai.scout.*`, `ai.vision_wait_minutes`, `notifications.super_deals.*`,
   `notifications.daily_top.*`.
 * **`POST /api/v1/ai/scout/test`**: runs the triage on 4 built-in sample ads (hidden RTX 3070 in an old PC, a typo, a
   wanted ad, a pram) → `{ok, seconds, sec_per_ad, per_hour, answered, hidden_gpu, typo_fixed, wanted_seen, items[],
-  message_ru, error_ru, suggested_model}`. It picks the catalog's best installed triage model when none is set;
+  message_ru, error_ru, suggested_model, too_small, recommended {key, name, ollama, lmstudio, llamacpp}}`. It picks
+  the catalog's best installed triage model when none is set. A model under 2B is not run: `too_small=true` and a
+  plain-Russian message naming an installed catalog model or the one to download (LM Studio name / Ollama name).
   `save=true` stores the endpoint and switches the scout on.
+* **`GET /api/v1/ai/recommend`** (`?ram_gb=&vram_gb=&arm=&role=server|pc&detect=`): «Выбери своё железо → рекомендую
+  модель» from `model_catalog.recommend`. Without parameters it uses this machine's hardware (`ai/hardware.py`:
+  cores, RAM, arch, NVIDIA GPU via nvidia-smi if present). Returns `host`, `input`, `tier`, `summary_ru`, `picks`
+  {triage, vision, embeddings, second_opinion} (ids per runtime, quant, RAM/VRAM, label/desc, `speed_ru`, `get_ru`
+  per runtime), `notes_ru`, `installed_match` (per found LM Studio / Ollama server: which installed models already fit,
+  via `best_installed`) and `setup_ru` per runtime. No shell commands in any text.
 * **Events**: `deal_found` / `deal_updated` (from the monitor) keep their old keys and add `found_by`, `tier`,
   `listing` (JSON), `evaluation` (JSON) and `card`.
 
@@ -358,7 +389,11 @@ Frontend (for the SPA team, `ebeyparser/web/app/**`):
    «Авто / Все объявления / Только непонятные» (`ai.scout.mode`); an endpoint (address + model, default «как у
    нейросети для фото»); a «Проверить разведчика» button (`POST /ai/scout/test`, showing the 4 sample readings and
    «≈ N объявлений в час»); the live line `scout.text_ru` + `scout.speed_ru`; an advanced section (batch, cap/hour,
-   share of interval, min interest); «Ждать проверку фото, мин» (`ai.vision_wait_minutes`).
+   share of interval, min interest); «Ждать проверку фото, мин» (`ai.vision_wait_minutes`). When the scout test
+   says `too_small`, show its `message_ru` and offer `recommended`.
+6. **«Выбери своё железо → рекомендую модель»** (onboarding and Settings → Нейросеть) from `GET /ai/recommend`: the
+   detected machine as the default, a server/PC switch, per task a card (name, label_ru, desc_ru, speed_ru, the
+   runtime's id with a copy button, get_ru), "already installed" from `installed_match`, `setup_ru` per runtime.
 4. **Состояние**: a «Разведчик» tile with `scout.text_ru`, `speed_ru`, `mode_ru`, and «не успел N» (`overflow_last_hour`);
    a «Ждут проверки фото: N» line (`scout.vision_queue.text_ru`).
 5. **Settings → Уведомления**: «Супер-находки сразу» (enabled + min profit/ROI) and «Топ за день» (enabled, hour, per search).
@@ -366,7 +401,8 @@ Frontend (for the SPA team, `ebeyparser/web/app/**`):
 ## 13. Monitor integration (what changed where)
 
 * `__init__(…, scout=TriageEngine)` for tests/benchmarks; `_ensure_components` builds the engine from `ai.scout`
-  (`_scout_llm_settings` falls back to `ai`).
+  (`_scout_llm_settings` falls back to `ai`; batch size by model size), but not for a model under 2B
+  (`_scout_too_small`: logged once, status `too_small`).
 * `run_once`: `_scout_begin_pass` (time budget), `_drain_vision_queue`, per search `_scout_read` (before the free
   funnel), `_scout_rescue` after all searches, `_scout_save_stats`.
 * `_triage` (free funnel): `_scout_plan_for`, promotion via `_scout_candidate` (kind veto / early skip), `_scout_enrich`
@@ -378,7 +414,8 @@ Frontend (for the SPA team, `ebeyparser/web/app/**`):
   line, `_hold_for_vision`.
 * `_after_evaluation`: counts, the `deal_found` payload (`_deal_event`), tier-aware alerts; `_alert(super_find=True)`
   skips the cap; `_should_notify` holds queued would-be deals; `_maybe_daily_top` in `_after_run`.
-* `scout_status()` for the API.
+* `scout_status()` for the API; `_scout_expected_speed` gives the catalog's seconds per ad for this machine's tier
+  (an endpoint elsewhere counts as T0) until the scout has measured its own.
 
 ## 14. Evidence
 
@@ -387,20 +424,21 @@ Frontend (for the SPA team, `ebeyparser/web/app/**`):
 off and on. The scout's model is simulated as JSON text through the real engine, at three qualities, with simulated
 GPU/CPU speed. See §14.1.
 
-**Real LLM smoke test**: Qwen2.5-1.5B-Instruct Q4_K_M on this 4-core sandbox CPU via llama.cpp `llama-server`
-(OpenAI-compatible) on 40 realistic German ads. See §14.2.
+**Real LLM smoke test**: Qwen3.5-2B Q4_K_M on this 4-core sandbox CPU via llama.cpp `llama-server`
+(OpenAI-compatible) on 16 of 40 realistic German ads. See §14.2.
 
 ### 14.1 Benchmark results
 
-`python -m ebeyparser.benchmark_gems --seed S --n 400` for S = 1, 2, 3, summed over the three seeds.
-Each seed has ~470 scored ads: the standard stream with its deals, normal ads and every standard trap type, plus 12 % hidden gems
+`python -m ebeyparser.benchmark_gems --seed S --n 400` for S = 1, 2, 3, summed (seeds [1, 2, 3]).
+Each seed has ~470 scored ads: the standard stream with its deals, normal ads and 173-ish traps, plus 12 % hidden gems
 (7 kinds) and 5 % gem-shaped traps. The scout's model is simulated as JSON text going through the real engine:
 
 * **oracle**: correct readings;
 * **noisy**: 15 % wrong model, 20 % missed parts, 8 % broken JSON, 3 % shifted indexes, ±2 interest;
-* **weak**: a 3–4B on a 4-core CPU. 35 % not identified, 12 % hallucinated models/parts, 20 % broken JSON (truncated,
-  fenced, prose), 6 % shifted indexes, ±3 interest, ~10 s/ad, so most ads overflow to the script path and the
-  "candidates" mode kicks in.
+* **weak**: a small model on a 4-core CPU. 35 % not identified, 12 % hallucinated models/parts, 20 % broken JSON
+  (truncated, fenced, prose), 6 % shifted indexes, **interest pure noise** (0–10 at random, as the model research
+  measured for Qwen3.5 2B: AUC 0.43), ~10 s/ad, so most ads overflow to the script path and the "candidates" mode
+  kicks in.
 
 Stage C (photos) is an oracle-like vision fake of the same quality level for both pipelines. "Precision" counts a VB
 "buy" whose offer is a real deal as correct, like the standard benchmark's «buy + торг».
@@ -408,20 +446,20 @@ Stage C (photos) is an oracle-like vision fake of the same quality level for bot
 | model quality | scout | precision «buy» | recall «buy» | gems bought | gems in feed (buy+maybe) | trap buys | buys found by scout | ads read / not reached | broken answers | vision calls |
 |---|---|---|---|---|---|---|---|---|---|---|
 | oracle | off (script only) | 100.0 % (267/267) | 72.8 % | 74/143 | 85 % | 0 | 0 | 0 / 0 | 0 | 484 |
-| oracle | on, gpu_7b | 100.0 % (313/313) | 85.3 % | 115/143 | 96 % | 0 | 111 | 1401 / 3 | 0 | 475 |
+| oracle | on, gpu_7b | 100.0 % (312/312) | 85.0 % | 115/143 | 96 % | 0 | 111 | 1401 / 3 | 0 | 483 |
 | noisy | off (script only) | 100.0 % (248/248) | 67.8 % | 74/143 | 85 % | 0 | 0 | 0 / 0 | 0 | 484 |
-| noisy | on, gpu_7b | 100.0 % (275/275) | 75.1 % | 101/143 | 92 % | 0 | 76 | 1402 / 2 | 24 | 474 |
+| noisy | on, gpu_7b | 100.0 % (280/280) | 76.5 % | 104/143 | 92 % | 0 | 81 | 1402 / 2 | 28 | 484 |
 | weak | off (script only) | 100.0 % (248/248) | 67.8 % | 74/143 | 85 % | 0 | 0 | 0 / 0 | 0 | 484 |
-| weak | on, cpu_3b | 100.0 % (260/260) | 71.0 % | 90/143 | 90 % | 0 | 45 | 945 / 1211 | 91 | 481 |
+| weak | on, cpu_3b | 100.0 % (253/253) | 69.1 % | 84/143 | 94 % | 0 | 44 | 924 / 1176 | 74 | 491 |
 | gem type | script only | scout oracle | scout noisy | scout weak (CPU 3B) |
 |---|---|---|---|---|
-| typo | 20/21 buy, +1 maybe | 20/21 buy, +1 maybe | 20/21 buy, +1 maybe | 20/21 buy, +1 maybe |
+| typo | 20/21 buy, +1 maybe | 20/21 buy, +1 maybe | 20/21 buy, +1 maybe | 19/21 buy, +2 maybe |
 | vague_text | 20/21 buy, +1 maybe | 19/21 buy, +2 maybe | 20/21 buy, +1 maybe | 18/21 buy, +3 maybe |
-| unknown_model | 19/21 buy, +2 maybe | 19/21 buy, +2 maybe | 18/21 buy, +3 maybe | 19/21 buy, +2 maybe |
-| pc_gpu | 0/21 buy, +0 maybe | 16/21 buy, +1 maybe | 8/21 buy, +3 maybe | 6/21 buy, +1 maybe |
-| konvolut | 0/21 buy, +21 maybe | 16/21 buy, +5 maybe | 12/21 buy, +9 maybe | 6/21 buy, +15 maybe |
-| bundle | 0/21 buy, +21 maybe | 9/21 buy, +10 maybe | 8/21 buy, +11 maybe | 5/21 buy, +15 maybe |
-| wrong_category | 15/18 buy, +3 maybe | 16/18 buy, +2 maybe | 15/18 buy, +3 maybe | 16/18 buy, +2 maybe |
+| unknown_model | 19/21 buy, +2 maybe | 19/21 buy, +2 maybe | 19/21 buy, +2 maybe | 19/21 buy, +2 maybe |
+| pc_gpu | 0/21 buy, +0 maybe | 16/21 buy, +1 maybe | 9/21 buy, +3 maybe | 9/21 buy, +5 maybe |
+| konvolut | 0/21 buy, +21 maybe | 16/21 buy, +5 maybe | 13/21 buy, +8 maybe | 3/21 buy, +18 maybe |
+| bundle | 0/21 buy, +21 maybe | 9/21 buy, +10 maybe | 8/21 buy, +11 maybe | 4/21 buy, +16 maybe |
+| wrong_category | 15/18 buy, +3 maybe | 16/18 buy, +2 maybe | 15/18 buy, +3 maybe | 12/18 buy, +6 maybe |
 
 Reading it:
 
@@ -435,7 +473,13 @@ Reading it:
   and wrong categories were already mostly found by script + vision in this benchmark. Its vision budget (30 per
   pass) was enough at n = 400. With the paid-step budgets under pressure (big category scans), the scout's ranking
   matters more.
-* Even the weak CPU model helps. It reads only ~45 % of the ads and the rest take the script path.
+* Even the weak CPU model helps, although its interest score is random: promotion is decided by grounded products
+  and price data only (§6), and its reading ranks candidates. It reads only ~45 % of the ads and the rest take the
+  script path. With a weak model whose interest *does* carry signal (the earlier simulation), the same rules give 87
+  gems / recall 70.2 %; the previous interest-driven rules gave 90 / 71.0 % there, the difference being lots and
+  bundles promoted on a high score alone (now: only with something priceable).
+* The code's red flags block promotions the model didn't flag (WhatsApp / Telegram / e-mail, «Sicher bezahlen» links,
+  Vorkasse, "nur Versand"): no gem-shaped scam got through in any configuration.
 * The standard benchmark (`python -m ebeyparser.benchmark --seed 1 --n 600`, scout off) is unchanged: precision
   100 %, recall 92.6 %, 0 trap buys, invariant ✔.
 
@@ -527,5 +571,5 @@ Reading it:
 * **Output length**: ~69 output tokens/ad in the smoke test, against 46–55 in the model research's shorter schema.
   On a CPU, output tokens are the cost. Dropping `q` (the scout's search phrase, often the product again) or
   shortening `r` could buy ~20–30 % more ads per hour. Measure before cutting: `q` feeds the comparables lookup.
-* **Batch cross-talk** on 2B models (one ad's product given to its neighbour) is caught by grounding. If it shows up
-  often in real use, a batch of 4 for 1.5–2B models is the cheap fix (`ai.scout.max_batch`).
+* **Batch cross-talk** on 2B models (one ad's product given to its neighbour) is caught by grounding. ~2B models now
+  run at batch ≤ 5 by default (the smoke test above used 8); if it still shows up often, `ai.scout.max_batch: 4`.

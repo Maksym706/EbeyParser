@@ -185,14 +185,15 @@ ai:
   enabled: true
   provider: ${AI_PROVIDER:-openai}                  # openai = LM Studio (и любой OpenAI-совместимый сервер) | ollama
   base_url: ${AI_BASE_URL:-http://localhost:1234/v1}
-  model: ${AI_MODEL:-qwen/qwen2.5-vl-7b}            # идентификатор модели в LM Studio (ai-check покажет список)
+  model: ${AI_MODEL:-qwen/qwen3.5-9b}               # модель для фото в LM Studio (ai-check покажет список);
+                                                    # видеокарта 6–8 ГБ: qwen/qwen3.5-4b; 24 ГБ: qwen/qwen3.6-35b-a3b
   max_images: 3                 # сколько фото показывать модели
   timeout_seconds: 240
   run_for: promising            # promising — только перспективные (быстрее), all — все подряд
   # ── Ollama вместо LM Studio ──
   # provider: ollama
   # base_url: http://localhost:11434
-  # model: qwen2.5vl:7b          # ollama pull qwen2.5vl:7b
+  # model: qwen3.5:9b-q4_K_M     # ollama pull qwen3.5:9b-q4_K_M
 
   # Необязательно: «второе мнение» от Claude (облако, платно) — только для лучших находок.
   # Нужен ключ ANTHROPIC_API_KEY в .env и пакет:  pip install anthropic
@@ -211,13 +212,16 @@ ai:
   vision_wait_minutes: 45       # ПК с моделью для фото выключен: ждать до N мин, потом прислать «фото не проверены»
   scout:
     enabled: false
+    # Сервер, который работает всегда (docs/design/AI_MODELS.md): слабый без видеокарты — Qwen3.5 2B
+    # (≈6 с на объявление, ~600 в час), 8 ядер / 16 ГБ — Qwen3.5 4B (точнее, ≈6 с). Модели меньше 2B не годятся.
+    provider: openai            # openai = LM Studio / llama-server | ollama
     base_url: ""                # пусто = тот же сервер, что выше; например http://127.0.0.1:8080/v1 (llama-server)
-    model: ""                   # пусто = та же модель; для процессора: qwen3.5-2b / qwen3.5-4b (см. docs/design/AI_MODELS.md)
+    model: ""                   # пусто = та же модель; LM Studio: qwen/qwen3.5-2b · Ollama: qwen3.5:2b-q4_K_M
     mode: auto                  # auto — все объявления, пока успевает, иначе только непонятные; all; candidates
-    batch_size: 8               # объявлений за один запрос (подстраивается сам)
+    batch_size: 0               # объявлений за запрос; 0 = по размеру модели (5 для 2B, 10 для 4B и больше)
     max_per_hour: 600           # не больше N объявлений в час (чтобы слабый процессор не задыхался)
     pass_share: 0.5             # не больше этой доли интервала проверок на чтение
-    min_interest: 6             # с какого «интереса» 0–10 отброшенное объявление смотрим ещё раз
+    min_interest: 0             # «интерес» 0–10 у маленьких моделей почти случаен: решают цены; 0 = не отсеивать
 
 # ─── eBay (официальный API) ──────────────────────────────────────────────────
 # developer.ebay.com/my/keys → Production keyset: App ID → EBAY_CLIENT_ID, Cert ID → EBAY_CLIENT_SECRET (в .env).

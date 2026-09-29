@@ -166,26 +166,31 @@ class ScoutConfig(LLMSettings):
     (title, price, snippet) and says what it really is — product, bundle contents, hidden value,
     risks, interest 0..10. It never guesses prices: those come from our own price history.
 
-    Its own endpoint: an always-on 1-4B model on the home server's CPU (llama.cpp / Ollama /
+    Its own endpoint: an always-on 2-4B model on the home server's CPU (llama.cpp / Ollama /
     LM Studio), while `ai` (the vision model) may live on a gaming PC that is only sometimes on.
     Empty base_url + model = use the `ai` endpoint and model for the scout too."""
 
     enabled: bool = False
     provider: AIProvider = "openai"
     base_url: str = ""  # "" = the ai endpoint; e.g. http://127.0.0.1:8080/v1 (llama.cpp server)
-    model: str = ""  # "" = ai.model; e.g. "qwen2.5-3b-instruct"
+    model: str = ""  # "" = ai.model; e.g. "qwen3.5:2b-q4_K_M" (Ollama) or "qwen/qwen3.5-2b" (LM Studio)
     timeout_seconds: float = 180.0
     temperature: float = 0.1
     max_tokens: int = 1800  # one batch answer; the engine also caps it per batch size
     # "auto": every new ad while the model keeps up, else only the ads where the script is blind
     # (no product found, PCs, bundles, lots); "all": always every ad; "candidates": only those
     mode: ScoutMode = "auto"
-    batch_size: int = 8  # ads per model call (adapted between min_batch and max_batch)
+    # ads per model call, adapted between min_batch and max_batch; 0 = by the model's size
+    # (docs/design/AI_MODELS.md §5): 5 for ~2B models (they lose track in longer batches), 10 for 4B+
+    batch_size: int = 0
     min_batch: int = 2
-    max_batch: int = 16
+    max_batch: int = 0  # 0 = by the model's size: 5 for ~2B, 16 for 4B+
     max_per_hour: int = 600  # hard cap of ads per hour (a 4-core CPU must stay usable)
     pass_share: float = 0.5  # at most this share of general.interval_minutes per pass goes to the scout
-    min_interest: int = 6  # interest 0..10 from which a dismissed ad gets a second look
+    # The model's interest 0..10 is only a weak signal (a 2B barely tells deals from junk): the scout
+    # promotes an ad by a grounded product and real prices. An ad it rates below this is not
+    # promoted; 0 = interest never filters (only orders equal candidates).
+    min_interest: int = 0
     backlog_hours: float = 6.0  # ads not reached in their pass are still read later (rescue) this long
     bundle_discount: float = 0.15  # a bundle sells for the sum of its parts minus this
     pc_discount: float = 0.25  # parting out a PC: more work, lower price

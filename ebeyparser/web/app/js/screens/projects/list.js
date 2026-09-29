@@ -4,7 +4,7 @@ import { html, cx, useEffect, useState } from "../../lib/html.js";
 import { useIsMobile } from "../../lib/hooks.js";
 import { navigate } from "../../lib/router.js";
 import { useStore } from "../../lib/store.js";
-import { plural } from "../../lib/format.js";
+import { plural, money } from "../../lib/format.js";
 import { Icon, Button, PageHeader, EmptyState, ErrorState, Skeleton, Ring, Chip, toast } from "../../ui/index.js";
 import { useTopbar } from "../../shell/topbar.js";
 import { projectsStore, projectsApi, cacheView, ru, StatusChip, DealsSwitch, STATUS_ORDER, TEMPLATE_ICON } from "../../features/projects-common.js";
@@ -116,6 +116,8 @@ function NextStep({ card }) {
 function ProjectCard({ card }) {
   const over = card.over_budget > 0;
   const fits = card.fits_budget === true;
+  // nothing priced yet (own items before the first pass): «~0 € из 400 €» would mislead
+  const noPrices = !card.best_total && !card.estimated_total;
   const open = (e) => {
     if (e.target.closest("a, button")) return;
     navigate(`/projects/${card.id}`);
@@ -134,8 +136,8 @@ function ProjectCard({ card }) {
         <span class="num">${card.slots_done}</span>
       <//>
       <div class="pj-card__totals">
-        <span class=${cx("pj-card__total num", fits && "t-green", over && "t-amber")}>${ru(card.total_label)}</span>
-        <span class="pj-card__progress">${ru(card.progress_label)}${over ? html` · <span class="tag tone-haggle">над бюджетом</span>` : ""}</span>
+        <span class=${cx("pj-card__total num", fits && "t-green", over && "t-amber")}>${noPrices ? (card.budget ? `бюджет ${money(card.budget)}` : "цены пока нет") : ru(card.total_label)}</span>
+        <span class="pj-card__progress">${ru(card.progress_label)}${noPrices ? " · цены узнаю из объявлений" : ""}${over ? html` · <span class="tag tone-haggle">над бюджетом</span>` : ""}</span>
       </div>
     </div>
     ${card.headline_ru && html`<div class="pj-card__headline tone-profit"><span class="sdot"></span><span>${ru(card.headline_ru)}</span></div>`}

@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, Query
 
 from ...config import EbayConfig, EmailConfig, NotificationsConfig, TelegramConfig
 from ...models import DealView, Listing, utcnow
-from ..localai import LMSTUDIO_URL, OLLAMA_URL, detect_local_ai, probe_json
+from ..localai import DEFAULT_LMSTUDIO_MODEL, LMSTUDIO_URL, OLLAMA_URL, detect_local_ai, probe_json
 from .context import ApiContext, get_ctx, mask
 from ...errors_ru import ai_problem, humanize, status_message
 from .errors import ApiError, from_exception, validation_error
@@ -46,16 +46,22 @@ LINK_KEY = "telegram:link"
 LINK_TTL = timedelta(minutes=15)
 SLOW_AI_SECONDS = 90.0
 EMAIL_TEST_TIMEOUT = 15.0  # the check must not hang for half a minute on a dead network
-GPU_PRESETS = [
-    {"key": "10-12", "label_ru": "10–12 ГБ", "model_ru": "Qwen2.5-VL-7B", "lmstudio": "Qwen2.5-VL-7B-Instruct",
-     "ollama": "qwen2.5vl:7b", "note_ru": "лучшее качество, понимает немецкий; на 8 ГБ — 2 фото", "recommended": True},
-    {"key": "6-8", "label_ru": "6–8 ГБ", "model_ru": "Gemma 3 4B или MiniCPM-V", "lmstudio": "gemma-3-4b-it",
-     "ollama": "gemma3:4b", "note_ru": "занимает 5–8 ГБ", "recommended": False},
-    {"key": "weak", "label_ru": "Слабый ПК", "model_ru": "Qwen2.5-VL-3B", "lmstudio": "Qwen2.5-VL-3B-Instruct",
-     "ollama": "qwen2.5vl:3b", "note_ru": "на процессоре 1–3 минуты на объявление", "recommended": False},
-    {"key": "16-24", "label_ru": "16–24 ГБ", "model_ru": "Gemma 3 12B или Qwen2.5-VL-32B", "lmstudio": "gemma-3-12b-it",
-     "ollama": "gemma3:12b", "note_ru": "для RTX 3090 и мощнее", "recommended": False},
-]
+
+
+def _gpu_presets() -> list[dict[str, Any]]:
+    """«Какая у тебя видеокарта?» → the catalog's photo model (docs/design/AI_MODELS.md)."""
+    from ...ai.model_catalog import MODELS
+
+    rows = (("10-12", "10–12 ГБ", "qwen3.5-9b-vision", "лучшая в своём размере: фото и немецкий текст за секунды", True),
+            ("6-8", "6–8 ГБ", "qwen3.5-4b-vision", "занимает около 5 ГБ", False),
+            ("weak", "Слабый ПК", "qwen3.5-2b-vision", "без видеокарты — около 40 секунд на фото", False),
+            ("16-24", "16–24 ГБ", "qwen3.6-35b-a3b-vision", "для RTX 3090 и мощнее: текст и фото одной моделью", False))
+    return [{"key": key, "label_ru": label, "model_ru": MODELS[m].name.replace(" + mmproj", ""),
+             "lmstudio": MODELS[m].lmstudio, "ollama": MODELS[m].ollama, "note_ru": note, "recommended": rec}
+            for key, label, m, note, rec in rows]
+
+
+GPU_PRESETS = _gpu_presets()
 
 
 # ====================================================================== AI
@@ -87,7 +93,8 @@ async def ai_detect(ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
         variant, text = "found", f"Нашёл {vision[0]['name']} · модель видит фото"
     elif out:
         variant = "no_vision"
-        text = f"{out[0]['name']} работает, но нет модели, которая понимает фото — скачай Qwen2.5-VL-7B-Instruct"
+        text = (f"{out[0]['name']} работает, но нет модели, которая понимает фото — скачай Qwen3.5 9B"
+                " (для видеокарты 6–8 ГБ — Qwen3.5 4B)")
     elif ai.enabled and ai.model and ai.provider in ("openai", "ollama"):
         # already set up, the server is just closed: not the install guide
         variant = "not_running"
@@ -100,12 +107,38 @@ async def ai_detect(ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
         "variant": variant,
         "message_ru": text,
         "suggested": {"provider": best["provider"], "base_url": best["base_url"], "model": best["default_model"]}
-        if best else {"provider": "openai", "base_url": LMSTUDIO_URL, "model": "qwen/qwen2.5-vl-7b"},
+        if best else {"provider": "openai", "base_url": LMSTUDIO_URL, "model": DEFAULT_LMSTUDIO_MODEL},
         "gpu_presets": GPU_PRESETS,
         "pillow": _pillow(),
         "current": {"enabled": ctx.config.ai.enabled, "provider": ctx.config.ai.provider,
                     "base_url": ctx.config.ai.base_url, "model": ctx.config.ai.model},
     }
+
+
+@router.get("/ai/recommend", summary="Какие модели поставить: по железу этого компьютера или по ?ram_gb=&vram_gb=&arm=&role=server|pc")
+async def ai_recommend(ram_gb: float | None = Query(None, ge=0, le=4096, description="ОЗУ, ГБ (пусто — этого компьютера)"),
+                       vram_gb: float | None = Query(None, ge=0, le=1024, description="память видеокарты, ГБ"),
+                       arm: bool | None = Query(None, description="ARM (Raspberry Pi, Apple Silicon)"),
+                       role: str = Query("server", pattern="^(server|pc)$",
+                                         description="server — работает всегда; pc — игровой ПК для фото"),
+                       detect: bool = Query(True, description="искать LM Studio / Ollama и их модели"),
+                       ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
+    """«Выбери своё железо → рекомендую модель» (ebeyparser/ai/model_catalog.py): this machine's
+    hardware (the default when no parameters are given), the picks per task with ids for LM Studio /
+    Ollama / llama.cpp, expected speed, and which installed models already fit."""
+    from ...ai.hardware import detect_host
+    from .model_advice import recommend_view
+
+    probe = getattr(ctx, "host_probe", None) or detect_host
+    try:
+        host = await asyncio.to_thread(probe)
+    except Exception:  # noqa: BLE001 - the picker works from the parameters alone
+        host = {"cores": None, "ram_gb": None, "arch": None, "arm": False, "os": None, "gpu": None}
+    servers: list[dict[str, Any]] | None = None
+    if detect:
+        found = await asyncio.to_thread(detect_local_ai, ctx.ai_probe or probe_json)
+        servers = [server.as_dict() for server in found]
+    return recommend_view(host, ram_gb=ram_gb, vram_gb=vram_gb, arm=arm, role=role, servers=servers)
 
 
 def sample_listing() -> Listing:
@@ -242,7 +275,8 @@ async def ai_scout_test(body: AiTestIn | None = None, ctx: ApiContext = Depends(
     """Runs the scout's batch triage on built-in sample ads (a PC with a hidden RTX 3070, a typo,
     a wanted ad, a pram) against the given or configured scout endpoint. save=true stores the
     endpoint as ai.scout.* and switches the scout on."""
-    from ...ai.triage import TriageEngine, check_sample, sample_ads
+    from ...ai.model_catalog import best_installed
+    from ...ai.triage import TriageEngine, check_sample, sample_ads, too_small_for_triage
     from ...config import LLMSettings
 
     body = body or AiTestIn()
@@ -256,19 +290,19 @@ async def ai_scout_test(body: AiTestIn | None = None, ctx: ApiContext = Depends(
         base_url = LMSTUDIO_URL
     model = (body.model or sc.model).strip()
     suggested = None
-    if not model:  # no scout model chosen: the catalog's best triage model installed on that server
+    if not model or too_small_for_triage(model):
+        # the catalog's best triage model already installed on that server (never one under 2B)
         try:
-            probe = _llm(ctx, LLMSettings(provider=provider, base_url=base_url, model=ai.model, max_images=0,
+            probe = _llm(ctx, LLMSettings(provider=provider, base_url=base_url, model=model or ai.model, max_images=0,
                                           timeout_seconds=20))
             try:
                 health = await asyncio.wait_for(probe.health(), timeout=20)
             finally:
                 await probe.aclose()
-            from ...ai.model_catalog import best_installed
-
             suggested = best_installed(list(health.get("models") or []), task="triage")
         except Exception:  # noqa: BLE001 - only a suggestion
             suggested = None
+    if not model:
         model = suggested or ai.model.strip()
     if not model:
         raise validation_error({"model": "укажи модель, например qwen3.5-2b"})
@@ -279,7 +313,12 @@ async def ai_scout_test(body: AiTestIn | None = None, ctx: ApiContext = Depends(
     result: dict[str, Any] = {"ok": False, "provider": provider, "base_url": base_url, "model": model,
                               "seconds": None, "sec_per_ad": None, "per_hour": None, "answered": 0, "total": 4,
                               "hidden_gpu": False, "typo_fixed": False, "wanted_seen": False, "items": [],
-                              "message_ru": "", "error_ru": "", "saved": False, "suggested_model": suggested}
+                              "message_ru": "", "error_ru": "", "saved": False, "suggested_model": suggested,
+                              "too_small": False, "recommended": _scout_pick()}
+    if too_small_for_triage(model):  # never triage with a model under 2B (AI_MODELS.md §4)
+        result["too_small"] = True
+        result["error_ru"] = result["message_ru"] = _too_small_ru(model, provider, suggested)
+        return result
     try:
         llm = _llm(ctx, settings)
     except Exception as exc:  # noqa: BLE001
@@ -309,8 +348,8 @@ async def ai_scout_test(body: AiTestIn | None = None, ctx: ApiContext = Depends(
     quality = sum(bool(result[k]) for k in ("hidden_gpu", "typo_fixed", "wanted_seen"))
     result["ok"] = result["answered"] >= 3 and quality >= 2
     if not result["answered"]:
-        result["message_ru"] = ("Модель ответила, но не так, как нужно — выбери другую модель (например Qwen2.5 3B"
-                                " Instruct) или увеличь её контекст до 8192")
+        result["message_ru"] = ("Модель ответила, но не так, как нужно — выбери другую модель (например Qwen3.5 2B"
+                                " или 4B) или увеличь её контекст до 8192")
     elif result["ok"]:
         result["message_ru"] = (f"Разведчик работает: {result['answered']} из 4 примеров за {seconds:.0f} с"
                                 + (f", успеет ≈ {result['per_hour']} объявлений в час" if result["per_hour"] else ""))
@@ -322,6 +361,24 @@ async def ai_scout_test(body: AiTestIn | None = None, ctx: ApiContext = Depends(
                           "ai.scout.model": model}, reason="ai")
         result["saved"] = True
     return result
+
+
+def _scout_pick(key: str = "qwen3.5-2b") -> dict[str, Any]:
+    """The catalog's model for the always-on server's scout, ids per runtime."""
+    from ...ai.model_catalog import MODELS
+
+    m = MODELS[key]
+    return {"key": m.key, "name": m.name, "ollama": m.ollama, "lmstudio": m.lmstudio, "llamacpp": m.llamacpp}
+
+
+def _too_small_ru(model: str, provider: str, suggested: str | None) -> str:
+    text = f"Модель {model} слишком маленькая для разведчика (меньше 2B): такие модели путают объявления."
+    if suggested:
+        return f"{text} На этом сервере уже есть {suggested} — выбери её."
+    pick = _scout_pick()
+    where = (f"в Ollama — модель {pick['ollama']}" if provider == "ollama"
+             else f"в LM Studio найди «{pick['lmstudio']}» во вкладке Discover")
+    return f"{text} Скачай {pick['name']} ({where}); на сервере мощнее — Qwen3.5 4B."
 
 
 async def _sample_check(llm: Any, settings: Any, result: dict[str, Any]) -> None:

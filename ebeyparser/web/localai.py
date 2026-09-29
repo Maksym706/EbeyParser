@@ -1,7 +1,8 @@
 """Find local model servers (LM Studio first, then Ollama) and their vision models.
 
 Used by the setup wizard and the /settings page. LM Studio is the expected setup
-(http://localhost:1234/v1 with qwen/qwen2.5-vl-7b); Ollama is the alternative.
+(http://localhost:1234/v1); Ollama is the alternative. The recommended models come from
+ebeyparser/ai/model_catalog.py (Qwen3.5, docs/design/AI_MODELS.md).
 """
 
 from __future__ import annotations
@@ -11,9 +12,13 @@ from typing import Any, Callable
 
 LMSTUDIO_URL = "http://localhost:1234/v1"
 OLLAMA_URL = "http://localhost:11434"
-DEFAULT_LMSTUDIO_MODEL = "qwen/qwen2.5-vl-7b"
-DEFAULT_OLLAMA_MODEL = "qwen2.5vl:7b"
-PREFERRED_MODEL_HINTS = ("qwen2.5-vl-7b", "qwen2.5vl:7b", "qwen2.5-vl", "qwen2.5vl")
+# nothing installed yet: the catalog's photo model for an 8-12 GB graphics card (T2)
+DEFAULT_LMSTUDIO_MODEL = "qwen/qwen3.5-9b"
+DEFAULT_OLLAMA_MODEL = "qwen3.5:9b-q4_K_M"
+# installed: the catalog's photo models first (biggest first), then the older Qwen2.5-VL
+PREFERRED_MODEL_HINTS = ("qwen3.6-35b-a3b", "qwen3.6:35b-a3b", "qwen3.5-9b", "qwen3.5:9b", "qwen3.5-4b",
+                         "qwen3.5:4b", "qwen2.5-vl-7b", "qwen2.5vl:7b", "qwen3.5-2b", "qwen3.5:2b", "qwen2.5-vl",
+                         "qwen2.5vl")
 
 
 @dataclass
@@ -25,7 +30,7 @@ class LocalAIServer:
 
     @property
     def vision_models(self) -> list[str]:
-        """Models that can look at photos, preferred Qwen2.5-VL-7B first."""
+        """Models that can look at photos, the catalog's picks (Qwen3.5) first."""
         from ..ai.client import looks_like_vision_model
 
         vision = [m for m in self.models if looks_like_vision_model(m)]

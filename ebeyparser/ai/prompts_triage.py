@@ -15,6 +15,9 @@ from __future__ import annotations
 from ..models import Listing
 
 KINDS = ("single", "bundle", "pc", "lot", "part", "acc", "box", "wanted", "swap", "service", "defect", "other")
+# what the MODEL sees: "sale" is the explicit default (the research's measured prompt, AI_MODELS.md §5);
+# the parser maps it back to the internal "single"
+PROMPT_KINDS = ("sale",) + KINDS[1:]
 CONDITIONS = ("new", "good", "used", "defect", "unknown")
 HIDDEN_TAGS = ("typo", "vague", "unknown_model", "pc_parts", "lot", "bundle", "wrong_category", "cheap")
 RISK_TAGS = ("scam", "defect", "locked", "fake", "missing", "reserved", "rent")
@@ -24,14 +27,21 @@ TEXT_LIMIT = 320  # characters of the ad text per ad (the search card shows ~150
 
 SYSTEM_PROMPT = """\
 You read second-hand ads from Kleinanzeigen.de and eBay.de for a student in Berlin who buys \
-cheap things to resell. For EVERY ad return one object. Report only what the ad says; do not \
+cheap things to resell. For EVERY ad return one object. Report only what the ad says; never \
 guess prices. Keys:
 i: the ad number [i].
-k: kind, default single (one product for sale). Others: bundle (a product with extras, e.g. console + \
-games) | pc (whole computer: list its parts) | lot (Konvolut, Nachlass, box of mixed things) | \
-part (spare part) | acc (accessory, case, cable) | box (nur OVP, leerer Karton) | wanted (Suche, Kaufe) | \
-swap (Tausche, nur Tausch) | service | defect (defekt, für Bastler, iCloud gesperrt) | other (furniture, \
-clothes, anything that is not electronics or tools).
+k: kind. Default: sale (one product for sale). Use another kind only when the ad says so:
+wanted = Suche, Suche nach, Kaufe, Gesucht
+swap = Tausche, Tausch, nur Tausch
+defect = defekt, kaputt, für Bastler, iCloud gesperrt
+part = Ersatzteil, als Ersatzteil (one component, not the whole device)
+box = nur OVP, nur Karton, leere Verpackung
+bundle = a product with extras: Paket, Set, Bundle, "mit 2 Controllern und Spielen"
+lot = Konvolut, Sammlung, Nachlass, Kiste mit Technik (many different things)
+pc = a whole computer: Gaming PC, Rechner, Tower (list its parts in c)
+acc = only an accessory: Hülle, Kabel, Ladegerät
+service = Reparatur, Dienstleistung
+other = not electronics or tools: furniture, clothes, toys
 p: the exact product: brand model variant storage, e.g. "Apple iPhone 13 Pro 256GB", \
 "NVIDIA RTX 3080 10GB". Copy model numbers and sizes exactly as the ad writes them; fix typos \
 ("Iphne" -> "iPhone"). Use the text, not only the title. "" if no model is named.
@@ -43,11 +53,11 @@ z: condition: new | good | used | defect | unknown.
 h: hidden value tags: typo (misspelled brand/model) | vague (title hides what it is) | \
 unknown_model (seller does not know the model) | pc_parts (valuable parts inside a PC) | \
 lot | bundle | wrong_category | cheap (price looks very low for this item). [] if none.
-x: risk tags: scam (prepayment, only shipping, WhatsApp, too good) | defect | locked \
-(iCloud/account lock) | fake (replica) | missing (important part missing) | reserved | rent. [] if none.
+x: risk tags: scam (Vorkasse, only shipping, WhatsApp, Telegram, e-mail, link, too good) | defect | \
+locked (iCloud/account lock) | fake (replica) | missing (important part missing) | reserved | rent. [] if none.
 s: interest 0-10 for reselling: 9-10 valuable item hidden or far too cheap; 6-8 known \
 valuable product, resellable; 3-5 ordinary; 0-2 junk, wanted, swap, service, broken, scam.
-r: reason in Russian, at most 8 words.
+r: reason in Russian, at most 8 words, in your own words. Never copy German text from the ad.
 Answer ONLY with minified JSON on one line (no line breaks, no indentation): {"items":[{...},...]}.
 
 Example ads:
@@ -58,15 +68,15 @@ RTX 3070, 16GB RAM, läuft
 Example answer:
 {"items":[{"i":0,"k":"pc","p":"","n":1,"c":["RTX 3070","Intel Core i7-8700K","16GB DDR4 RAM"],\
 "q":"gaming pc rtx 3070","z":"used","h":["pc_parts","vague"],"x":[],"s":9,"r":"старый ПК, внутри RTX 3070"},\
-{"i":1,"k":"single","p":"Apple iPhone 12 64GB","n":1,"c":[],"q":"iphone 12 64gb","z":"used",\
-"h":["typo"],"x":[],"s":6,"r":"iPhone 12 с опечаткой в названии"},\
+{"i":1,"k":"sale","p":"Apple iPhone 12 64GB","n":1,"c":[],"q":"iphone 12 64gb","z":"used",\
+"h":["typo"],"x":[],"s":6,"r":"iPhone 12, опечатка в названии"},\
 {"i":2,"k":"wanted","p":"Sony PS5 Disc","n":1,"c":[],"q":"ps5 disc","z":"unknown","h":[],"x":[],\
 "s":0,"r":"ищет, а не продаёт"}]}
 """
 
 _ITEM_PROPERTIES: dict = {
     "i": {"type": "integer"},
-    "k": {"type": "string", "enum": list(KINDS)},
+    "k": {"type": "string", "enum": list(PROMPT_KINDS)},
     "p": {"type": "string"},
     "n": {"type": "integer"},
     "c": {"type": "array", "items": {"type": "string"}},

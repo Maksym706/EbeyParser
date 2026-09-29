@@ -20,6 +20,7 @@ from .models import DealView
 from .web.configfile import save_searches_block, update_yaml_values, write_env_values
 from .web.localai import (
     DEFAULT_LMSTUDIO_MODEL,
+    DEFAULT_OLLAMA_MODEL,
     LMSTUDIO_URL,
     LocalAIServer,
     detect_local_ai,
@@ -56,9 +57,37 @@ def _open(config_path: Path) -> tuple[AppConfig, Database]:
     return config, Database(config.db_path)
 
 
-def _web_base_url(config: AppConfig) -> str:
-    host = "localhost" if config.web.host in ("0.0.0.0", "127.0.0.1", "::") else config.web.host
-    return f"http://{host}:{config.web.port}"
+def _web_base_url(config: AppConfig, host: str | None = None, port: int | None = None) -> str:
+    """Base of the links in alerts («Подробнее в EbeyParser»). Listening on the whole network: the
+    address a phone can open (Tailscale name / IP first — it works outside home too — then the
+    home network), not localhost. The links carry no key: the phone's browser remembers it."""
+    from .web.security import ANY_ADDRESS, is_loopback
+
+    host = (host or config.web.host or "").strip()
+    port = port or config.web.port
+    if is_loopback(host):
+        return f"http://localhost:{port}"
+    if host.strip("[]").lower() in ANY_ADDRESS:
+        best = _reachable_address()
+        return f"http://{best or 'localhost'}:{port}"
+    return f"http://{f'[{host}]' if ':' in host and not host.startswith('[') else host}:{port}"
+
+
+_REACHABLE: list[str | None] = []
+
+
+def _reachable_address() -> str | None:
+    """Tailscale name, Tailscale IP, else the first home-network IP (looked up once per process)."""
+    if not _REACHABLE:
+        from .homeserver import access_links
+        from .web.security import tailscale_name
+
+        name = tailscale_name()
+        links = access_links("0.0.0.0", 1, None, tailscale=name)
+        tailnet = [u for where, u in links if where == "Tailscale"]
+        pick = (tailnet[-1] if tailnet else links[0][1]) if links else None
+        _REACHABLE.append(pick.split("//", 1)[1].rsplit(":", 1)[0] if pick else None)
+    return _REACHABLE[0]
 
 
 def _money(value: float | None) -> str:
@@ -180,9 +209,11 @@ BROWSER_QUIET_SECONDS = 10 * 60  # a crash-restart loop (start-windows.bat) must
 BROWSER_WAIT_SECONDS = 60.0
 
 
-def bootstrap_config(config_path: Path) -> bool:
+def bootstrap_config(config_path: Path, host: str | None = None) -> bool:
     """No config.yaml yet: create it silently from the example — without its sample searches
-    and with the AI off — so the web UI's onboarding takes over. Also .env from .env.example."""
+    and with the AI off — so the web UI's onboarding takes over. Also .env from .env.example.
+    `host`: web.host of the new config (a headless server: "0.0.0.0", the onboarding happens on
+    the phone or PC, with the access key)."""
     if config_path.exists():
         return False
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -191,7 +222,7 @@ def bootstrap_config(config_path: Path) -> bool:
     else:
         config_path.write_text("", encoding="utf-8")
     save_searches_block(config_path, [])
-    update_yaml_values(config_path, {"ai.enabled": False})
+    update_yaml_values(config_path, {"ai.enabled": False, **({"web.host": host} if host else {})})
     env = config_path.parent / ".env"
     if not env.exists() and EXAMPLE_ENV.is_file():
         shutil.copyfile(EXAMPLE_ENV, env)
@@ -204,7 +235,7 @@ def browser_allowed(args: argparse.Namespace) -> bool:
     redirected (Windows: pythonw without a console counts as a user double-click)."""
     import os
 
-    if getattr(args, "no_browser", False) or os.environ.get("EBEYPARSER_NO_BROWSER"):
+    if getattr(args, "no_browser", False) or getattr(args, "server", False) or os.environ.get("EBEYPARSER_NO_BROWSER"):
         return False
     if os.environ.get("CI") or os.environ.get("INVOCATION_ID") or os.environ.get("container") \
             or Path("/.dockerenv").exists():
@@ -272,7 +303,8 @@ def _make_server(app: Any, host: str, port: int, verbose: bool) -> Any:
                 hub.close_threadsafe()
             super().handle_exit(sig, frame)
 
-    return _Server(uvicorn.Config(app, host=host, port=port, log_level="info" if verbose else "warning"))
+    return _Server(uvicorn.Config(app, host=host, port=port, log_level="info" if verbose else "warning",
+                                  access_log=verbose))
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -281,16 +313,20 @@ def cmd_run(args: argparse.Namespace) -> int:
     from .monitor import Monitor
     from .notify.base import build_notifiers
     from .web.app import create_app
-    from .web.security import TOKEN_PARAM, ensure_token, is_loopback, lan_urls
+    from .web.security import TOKEN_PARAM, ensure_token, is_loopback
 
     config_path = Path(args.config)
-    created = bootstrap_config(config_path)
+    server_mode = bool(getattr(args, "server", False))
+    created = bootstrap_config(config_path, host=args.host or ("0.0.0.0" if server_mode else None))
     if created:
-        print(f"✔ Создан {config_path} — настройка продолжится в браузере (город, категории, нейросеть, Telegram).")
+        where = "на телефоне или ПК по ссылке ниже" if server_mode or args.host else "в браузере"
+        print(f"✔ Создан {config_path} — настройка продолжится {where} (город, категории, нейросеть, Telegram).",
+              flush=True)
     open_browser = browser_allowed(args)
     with _long_running(load_config(config_path)) as ok:
         if not ok:
             return 3
+        _autoconfigure_scout(config_path)
         while True:
             config, db = _open(config_path)
             if created:  # the web UI's onboarding asks for the AI step (see web/api/routes_app.is_onboarded)
@@ -298,7 +334,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 created = False
             host = args.host or config.web.host
             port = args.port or config.web.port
-            base_url = _web_base_url(config)
+            base_url = _web_base_url(config, host, port)
             token = None if is_loopback(host) else ensure_token(config.data_path)
             monitor = Monitor(config, db, web_base_url=base_url)
             attach_projects(monitor, db)  # build-project alerts (the web app only updates this wiring)
@@ -311,21 +347,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                 bind_host=host,
                 access_token=token,
             )
-            local_url = f"http://localhost:{port}/" + (f"?{TOKEN_PARAM}={token}" if token else "")
-            if token is None:
-                print(f"🚀 EbeyParser: открой http://localhost:{port}")
-            else:
-                everywhere = host in ("0.0.0.0", "::")
-                print(f"⚠ Панель открыта {'для всей сети' if everywhere else 'по адресу ' + host}"
-                      " — вход только по ссылке с ключом.")
-                if everywhere:
-                    print("   Не делай так в общественном Wi-Fi (общежитие, кафе); для телефона лучше Tailscale.")
-                    print(f"🚀 На этом компьютере: {local_url}")
-                urls = lan_urls(port, token) if everywhere else [f"http://{host}:{port}/?{TOKEN_PARAM}={token}"]
-                for url in urls:
-                    print(f"📱 С телефона: {url}")
-                print(f"   Ключ хранится в {config.data_path / 'web_token.txt'} — удали файл, чтобы сменить ключ.")
-            print(f"   Лог: {config.data_path / 'logs' / 'ebeyparser.log'}. Ctrl+C — остановить.")
+            _attach_scout_autoconfig(monitor, app)
+            everywhere = host.strip("[]") in ("0.0.0.0", "::", "")
+            local_host = "localhost" if everywhere or is_loopback(host) else (f"[{host}]" if ":" in host else host)
+            local_url = f"http://{local_host}:{port}/" + (f"?{TOKEN_PARAM}={token}" if token else "")
+            _print_access(config, host, port, token, server_mode=server_mode)
+            print(f"   Лог: {config.data_path / 'logs' / 'ebeyparser.log'}. Ctrl+C — остановить.", flush=True)
             server = _make_server(app, host, port, args.verbose)
             restart = {"requested": False}
 
@@ -349,6 +376,139 @@ def cmd_run(args: argparse.Namespace) -> int:
             if not restart["requested"]:
                 break
             print("♻ Перезапускаю с новыми настройками…")
+    return 0
+
+
+def _print_access(config: AppConfig, host: str, port: int, token: str | None, *, server_mode: bool = False,
+                  qr: bool = True, log_line: bool = True) -> None:
+    """Where to open the panel: real home-network / Tailscale addresses with the key, and a QR code
+    (stdout — the console, `journalctl -u ebeyparser`, `docker compose logs`); a line without the
+    key goes to the log file."""
+    from .homeserver import access_links, access_lines, emit
+    from .web.security import TOKEN_FILE, is_loopback, tailscale_name
+
+    ts_name = None if is_loopback(host) else tailscale_name()
+    emit(access_lines(host, port, token, config.data_path / TOKEN_FILE, allowed_hosts=config.web.allowed_hosts,
+                      qr=qr, tailscale=ts_name))
+    if is_loopback(host) and server_mode:
+        emit(["   Это сервер без экрана? Открой панель для домашней сети: python -m ebeyparser access lan",
+              "   (в Docker: docker compose exec ebeyparser python -m ebeyparser access lan) и перезапусти программу."])
+    if log_line and not is_loopback(host):
+        links = access_links(host, port, None, allowed_hosts=config.web.allowed_hosts, tailscale=ts_name)
+        logging.getLogger(__name__).info("Web UI for the network: %s (open once with ?token=… from %s)",
+                                         ", ".join(u.rstrip("/") for _, u in links) or host,
+                                         config.data_path / TOKEN_FILE)
+
+
+def _autoconfigure_scout(config_path: Path) -> None:
+    """Docker `ai` profile / install-linux.sh: EBEYPARSER_OLLAMA_URL points at the server's own
+    Ollama — switch the AI scout on there once (never over the user's own settings)."""
+    import os
+
+    from .homeserver import OLLAMA_URL_ENV, autoconfigure_scout, model_ram_gb
+
+    url = os.environ.get(OLLAMA_URL_ENV, "").strip()
+    if not url or not config_path.is_file():
+        return
+    try:
+        note = autoconfigure_scout(config_path, load_config(config_path), url, ram_gb=model_ram_gb())
+    except Exception as exc:  # noqa: BLE001 - never block the start
+        logging.getLogger(__name__).warning("AI scout auto-setup skipped: %s", exc)
+        return
+    if note:
+        print(f"🤖 {note}", flush=True)
+        logging.getLogger(__name__).info(note)
+
+
+def _attach_scout_autoconfig(monitor: Any, app: Any) -> None:
+    """The models may still be downloading at the first start: look again after each pass."""
+    import os
+
+    from .homeserver import OLLAMA_URL_ENV, model_ram_gb, scout_autoconfig_hook
+
+    try:
+        hook = scout_autoconfig_hook(app, os.environ.get(OLLAMA_URL_ENV, "").strip(), ram_gb=model_ram_gb())
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("AI scout auto-setup not attached: %s", exc)
+        return
+    hooks = getattr(monitor, "on_event", None)
+    if hook is not None and isinstance(hooks, list):
+        hooks.append(hook)
+
+
+def cmd_access(args: argparse.Namespace) -> int:
+    """Show the links (+ QR) for the phone, or switch who may open the panel: local / lan / tailscale."""
+    from .web.security import ensure_token, is_loopback, is_tailscale_ip, local_addresses
+
+    config_path = Path(args.config)
+    if args.mode:
+        if args.mode == "local":
+            host = "127.0.0.1"
+        elif args.mode == "lan":
+            host = "0.0.0.0"
+        else:
+            host = (args.host or "").strip() or next(iter(sorted(a for a in local_addresses() if is_tailscale_ip(a))), "")
+            if not host:
+                print("✖ Tailscale не найден на этом компьютере: установи Tailscale и войди в аккаунт"
+                      " (tailscale up), или укажи адрес: python -m ebeyparser access tailscale --host 100.x.y.z")
+                return 2
+        if bootstrap_config(config_path, host=host):
+            config = load_config(config_path)
+            db = Database(config.db_path)
+            db.set_state("onboarding:bootstrapped", "1")
+            db.close()
+        else:
+            update_yaml_values(config_path, {"web.host": host})
+        print(f"✔ web.host: {host} записан в {config_path}. Перезапусти программу (сервер: sudo systemctl restart"
+              " ebeyparser; Docker: docker compose restart ebeyparser), чтобы это заработало.")
+    config = load_config(config_path)
+    host = config.web.host
+    token = None if is_loopback(host) else ensure_token(config.data_path)
+    _print_access(config, host, config.web.port, token, qr=not args.no_qr, log_line=False)
+    return 0
+
+
+def cmd_server_models(args: argparse.Namespace) -> int:
+    """Which small models fit this server (model catalog by RAM/CPU); --pull downloads them into Ollama."""
+    import json as _json
+    import os
+
+    from .homeserver import (
+        OLLAMA_URL_ENV,
+        describe_plan,
+        detect_hardware,
+        ollama_limit_gb,
+        pull_models,
+        server_plan,
+    )
+
+    hw = detect_hardware()
+    if args.ram_gb:
+        hw = type(hw)(ram_gb=args.ram_gb, cores=hw.cores, arch=hw.arch, arm=hw.arm)
+    plan = server_plan(hw.ram_gb, arm=hw.arm, limit_gb=ollama_limit_gb())
+    if args.json:
+        print(_json.dumps({"hardware": hw.__dict__, **plan}, ensure_ascii=False))
+        return 0
+    for line in describe_plan(plan, hw):
+        print(line)
+    if not plan["pull"]:
+        return 1
+    url = args.ollama or os.environ.get(OLLAMA_URL_ENV) or "http://127.0.0.1:11434"
+    if not args.pull:
+        print(f"\nСкачать в Ollama ({url}): python -m ebeyparser server-models --pull"
+              f"   (или: {' && '.join('ollama pull ' + m for m in plan['pull'])})")
+        return 0
+    if args.dry_run:
+        print(f"\n[dry-run] скачал бы в Ollama {url}: {', '.join(plan['pull'])}")
+        return 0
+    print(f"\nСкачиваю в Ollama {url} …", flush=True)
+    failed = pull_models(url, plan["pull"], say=lambda text: print(text, flush=True),
+                         wait_seconds=args.wait)
+    if failed:
+        print(f"⚠ Не скачались: {', '.join(failed)}. Проверь интернет и место на диске и запусти ещё раз.")
+        return 0 if args.never_fail else 1
+    print("✔ Модели на месте. Разведчик включится сам при следующем запуске программы"
+          " (или: Настройки → Нейросеть → Разведчик).")
     return 0
 
 
@@ -706,7 +866,7 @@ def cmd_ai_check(args: argparse.Namespace) -> int:
     print(f"⚠  Сервер {health['base_url']} работает, но модели «{health['model']}» на нём нет.")
     if not models:
         print("   На сервере вообще нет моделей." + (
-            " Скачай vision-модель в LM Studio (вкладка Discover), например Qwen2.5-VL-7B-Instruct."
+            " Скачай vision-модель в LM Studio (вкладка Discover), например Qwen3.5 9B (qwen/qwen3.5-9b)."
             if lmstudio else f" Скачай: ollama pull {health['model']}"))
         return 1
     print("   Модели на сервере:")
@@ -715,7 +875,7 @@ def cmd_ai_check(args: argparse.Namespace) -> int:
     vision = [m for m in models if looks_like_vision_model(m)]
     if not vision:
         print("   ⚠ Ни одна из них не похожа на vision-модель — а программе нужна модель, которая видит фото"
-              " (Qwen2.5-VL, Gemma 3, MiniCPM-V, LLaVA...).")
+              " (Qwen3.5, Qwen2.5-VL, Gemma 3, MiniCPM-V, LLaVA...).")
         return 1
     best = vision[0]
     if args.fix:
@@ -1038,8 +1198,9 @@ def _ask_ai(p: _Prompter, servers: list[LocalAIServer]) -> dict[str, Any]:
               + (", ".join(vision[:3]) if vision else "ни одной"))
     if not servers:
         p.say("   Не нашёл: LM Studio (localhost:1234) и Ollama (localhost:11434) не отвечают.")
-        if p.yes("   Настроить под LM Studio с моделью Qwen2.5-VL-7B? Сервер можно запустить позже"):
-            p.say("   В LM Studio: скачай Qwen2.5-VL-7B (вкладка Discover) → Developer → Start Server.")
+        if p.yes("   Настроить под LM Studio с моделью Qwen3.5 9B? Сервер можно запустить позже"):
+            p.say("   В LM Studio: скачай Qwen3.5 9B (вкладка Discover, qwen/qwen3.5-9b; для видеокарты 6–8 ГБ —"
+                  " qwen/qwen3.5-4b) → Developer → Start Server.")
             return {"ai.enabled": True, "ai.provider": "openai", "ai.base_url": LMSTUDIO_URL,
                     "ai.model": DEFAULT_LMSTUDIO_MODEL}
         p.say("   Хорошо, без нейросети: оценка только по ценам. Включить позже — python -m ebeyparser setup.")
@@ -1055,9 +1216,10 @@ def _ask_ai(p: _Prompter, servers: list[LocalAIServer]) -> dict[str, Any]:
             server = servers[int(answer) - 1]
     vision = server.vision_models
     if not vision:
-        model = DEFAULT_LMSTUDIO_MODEL if server.provider == "openai" else "qwen2.5vl:7b"
-        p.say(f"   ⚠ В {server.name} нет модели, которая видит фото. Скачай Qwen2.5-VL-7B"
-              + (" (вкладка Discover)." if server.provider == "openai" else " командой: ollama pull qwen2.5vl:7b")
+        model = DEFAULT_LMSTUDIO_MODEL if server.provider == "openai" else DEFAULT_OLLAMA_MODEL
+        p.say(f"   ⚠ В {server.name} нет модели, которая видит фото. Скачай Qwen3.5 9B"
+              + (" (вкладка Discover)." if server.provider == "openai"
+                 else f" командой: ollama pull {DEFAULT_OLLAMA_MODEL}")
               + f" Пока впишу {model}.")
     elif len(vision) == 1:
         model = vision[0]
@@ -1205,7 +1367,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-monitor", action="store_true", help="только веб-интерфейс, без проверок")
     p.add_argument("--no-browser", action="store_true", default=argparse.SUPPRESS,
                    help="не открывать браузер при запуске")
+    p.add_argument("--server", action="store_true",
+                   help="домашний сервер без экрана: браузер не открывается, при первом запуске панель открыта"
+                        " для домашней сети (вход по ссылке с ключом, она в логе)")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("access", help="ссылки на панель для телефона (+ QR-код) или сменить доступ: local / lan / tailscale")
+    p.add_argument("mode", nargs="?", choices=["local", "lan", "tailscale"],
+                   help="local — только этот компьютер, lan — домашняя сеть, tailscale — только через Tailscale")
+    p.add_argument("--host", help="для tailscale: адрес компьютера в Tailscale (100.x.y.z), если не нашёлся сам")
+    p.add_argument("--no-qr", action="store_true", help="без QR-кода")
+    p.set_defaults(func=cmd_access)
+
+    p = sub.add_parser("server-models", help="какие нейросети потянет этот сервер (по памяти и процессору);"
+                                             " --pull — скачать их в Ollama")
+    p.add_argument("--pull", action="store_true", help="скачать в Ollama")
+    p.add_argument("--ollama", help="адрес Ollama (по умолчанию EBEYPARSER_OLLAMA_URL или http://127.0.0.1:11434)")
+    p.add_argument("--ram-gb", type=float, help="считать, что памяти столько ГБ")
+    p.add_argument("--dry-run", action="store_true", help="только показать, что будет скачано")
+    p.add_argument("--json", action="store_true", help="план в JSON (для скриптов установки)")
+    p.add_argument("--wait", type=float, default=60.0, help="сколько секунд ждать, пока Ollama запустится")
+    p.add_argument("--never-fail", action="store_true", help="код выхода 0, даже если скачать не вышло (Docker)")
+    p.set_defaults(func=cmd_server_models)
 
     sub.add_parser("monitor", help="мониторинг без веб-интерфейса").set_defaults(func=cmd_monitor)
 
@@ -1262,7 +1445,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command is None:
         args = parser.parse_args([*(argv or sys.argv[1:]), "run"])
-    for name, default in (("host", None), ("port", None), ("no_monitor", False), ("no_browser", False)):
+    for name, default in (("host", None), ("port", None), ("no_monitor", False), ("no_browser", False),
+                          ("server", False)):
         if not hasattr(args, name):
             setattr(args, name, default)
     _setup_logging(args.verbose)

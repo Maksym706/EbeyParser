@@ -15,10 +15,10 @@ import "./icons-extra.js";
 const EXTRA = {
   "plug-zap":
     '<path d="M6.3 20.3a2.4 2.4 0 0 0 3.4 0L12 18l-6-6-2.3 2.3a2.4 2.4 0 0 0 0 3.4Z" /><path d="m2 22 3-3" /><path d="M7.5 13.5 10 11" /><path d="M10.5 16.5 13 14" /><path d="m18 3-4 4h6l-4 4" />',
-  fan: '<path d="M10.827 16.379a6.082 6.082 0 0 1-8.618-7.002l5.412 1.45a6.082 6.082 0 0 1 7.002-8.618l-1.45 5.412a6.082 6.082 0 0 1 8.618 7.002l-5.412-1.45a6.082 6.082 0 0 1-7.002 8.618l1.45-5.412Z" /><path d="M12 12v.01" />',
+  "fan": '<path d="M10.827 16.379a6.082 6.082 0 0 1-8.618-7.002l5.412 1.45a6.082 6.082 0 0 1 7.002-8.618l-1.45 5.412a6.082 6.082 0 0 1 8.618 7.002l-5.412-1.45a6.082 6.082 0 0 1-7.002 8.618l1.45-5.412Z" /><path d="M12 12v.01" />',
   "sticky-note": '<path d="M21 9a2.4 2.4 0 0 0-.706-1.706l-3.588-3.588A2.4 2.4 0 0 0 15 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2z" /><path d="M15 3v5a1 1 0 0 0 1 1h5" />',
   "circle-slash": '<circle cx="12" cy="12" r="10" /><line x1="9" x2="15" y1="15" y2="9" />',
-  trophy:
+  "trophy":
     '<path d="M10 14.66V17a1 1 0 0 1-1 1 2 2 0 0 0-2 2v2" /><path d="M14 14.66V17a1 1 0 0 0 1 1 2 2 0 0 1 2 2v2" /><path d="M17.916 10H19.5A2.5 2.5 0 0 0 22 7.5V5a1 1 0 0 0-1-1h-3" /><path d="M4 22h16" /><path d="M6 9a6 6 0 0 0 12 0V3a1 1 0 0 0-1-1H7a1 1 0 0 0-1 1z" /><path d="M6.084 10H4.5A2.5 2.5 0 0 1 2 7.5V5a1 1 0 0 1 1-1h3" />',
 };
 for (const [name, body] of Object.entries(EXTRA)) if (!(name in ICONS)) ICONS[name] = body;
@@ -169,7 +169,7 @@ export async function changeChoice(project, slotKey, optionKey, { onView, title 
     const others = diffChosen(project, view, [slotKey]);
     const next = (view.slots || []).find((s) => s.key === slotKey);
     const undoChoices = { [slotKey]: prevChosen, ...Object.fromEntries(others.map((c) => [c.key, c.from])) };
-    toast.success(title || `${slot ? slot.label : "Часть"}: ${ru(shortOption(next ? next.chosen_label : optionKey))}`, {
+    toast.success(title || `${slot ? slot.label : "Часть"}: ${ru(withoutPrefix(shortOption(next ? next.chosen_label : optionKey), slot && slot.label))}`, {
       message: sideChangesText(others),
       action: prevChosen
         ? {

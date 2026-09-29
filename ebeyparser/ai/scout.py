@@ -23,14 +23,22 @@ from typing import Any, Callable
 from ..models import AIVerdict, Listing, PriceEstimate
 from ..pricing.ai_key import ProductRef, grounded, resolve, split_quantity
 from ..pricing.bundle import BundleValue, Component, value_bundle
+from ..pricing.text import FLAG_EMAIL, FLAG_WHATSAPP, SEVERE_FLAGS, detect_red_flags, is_remote_only
 from .triage import TriageItem
 
 # triage kinds that are never worth a second look, and risk tags that forbid one
 NO_PROMOTE_KINDS = frozenset({"wanted", "swap", "service", "box", "defect", "other", "acc", "part"})
 BLOCKING_RISKS = frozenset({"scam", "locked", "fake", "rent", "defect", "missing", "reserved"})
 BUNDLE_KINDS = frozenset({"bundle", "pc", "lot"})
+# The code's own red flags (pricing/text.py) back up what a small model misses (a 2B missed the
+# WhatsApp / e-mail / «Sicher bezahlen» scams, AI_MODELS.md §4): the scout never promotes such an ad.
+CODE_BLOCK_FLAGS = SEVERE_FLAGS | {FLAG_WHATSAPP, FLAG_EMAIL}
+REMOTE_ONLY_RU = "только пересылка, без встречи"
 UNKNOWN_PRIORITY = 0.75  # same scale as monitor._Candidate.discount (cost / market, lower = better)
-DEMOTED_PRIORITY = 0.97  # the scout calls it junk: after everything else
+DEMOTED_PRIORITY = 0.97  # blocked (wanted, swap, scam, …): after everything else
+# The interest 0..10 of models up to 4B barely separates gems from junk (AUC 0.43 for 2B, 0.63 for
+# 4B): among candidates without a price it only breaks ties, it never outranks real prices.
+INTEREST_TIE_BREAK = 0.002
 
 FOUND_BY_SCRIPT = "script"
 FOUND_BY_SCOUT = "ai_scout"
@@ -66,17 +74,18 @@ class ScoutPlan:
         return self.ref is not None and self.grounded
 
     def priority(self, listing: Listing) -> float:
-        """Rank in the paid stage (lower first): cost / market when priced, else by interest."""
+        """Rank in the paid stage (lower first): cost / market when priced from real data; unpriced
+        ones rank together (the interest only breaks ties); blocked ones last."""
         if not self.item.is_ai:
             return UNKNOWN_PRIORITY
-        if self.blocked or self.interest <= 2:
+        if self.blocked:
             return DEMOTED_PRIORITY
         est = self.estimate
         if listing.is_free:
             return 0.0
         if est is not None and est.market_price and listing.price and listing.price > 1:
             return (listing.price + (listing.shipping_cost or 0.0)) / est.market_price
-        return max(0.3, UNKNOWN_PRIORITY - 0.03 * (self.interest - 5))
+        return UNKNOWN_PRIORITY - INTEREST_TIE_BREAK * (max(0, min(10, self.interest)) - 5)
 
     def reason_ru(self) -> str:
         reason = " ".join((self.item.reason or "").split())
@@ -93,7 +102,19 @@ def ad_text(listing: Listing) -> str:
     return f"{listing.title}\n{listing.description}"
 
 
-def _blocked(item: TriageItem) -> str:
+def code_red_flags(listing: Listing) -> list[str]:
+    """The script's red-flag rules on the ad text, whatever the model said: scam phrasings
+    (Vorkasse, PayPal Freunde, Western Union, «Sicher bezahlen» links), WhatsApp / Telegram /
+    e-mail contact, wanted / swap / defect / locked … and, on Kleinanzeigen, "nur Versand"
+    (a far-too-cheap find the seller won't show is the classic scam)."""
+    text = ad_text(listing)
+    flags = [f for f in detect_red_flags(text) if f in CODE_BLOCK_FLAGS]
+    if listing.source != "ebay" and is_remote_only(text):
+        flags.append(REMOTE_ONLY_RU)
+    return flags
+
+
+def _blocked(item: TriageItem, listing: Listing | None = None) -> str:
     if not item.is_ai:
         return "нет ответа нейросети"
     if item.kind in NO_PROMOTE_KINDS:
@@ -101,6 +122,9 @@ def _blocked(item: TriageItem) -> str:
     risks = BLOCKING_RISKS.intersection(item.risks)
     if risks:
         return "риск: " + ", ".join(sorted(risks))
+    flags = code_red_flags(listing) if listing is not None else []
+    if flags:
+        return "признаки: " + ", ".join(flags)
     return ""
 
 
@@ -109,7 +133,7 @@ def plan(listing: Listing, item: TriageItem, lookup: PriceLookup, *, bundle_disc
     """Stage B for one ad: ground the product / parts in the ad text, price them from history."""
     text = ad_text(listing)
     kind = item.kind
-    result = ScoutPlan(item=item, kind=kind, interest=item.interest, blocked=_blocked(item),
+    result = ScoutPlan(item=item, kind=kind, interest=item.interest, blocked=_blocked(item, listing),
                        query=item.query or "")
     if not item.is_ai:
         return result
@@ -155,24 +179,31 @@ def plan(listing: Listing, item: TriageItem, lookup: PriceLookup, *, bundle_disc
     return result
 
 
-def worth_a_look(plan_: ScoutPlan, *, deal_math: Callable[[PriceEstimate], bool], min_interest: int) -> bool:
-    """Promote an ad the script dismissed? Only a real, unblocked, grounded AI answer; with a
-    market price from history the math must show a possible deal; without one, only a high
-    interest (single items get a comparables lookup with the scout's phrase; a bundle without
-    priced parts needs an even higher interest — the vision check can't price it either)."""
+def worth_a_look(plan_: ScoutPlan, *, deal_math: Callable[[PriceEstimate], bool], min_interest: int = 0) -> bool:
+    """Promote an ad the script dismissed? Decided by data, not by the model's interest:
+
+    * a real, unblocked AI reading whose product (or a bundle's parts) is grounded in the ad text;
+    * and a market price from history whose math shows a possible deal, or something concrete
+      for the paid stage to price: a named single product the history doesn't know (comparables
+      with the scout's phrase), a bundle's model-numbered parts without a price yet.
+
+    A bundle with nothing priceable is not promoted (no data, at most a guess). The interest
+    is only a weak veto: below `min_interest` (0 = off) the ad is not promoted."""
     if not plan_.usable:
         return False
-    if plan_.estimate is not None and plan_.estimate.market_price and deal_math(plan_.estimate):
-        return True
+    if min_interest and plan_.interest < min_interest:
+        return False
+    est = plan_.estimate
+    if est is not None and est.market_price:
+        if deal_math(est):
+            return True
+        if plan_.kind not in BUNDLE_KINDS:
+            return False  # the history knows this product: no deal
     if plan_.kind in BUNDLE_KINDS:
         # the parts' sum is a lower bound: model-numbered parts without a price yet ("i7-8700K")
         # may still make it a deal once the paid stage looks up their comparables
-        if unpriced_parts(plan_) and plan_.interest >= min_interest + 1:
-            return True
-        return plan_.estimate is None and plan_.interest >= min_interest + 2 and plan_.grounded
-    if plan_.estimate is not None and plan_.estimate.market_price:
-        return False
-    return plan_.identified and plan_.interest >= min_interest and bool(plan_.query)
+        return bool(unpriced_parts(plan_))
+    return plan_.identified and bool(plan_.query)
 
 
 def unpriced_parts(plan_: ScoutPlan, limit: int = 2) -> list[Component]:
@@ -291,9 +322,16 @@ def _words(n: int, one: str, few: str, many: str) -> str:
     return many
 
 
+TOO_SMALL_RU = ("Модель {model} слишком маленькая для разведчика (меньше 2B): она путает объявления."
+                " Объявления смотрю обычным способом. Возьми Qwen3.5 2B или больше")
+
+
 def status_view(*, enabled: bool, mode_setting: str, provider: str, base_url: str, model: str, own_endpoint: bool,
-                snap: dict[str, Any], vision_waiting: int, vision_wait_minutes: float) -> dict[str, Any]:
-    """Everything the Settings → Нейросеть and Состояние screens show about the scout."""
+                snap: dict[str, Any], vision_waiting: int, vision_wait_minutes: float,
+                expected_sec_per_ad: float | None = None, pass_share: float = 0.5, max_per_hour: int = 0,
+                too_small: bool = False) -> dict[str, Any]:
+    """Everything the Settings → Нейросеть and Состояние screens show about the scout.
+    `expected_sec_per_ad`: the model research's speed for this model (before it measured its own)."""
     seen = int(snap.get("seen_last_hour") or 0)
     read = int(snap.get("triaged_last_hour") or 0)
     capacity = snap.get("capacity_per_hour")
@@ -303,6 +341,8 @@ def status_view(*, enabled: bool, mode_setting: str, provider: str, base_url: st
     down = bool(error) and (ok_at is None or (error_at or 0) > ok_at)
     if not enabled:
         state, text = "off", "Разведчик выключен — объявления отбираю по названию и истории цен"
+    elif too_small:
+        state, text = "too_small", TOO_SMALL_RU.format(model=model or "?")
     elif down:
         state, text = "down", "Разведчик не отвечает — пока смотрю объявления обычным способом"
     elif seen == 0 and read == 0:
@@ -311,10 +351,17 @@ def status_view(*, enabled: bool, mode_setting: str, provider: str, base_url: st
         state = "ok" if read >= seen else "behind"
         text = f"Успевает смотреть {read} из {seen} {_words(seen, 'нового объявления', 'новых объявлений', 'новых объявлений')} в час"
     speed = ""
+    expected = False
+    if not sec and expected_sec_per_ad and not too_small:
+        sec, expected = float(expected_sec_per_ad), True
+        per_hour = 3600.0 * max(0.05, pass_share) / sec
+        capacity = int(min(max_per_hour, per_hour) if max_per_hour > 0 else per_hour)
     if sec:
         speed = f"≈ {sec:.1f} с на объявление"
         if capacity:
             speed += f", до {capacity} {_words(int(capacity), 'объявления', 'объявлений', 'объявлений')} в час"
+        if expected:
+            speed = "Ожидается " + speed + " (пока не измерено)"
     return {
         "enabled": enabled,
         "state": state,
@@ -332,6 +379,8 @@ def status_view(*, enabled: bool, mode_setting: str, provider: str, base_url: st
         "overflow_last_hour": int(snap.get("overflow_last_hour") or 0),
         "failed_last_hour": int(snap.get("failed_last_hour") or 0),
         "sec_per_ad": sec,
+        "speed_expected": expected,
+        "too_small": too_small,
         "capacity_per_hour": capacity,
         "batch_size": snap.get("batch_size") or None,
         "vision_queue": {

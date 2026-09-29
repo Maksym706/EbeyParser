@@ -35,7 +35,8 @@ from .ai import scout as scout_ai
 from .ai.claude import make_llm
 from .ai.evaluator import AIEvaluator, same_variant_comparables
 from .ai.prompts import MAX_PROMPT_COMPARABLES, prompt_comparables
-from .ai.triage import TriageEngine, TriageItem, blind_spot, scout_priority
+from .ai.triage import (TriageEngine, TriageItem, blind_spot, expected_sec_per_ad, scout_priority,
+                        too_small_for_triage)
 from .config import AppConfig, GeneralConfig, LLMSettings, SearchConfig
 from .db import Database
 from .models import AIVerdict, Comparable, DealView, Evaluation, Listing, PriceEstimate, RunSummary, utcnow
@@ -288,6 +289,7 @@ class Monitor:
         self._scout_searches_left = 0
         self._scout_hints_text: str | None = None
         self._scout_down_reported = False
+        self._scout_small_warned = False
         self._second_calls = 0
         self._rate_limited: dict[str, datetime] = {}  # host -> retry_at, this pass
         self._budget: _Budget | None = None
@@ -405,6 +407,17 @@ class Monitor:
             max_tokens=sc.max_tokens,
         )
 
+    def _scout_too_small(self) -> bool:
+        """No triage with a model under ~2B (docs/design/AI_MODELS.md §4: the 0.8B renumbered and
+        copied ads). The user's model stays as configured; the status says why the scout is idle."""
+        model = self._scout_llm_settings().model
+        if not too_small_for_triage(model):
+            return False
+        if not self._scout_small_warned:
+            self._scout_small_warned = True
+            log.warning("AI scout: %s is too small for reading ads (under 2B) — the scout stays off", model)
+        return True
+
     @property
     def scout_enabled(self) -> bool:
         return self._scout is not None and (self._injected["scout"] or self.config.ai.scout.enabled)
@@ -436,7 +449,7 @@ class Monitor:
             except Exception as exc:  # e.g. anthropic package missing
                 log.warning("Second opinion disabled: %s", exc)
         sc = ai.scout
-        if self._scout is None and sc.enabled and not self._injected["scout"]:
+        if self._scout is None and sc.enabled and not self._injected["scout"] and not self._scout_too_small():
             try:
                 settings = self._scout_llm_settings()
                 self._scout_llm = make_scout_llm(settings)
@@ -1496,8 +1509,13 @@ class Monitor:
         return estimate
 
     def _cache_comps(self, key: str, estimate: PriceEstimate) -> None:
-        self._comps_cache[key] = (time.monotonic(), estimate)
+        now = time.monotonic()
+        self._comps_cache[key] = (now, estimate)
         self._comps_cache.move_to_end(key)
+        # oldest first (every write moves to the end): expired estimates are never read again, so
+        # don't keep up to COMPS_CACHE_MAX of them (tens of MB of comparables) on a small home server
+        while self._comps_cache and now - next(iter(self._comps_cache.values()))[0] >= COMPS_CACHE_TTL:
+            self._comps_cache.popitem(last=False)
         while len(self._comps_cache) > COMPS_CACHE_MAX:
             self._comps_cache.popitem(last=False)
 
@@ -1940,10 +1958,29 @@ class Monitor:
             waiting = len(self.db.vision_queue())
         except (sqlite3.Error, AttributeError):
             waiting = 0
+        too_small = enabled and not self._injected["scout"] and too_small_for_triage(settings.model)
         return scout_status_view(enabled=enabled, mode_setting=sc.mode, provider=settings.provider,
                                  base_url=settings.base_url, model=settings.model, own_endpoint=bool(sc.base_url.strip()),
                                  snap=snap, vision_waiting=waiting,
-                                 vision_wait_minutes=self.config.ai.vision_wait_minutes)
+                                 vision_wait_minutes=self.config.ai.vision_wait_minutes,
+                                 expected_sec_per_ad=self._scout_expected_speed(settings),
+                                 pass_share=sc.pass_share, max_per_hour=sc.max_per_hour, too_small=too_small)
+
+    @staticmethod
+    def _scout_expected_speed(settings: LLMSettings) -> float | None:
+        """The model research's seconds per ad for this model on this machine's tier (an endpoint
+        elsewhere: the weak always-on server, T0) — shown until the scout has measured its own."""
+        from .ai.hardware import detect_host, is_local_url
+        from .ai.model_catalog import tier_for
+
+        tier = "T0"
+        if is_local_url(settings.base_url):
+            host = detect_host(gpu=False)
+            if host.get("ram_gb"):
+                tier = tier_for(float(host["ram_gb"]), 0.0)
+                if tier == "T1" and (host.get("cores") or 0) < 6:  # 16 GB on a 4-core mini-PC: still T0 speed
+                    tier = "T0"
+        return expected_sec_per_ad(settings.model, tier) or expected_sec_per_ad(settings.model, "T0")
 
     # ------------------------------------------------------------ vision queue
     def _hold_for_vision(self, listing: Listing, search: SearchConfig, evaluation: Evaluation) -> None:

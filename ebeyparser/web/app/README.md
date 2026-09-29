@@ -31,6 +31,7 @@ js/
   screens/              one module per route (default export = screen component)
     onboarding/, settings/        Frontend A
     feed.js, deal.js, pipeline.js, searches.js, health.js (+ subfolders)   Frontend B
+    projects/     «Сборки» (Frontend C; shared pieces in features/projects-*.js, styles in css/projects.css)
   features/             Frontend B's shared pieces (deal card, composer, charts …)
 ```
 
@@ -71,6 +72,7 @@ export default function SearchesScreen({ params, query }) {
   | `/` | feed |
   | `/deal/:id` | deal |
   | `/deals/:column?` | pipeline |
+  | `/projects/*` | «Сборки»: list, `/projects/new`, `/projects/:id`, `/projects/:id/slot/:slot` (screens/projects/) |
   | `/searches/*` | searches |
   | `/health/*` | health |
   | `/settings/:section?` | settings |
@@ -148,7 +150,8 @@ api.url("/backup", { include_secrets: 1 })     // for <a href download>
 
 - Server events: `ready`, `run_started`, `run_finished`, `deal_found {ad_id, verdict, action, score, card}`,
   `deal_updated {ad_id, card}`, `health_alert`, `settings_changed`, `searches_changed`, `monitor_paused`,
-  `monitor_resumed`, `job_finished`.
+  `monitor_resumed`, `job_finished`, `project_updated {id, reason, card, alert?}` («Сборки»: toasts and the nav badge
+  live in `features/projects-live.js`).
 - Local pseudo-event: `connected`.
 - `onEvent("*", ({ type, data }) => …)` receives every event.
 - `main.js` already shows the "Новая выгодная находка" toast and bumps `newDeals`.

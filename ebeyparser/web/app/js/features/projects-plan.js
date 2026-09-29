@@ -44,6 +44,9 @@ export function PlanHero({ plan, onBudget }) {
   const understood = notes.length && /^Понял так:/.test(notes[0]) ? notes[0].replace(/^Понял так:\s*/, "").split(/,\s+/) : null;
   const rest = understood ? notes.slice(1) : notes;
   const ratio = t.ratio;
+  // unknown_price_slots may hold slot keys («item2») — show the part labels
+  const labels = Object.fromEntries((plan.slots || []).map((s) => [s.key, s.label]));
+  const unknown = (t.unknown_price_slots || []).map((k) => (labels[k] ? lower(labels[k]) : lower(k)));
   const stretchTone = ratio != null && ratio < 0.65 ? "t-red" : ratio != null && ratio < 0.9 ? "t-amber" : "";
   const newSub =
     t.savings_vs_new > 0
@@ -56,8 +59,8 @@ export function PlanHero({ plan, onBudget }) {
     <div class="pj-stats">
       <div class="pj-stat">
         <span class="overline">По рынку</span>
-        <b class="num">${approx(t.estimated_total ?? t.typical_total)}</b>
-        ${(t.unknown_price_slots || []).length > 0 && html`<span class="pj-stat__sub">без цены: ${t.unknown_price_slots.map(lower).join(", ")}</span>`}
+        <b class="num">${t.estimated_total || t.typical_total ? approx(t.estimated_total || t.typical_total) : "—"}</b>
+        ${unknown.length > 0 && html`<span class="pj-stat__sub">пока без цены: ${unknown.join(", ")}</span>`}
       </div>
       <div class="pj-stat">
         <span class="overline">Цель <${Hint} tip="Если брать каждую часть примерно на 10 % дешевле рынка." title="Цель" class="pj-q"><${Icon} name="circle-help" size=${13} /><//></span>
@@ -70,7 +73,7 @@ export function PlanHero({ plan, onBudget }) {
       <div class="pj-stat">
         <span class="overline">Новым</span>
         <b class="num">${t.new_total ? approx(t.new_total) : "—"}</b>
-        <span class="pj-stat__sub">${t.new_total ? newSub : "новыми не продаются"}</span>
+        <span class="pj-stat__sub">${t.new_total ? newSub : "цены новых не знаю"}</span>
       </div>
     </div>
     ${t.stretch_label_ru && html`<p class=${cx("pj-hero__stretch", stretchTone)}>${ru(t.stretch_label_ru)}</p>`}
@@ -311,7 +314,7 @@ export function SlotCard({ slot, plan, mode = "draft", onPick, onSlot, onRemove,
     </header>
     ${off
       ? html`<p class="pj-slot__offline">
-          ${slot.status === "have" ? "Уже есть — не ищу и не считаю в сумме." : "Не нужно — не ищу и не считаю в сумме."}
+          Не ищу эту часть и не считаю её в сумме.
           ${onSlot && html`<button type="button" class="linkish" onClick=${() => onSlot(slot.key, { status: "open" }, { undoOf: slot.status })}>Снова нужно</button>`}
         </p>`
       : body}
@@ -357,18 +360,20 @@ export function OptionDetail({ o, slot, generic, onSlot }) {
   const target = o.target_unit ?? slot.target_unit;
   const top = o.max_unit ?? slot.max_unit;
   return html`<div class="pj-detail">
-    <div class="pj-detail__head">
-      <b class="pj-detail__label">${ru(o.label)}</b>
+    ${!(generic && (slot.options || []).length === 1 && o.label === slot.label && o.source === "kb") &&
+    html`<div class="pj-detail__head">
+      ${!(generic && o.label === slot.label) && html`<b class="pj-detail__label">${ru(o.label)}</b>`}
       ${o.source !== "kb" && o.source_label && html`<${SourceChip} o=${o} />`}
-    </div>
+    </div>`}
     ${generic && o.query && html`<p class="pj-detail__query">ищу по словам: «${o.query}»</p>`}
     ${(o.specs_ru || []).length > 0 && html`<div class="chips-row pj-detail__specs">${o.specs_ru.map((s) => html`<span class="tag">${ru(s)}</span>`)}</div>`}
     <div class="pj-prices">
       <div class="pj-prices__market">
         ${p.typical
           ? html`<span>рынок <b class="num">~${money(p.typical)}</b>${o.qty > 1 ? html` <span class="muted">за штуку · ×${o.qty} = ~${money(p.total)}</span>` : ""}</span>
-              ${p.range_label ? html`<${Hint} tip=${`Обычно ${ru(p.range_label)}`} title="Разброс цен" class="pj-dotted pj-prices__src">${ru(p.label_ru)}<//>` : html`<span class="pj-prices__src">${ru(p.label_ru)}</span>`}
-              ${p.rough && html`<${Icon} name="circle-dashed" size=${12} class="pj-rough-mark" />`}`
+              ${p.range_label
+                ? html`<${Hint} tip=${`Обычно ${ru(p.range_label)}`} title="Разброс цен" class="pj-dotted pj-prices__src">${p.rough ? html`<${Icon} name="circle-dashed" size=${12} />` : ""}${ru(p.label_ru)}<//>`
+                : html`<span class="pj-prices__src">${ru(p.label_ru)}</span>`}`
           : html`<span class="muted">цены пока нет — узнаю из объявлений</span>`}
       </div>
       ${target != null &&
