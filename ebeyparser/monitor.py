@@ -30,10 +30,12 @@ from typing import Any, Callable
 
 import httpx
 
+from .ai import scout as scout_ai
 from .ai.claude import make_llm
 from .ai.evaluator import AIEvaluator, same_variant_comparables
 from .ai.prompts import MAX_PROMPT_COMPARABLES, prompt_comparables
-from .config import AppConfig, GeneralConfig, SearchConfig
+from .ai.triage import TriageEngine, TriageItem, blind_spot, scout_priority
+from .config import AppConfig, GeneralConfig, LLMSettings, SearchConfig
 from .db import Database
 from .models import AIVerdict, Comparable, DealView, Evaluation, Listing, PriceEstimate, RunSummary, utcnow
 from .notify.base import build_notifiers
@@ -52,7 +54,9 @@ from .pricing.estimator import (
     prefilter,
     prefilter_score,
 )
+from .pricing.ai_key import ProductRef, ai_keys_compatible
 from .pricing.identity import Identity, ProductKey, identify
+from .pricing.tiers import TIER_SUPER, deal_tier
 from .pricing.text import SEVERE_FLAGS, detect_red_flags, is_model_key, make_search_query, normalize
 from .errors_ru import AI_DOWN_RU, budget_message, humanize
 from .scraper.ebay_api import EBAY_NOT_CONNECTED_RU, EbayAPIError, EbayBrowseClient
@@ -117,13 +121,22 @@ class _Candidate:
     listing: Listing
     estimate: PriceEstimate | None  # reference / history market price; None = look up comparables
     hint: PriceEstimate | None = None  # any price known so far (only to rank candidates)
+    # AI scout (docs/design/AI_SCOUT.md): its priced reading of the ad, who made it a candidate,
+    # its rank when the market is unknown, and what the script alone would have stored
+    plan: Any = None  # ai.scout.ScoutPlan
+    found_by: str = "script"
+    priority: float | None = None
+    script_skip: Evaluation | None = None
 
     @property
     def discount(self) -> float:
-        """Buy cost / market price: lower = more promising. Free ads first."""
+        """Buy cost / market price: lower = more promising. Free ads first. Without a market
+        price the AI scout's interest decides (junk after everything else)."""
         listing = self.listing
         if listing.is_free:
             return 0.0
+        if self.priority is not None and (self.estimate is None or self.found_by == scout_ai.FOUND_BY_SCOUT):
+            return self.priority
         est = self.estimate or self.hint
         if listing.price is None or listing.price <= 1 or est is None or not est.market_price:
             return UNKNOWN_DISCOUNT
@@ -237,6 +250,7 @@ class Monitor:
         second_evaluator: AIEvaluator | None = None,
         notifiers: list[Any] | None = None,
         web_base_url: str | None = None,
+        scout: TriageEngine | None = None,
     ):
         self.config = config
         self.db = db
@@ -258,7 +272,17 @@ class Monitor:
             "evaluator": evaluator is not None,
             "second": second_evaluator is not None,
             "notifiers": notifiers is not None,
+            "scout": scout is not None,
         }
+        # AI scout (docs/design/AI_SCOUT.md): a small text model reads every new ad first
+        self._scout = scout
+        self._scout_llm: Any = None
+        self._scout_items: dict[str, TriageItem] = {}  # this pass: ad id -> the scout's reading
+        self._scout_plans: dict[str, Any] = {}  # ad id -> ai.scout.ScoutPlan (priced reading)
+        self._scout_deadline: float | None = None  # engine clock: end of this pass's scout time
+        self._scout_searches_left = 0
+        self._scout_hints_text: str | None = None
+        self._scout_down_reported = False
         self._second_calls = 0
         self._rate_limited: dict[str, datetime] = {}  # host -> retry_at, this pass
         self._budget: _Budget | None = None
@@ -357,6 +381,28 @@ class Monitor:
             self._second_llm = _close_soon(self._second_llm)
         if not self._injected["ebay_api"]:
             self._ebay_api = _close_soon(self._ebay_api)
+        if not self._injected["scout"]:
+            self._scout = None
+            self._scout_llm = _close_soon(self._scout_llm)
+
+    def _scout_llm_settings(self) -> LLMSettings:
+        """The scout's endpoint: its own (the always-on small model) or, left empty, the ai one."""
+        ai, sc = self.config.ai, self.config.ai.scout
+        own = bool(sc.base_url.strip())
+        return LLMSettings(
+            provider=sc.provider if own else ai.provider,
+            base_url=sc.base_url.strip() if own else ai.base_url,
+            model=(sc.model or "").strip() or ai.model,
+            api_key=(sc.api_key if own else ai.api_key) or "",
+            max_images=0,
+            timeout_seconds=sc.timeout_seconds,
+            temperature=sc.temperature,
+            max_tokens=sc.max_tokens,
+        )
+
+    @property
+    def scout_enabled(self) -> bool:
+        return self._scout is not None and (self._injected["scout"] or self.config.ai.scout.enabled)
 
     def _ensure_components(self) -> None:
         if self._client is None and not (self._injected["scraper"] and self._injected["ebay"]):
@@ -384,13 +430,21 @@ class Monitor:
                 self._second = AIEvaluator(self._second_llm, so)
             except Exception as exc:  # e.g. anthropic package missing
                 log.warning("Second opinion disabled: %s", exc)
+        sc = ai.scout
+        if self._scout is None and sc.enabled and not self._injected["scout"]:
+            try:
+                settings = self._scout_llm_settings()
+                self._scout_llm = make_llm(settings)
+                self._scout = TriageEngine.from_config(self._scout_llm, sc.model_copy(update={"model": settings.model}))
+            except Exception as exc:  # e.g. anthropic package missing: the script path works as before
+                log.warning("AI scout disabled: %s", exc)
         if self._notifiers is None:
             self._notifiers = build_notifiers(
                 self.config.notifications, web_base_url=self.web_base_url
             )
 
     async def aclose(self) -> None:
-        for name in ("_llm", "_second_llm", "_ebay_api"):
+        for name in ("_llm", "_second_llm", "_scout_llm", "_ebay_api"):
             obj = getattr(self, name)
             if obj is not None:
                 await obj.aclose()
