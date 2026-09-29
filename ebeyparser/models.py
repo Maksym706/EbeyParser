@@ -13,8 +13,9 @@ from pydantic import BaseModel, Field
 Purpose = Literal["resale", "personal"]
 Source = Literal["kleinanzeigen", "ebay"]
 Verdict = Literal["buy", "maybe", "skip"]
-DealStatus = Literal["new", "starred", "contacted", "bought", "ignored"]
-DEAL_STATUSES: tuple[str, ...] = ("new", "starred", "contacted", "bought", "ignored")
+# pipeline Избранное (starred) → Написал (contacted) → Купил (bought) → Продал (sold); ignored = hidden
+DealStatus = Literal["new", "starred", "contacted", "bought", "sold", "ignored"]
+DEAL_STATUSES: tuple[str, ...] = ("new", "starred", "contacted", "bought", "sold", "ignored")
 
 
 def utcnow() -> datetime:

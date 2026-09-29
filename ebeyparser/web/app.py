@@ -100,6 +100,7 @@ STATUS_LABELS = {
     "starred": "В избранном",
     "contacted": "Написал продавцу",
     "bought": "Куплено",
+    "sold": "Продано",
     "ignored": "Скрыто",
 }
 PURPOSE_LABELS = {"resale": "Перепродажа", "personal": "Для себя"}

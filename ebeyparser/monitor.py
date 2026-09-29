@@ -26,7 +26,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -95,6 +95,11 @@ _BUDGET_LIMITS = {
 _BUDGET_RU = {"comps_lookups": "поисков аналогов", "details_fetched": "страниц объявлений", "ai_calls": "вызовов ИИ"}
 # price filter inside a pasted Kleinanzeigen URL: /preis:100:400/ or ?minPrice=100
 _URL_PRICE_FILTER_RE = re.compile(r"preis:\d|preis::\d|[?&](?:minPrice|maxPrice)=\d", re.IGNORECASE)
+# Event hooks (web UI live updates): on_event(kind, data) with kind one of run_started,
+# run_finished, deal_found, health_alert, monitor_paused, monitor_resumed.
+EventHook = Callable[[str, dict[str, Any]], Any]
+PAUSED_STATE_KEY = "monitor:paused"  # kv_state: "1" = passes are skipped (survives restarts)
+DEAL_EVENT_ACTIONS = frozenset({"buy", "haggle", "bid"})
 
 
 class AlreadyRunningError(RuntimeError):
@@ -260,11 +265,68 @@ class Monitor:
         self._running = False
         self.last_summary: RunSummary | None = None
         self.next_run_at = None
+        self.on_event: list[EventHook] = []  # live-update hooks, see EventHook
+        self._wake: asyncio.Event | None = None  # interrupts run_forever's wait (pause/resume)
+        self._event_alerts: dict[str, datetime] = {}  # health_alert events: kind -> last emitted
+        self._paused = self._load_paused()
+        self.progress: dict[str, Any] | None = None  # current pass: search N of M (run_progress)
+        self._stage_cb: Callable[[str, str], Any] | None = None  # single-ad check: step reporter
 
     # ------------------------------------------------------------ lifecycle
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def paused(self) -> bool:
+        """Automatic passes are skipped while paused (a manual run_once still works)."""
+        return self._paused
+
+    def pause(self) -> None:
+        """Skip automatic passes until resume(); the current pass (if any) finishes. Persisted."""
+        if self._paused:
+            return
+        self._paused = True
+        self._store_paused()
+        self.next_run_at = None
+        self._poke()
+        self._emit("monitor_paused", {"paused": True})
+
+    def resume(self) -> None:
+        """Automatic passes again; an overdue pass starts right away."""
+        if not self._paused:
+            return
+        self._paused = False
+        self._store_paused()
+        self._poke()
+        self._emit("monitor_resumed", {"paused": False})
+
+    def _load_paused(self) -> bool:
+        try:
+            state = self.db.get_state(PAUSED_STATE_KEY)
+        except (sqlite3.Error, AttributeError):
+            return False
+        return bool(state and state[0] == "1")
+
+    def _store_paused(self) -> None:
+        try:
+            self.db.set_state(PAUSED_STATE_KEY, "1" if self._paused else "0")
+        except (sqlite3.Error, AttributeError) as exc:
+            log.warning("Pause state not saved: %s", exc)
+
+    def _poke(self) -> None:
+        if self._wake is not None:
+            self._wake.set()
+
+    def _emit(self, kind: str, data: dict[str, Any]) -> None:
+        """Call every on_event hook; a failing hook never breaks monitoring."""
+        for hook in list(self.on_event):
+            try:
+                result = hook(kind, data)
+                if inspect.isawaitable(result):
+                    asyncio.ensure_future(result)
+            except Exception:  # noqa: BLE001
+                log.exception("Event hook failed (%s)", kind)
 
     def update_config(self, config: AppConfig) -> None:
         """Apply a new config; network/AI components are rebuilt lazily."""
@@ -353,7 +415,20 @@ class Monitor:
 
     # --------------------------------------------------------------- running
     async def run_forever(self, stop: asyncio.Event) -> None:
+        """A pass every general.interval_minutes (±10 %) until `stop`; passes are skipped while
+        paused, and after resume() an overdue pass starts at once."""
+        due: datetime | None = None
         while not stop.is_set():
+            if self._paused:
+                self.next_run_at = None
+                await self._idle(stop, None)
+                continue
+            if due is not None:
+                left = (due - utcnow()).total_seconds()
+                if left > 0:
+                    self.next_run_at = due
+                    await self._idle(stop, left)
+                    continue
             try:
                 await self.run_once()
             except AlreadyRunningError:
@@ -362,12 +437,22 @@ class Monitor:
                 log.exception("Monitoring run crashed")
             interval = max(1.0, self.config.general.interval_minutes) * 60
             interval *= random.uniform(0.9, 1.1)  # don't hit the site on an exact beat
-            self.next_run_at = utcnow() + timedelta(seconds=interval)
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=interval)
-            except asyncio.TimeoutError:
-                pass
+            due = utcnow() + timedelta(seconds=interval)
+            self.next_run_at = due
         self.next_run_at = None
+
+    async def _idle(self, stop: asyncio.Event, timeout: float | None) -> None:
+        """Wait for `stop`, a pause/resume poke or `timeout` seconds (None = no timeout)."""
+        if self._wake is None:
+            self._wake = asyncio.Event()
+        wake = self._wake
+        waiters = [asyncio.ensure_future(stop.wait()), asyncio.ensure_future(wake.wait())]
+        try:
+            await asyncio.wait(waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
+        wake.clear()
 
     async def run_once(self) -> RunSummary:
         if self._running:
@@ -377,6 +462,7 @@ class Monitor:
             summary = RunSummary(finished_at=utcnow())
             summary.errors.append("Нет активных поисков — добавь их на странице «Поиски» или в config.yaml")
             self.last_summary = summary
+            self._emit("run_finished", summary.model_dump(mode="json"))
             return summary
 
         self._running = True
@@ -386,6 +472,8 @@ class Monitor:
         self._ai_answered = self._ai_failed = 0
         summary = self.db.start_run()
         digest: list[DealView] = []
+        self._emit("run_started", {"run_id": summary.id, "started_at": summary.started_at.isoformat(),
+                                   "searches": len(searches)})
         try:
             self._ensure_components()
             self._upkeep()
@@ -393,6 +481,9 @@ class Monitor:
             await self._retry_deliveries(summary)
             for search in searches:
                 summary.searches += 1
+                self.progress = {"run_id": summary.id, "index": summary.searches, "total": len(searches),
+                                 "search_name": search.name, "started_at": summary.started_at.isoformat()}
+                self._emit("run_progress", dict(self.progress))
                 seen_before = summary.listings_seen
                 try:
                     deals = await self._process_search(search, summary)
@@ -440,6 +531,8 @@ class Monitor:
             self.db.finish_run(summary)
             self.last_summary = summary
             self._running = False
+            self.progress = None
+            self._emit("run_finished", summary.model_dump(mode="json"))
         log.info(
             "Run finished: %d new, %d evaluated (%d early skips, %d from history), %d deals, %d notified,"
             " %d deferred; %d comps lookups, %d ad pages, %d AI calls; %d errors",
@@ -570,6 +663,10 @@ class Monitor:
                      evaluation.score, _profit_note(evaluation), why)
             if evaluation.verdict == "buy":
                 summary.deals_found += 1
+            if evaluation.verdict == "buy" or evaluation.action in DEAL_EVENT_ACTIONS:
+                self._emit("deal_found", {"ad_id": listing.ad_id, "search_name": search.name,
+                                          "title": listing.title, "verdict": evaluation.verdict,
+                                          "action": evaluation.action, "score": evaluation.score})
             if self._should_notify(evaluation):
                 deal = self.db.get_deal(listing.ad_id)
                 if deal is None:
@@ -874,10 +971,23 @@ class Monitor:
         return self._save(evaluation.model_copy(update={"stage": "full"}))
 
     # ------------------------------------------------------------ evaluation
-    async def evaluate_listing(self, listing: Listing, search: SearchConfig) -> Evaluation:
+    async def evaluate_listing(self, listing: Listing, search: SearchConfig, *,
+                               progress: Callable[[str, str], Any] | None = None) -> Evaluation:
         """Full pipeline for one ad — no budgets, no shortcuts (single-ad check);
-        stores the listing + evaluation."""
-        return await self._evaluate(listing, search, None)
+        stores the listing + evaluation. `progress(stage, text_ru)` hears about each step."""
+        previous, self._stage_cb = self._stage_cb, progress or self._stage_cb
+        try:
+            return await self._evaluate(listing, search, None)
+        finally:
+            self._stage_cb = previous
+
+    def _stage(self, stage: str, text_ru: str) -> None:
+        if self._stage_cb is None:
+            return
+        try:
+            self._stage_cb(stage, text_ru)
+        except Exception:  # noqa: BLE001 - a progress reporter never breaks a check
+            log.exception("progress callback failed")
 
     async def _evaluate(self, listing: Listing, search: SearchConfig, budget: _Budget | None = None) -> Evaluation:
         """Every step for one ad: prefilter → ad page → prefilter on the full text →
@@ -889,8 +999,11 @@ class Monitor:
             listing, keep, reasons = await self._load_detail(listing, search, source)
         if not keep:
             return self._save_skip(listing, search, reasons)
+        self._stage("market", "Ищу цены похожих…")
         estimate = await self._market_estimate(listing, search, budget)
         ask_ai = self._wants_ai(listing, estimate, search)
+        if ask_ai:
+            self._stage("ai", "Нейросеть смотрит фото…")
         return await self._conclude(listing, search, estimate, source, budget, ask_ai=ask_ai)
 
     def _save(self, evaluation: Evaluation) -> Evaluation:
@@ -1013,13 +1126,23 @@ class Monitor:
         return final.model_copy(update={"ai": evaluation.ai or final.ai, "ai_second": second})
 
     async def evaluate_url(
-        self, url: str, *, purpose: str = "resale", target_price: float | None = None
+        self, url: str, *, purpose: str = "resale", target_price: float | None = None,
+        progress: Callable[[str, str], Any] | None = None,
     ) -> DealView:
-        """Check a single ad by its link ("should I buy this?")."""
+        """Check a single ad by its link ("should I buy this?"). `progress(stage, text_ru)`
+        hears about each step: fetch, market, ai."""
         ad_id = ad_id_from_url(url)
         if not ad_id:
             raise ValueError("Не похоже на ссылку на объявление Kleinanzeigen или eBay")
+        previous, self._stage_cb = self._stage_cb, progress or self._stage_cb
+        try:
+            return await self._evaluate_url(url, ad_id, purpose=purpose, target_price=target_price)
+        finally:
+            self._stage_cb = previous
+
+    async def _evaluate_url(self, url: str, ad_id: str, *, purpose: str, target_price: float | None) -> DealView:
         self._ensure_components()
+        self._stage("fetch", "Открываю объявление…")
         source_name = "ebay" if ad_id.startswith("ebay-") else "kleinanzeigen"
         search = SearchConfig(
             name="Ручная проверка", source=source_name, purpose=purpose, target_price=target_price  # type: ignore[arg-type]
@@ -1418,6 +1541,7 @@ class Monitor:
                       every: timedelta | None = None) -> bool:
         """A service message ("AI down", "site blocks us", ...) through every channel that can
         send one; the same kind at most once per 6 hours (persisted)."""
+        self._emit_health(kind, text, every or HEALTH_ALERT_EVERY)
         if not self.config.notifications.health_alerts or not self._notifiers:
             return False
         key = f"alert:{kind}"
@@ -1429,6 +1553,16 @@ class Monitor:
             self.db.set_state(key, text)
             summary.health_alerts += 1
         return sent
+
+    def _emit_health(self, kind: str, text: str, every: timedelta) -> None:
+        """health_alert event for the web UI (even without notification channels), the same
+        kind at most once per `every` per process."""
+        last = self._event_alerts.get(kind)
+        now = utcnow()
+        if last is not None and now - last < every:
+            return
+        self._event_alerts[kind] = now
+        self._emit("health_alert", {"kind": kind, "text": text, "at": now.isoformat()})
 
     async def _send_text(self, text: str, *, exclude: set[str] | None = None) -> bool:
         sent = False

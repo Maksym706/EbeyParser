@@ -178,6 +178,7 @@ class Database:
             self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.executescript(SCHEMA)
         self._migrate_schema()
+        self._migrate_deal_state()
         self._conn.commit()
 
     def _migrate_schema(self) -> None:
@@ -842,7 +843,7 @@ class Database:
             "SELECT l.ad_id FROM listings l JOIN evaluations e ON e.ad_id = l.ad_id"
             " LEFT JOIN deal_state s ON s.ad_id = l.ad_id"
             " WHERE e.verdict = 'skip' AND l.last_seen < ?"
-            " AND COALESCE(s.status, 'new') NOT IN ('starred', 'contacted', 'bought')", (cutoff,))]
+            " AND COALESCE(s.status, 'new') NOT IN ('starred', 'contacted', 'bought', 'sold')", (cutoff,))]
         with self._lock:
             try:
                 for i in range(0, len(ids), 500):
@@ -878,11 +879,403 @@ class Database:
                 " JOIN listings l ON l.ad_id = e.ad_id"
                 " LEFT JOIN deal_state s ON s.ad_id = e.ad_id"
                 " WHERE e.verdict = 'buy' AND e.purpose = 'resale'"
-                " AND COALESCE(s.status, 'new') NOT IN ('ignored', 'bought') AND e.profit > 0"
+                " AND COALESCE(s.status, 'new') NOT IN ('ignored', 'bought', 'sold') AND e.profit > 0"
                 " AND l.first_seen >= ?",
                 (_ts(utcnow() - timedelta(days=7)),),
             ),
-            "bought_total": one("SELECT COUNT(*) FROM deal_state WHERE status = 'bought'"),
+            "bought_total": one("SELECT COUNT(*) FROM deal_state WHERE status IN ('bought', 'sold')"),
             "notified_total": one("SELECT COUNT(DISTINCT ad_id) FROM notifications"),
             "price_points_total": one("SELECT COUNT(*) FROM price_points"),
         }
+
+
+    # ============================================================ web API v1 (additive)
+    # Pipeline Избранное → Написал → Купил → Продал (starred → contacted → bought → sold): what the
+    # user really paid / got / spent on top (fees, shipping), when, and why a deal was hidden.
+    _DEAL_STATE_EXTRA = (
+        ("bought_price", "REAL"), ("bought_at", "TEXT"), ("sold_price", "REAL"), ("sold_at", "TEXT"),
+        ("extra_costs", "REAL"), ("hidden_reason", "TEXT"), ("contacted_at", "TEXT"), ("seen_at", "TEXT"),
+    )
+    _STATE_FIELDS = ("status", "note", "bought_price", "bought_at", "sold_price", "sold_at", "extra_costs",
+                     "hidden_reason", "contacted_at", "seen_at")
+    _STATE_TIMES = ("bought_at", "sold_at", "contacted_at", "seen_at", "updated_at")
+    _UNSET: Any = object()
+    _FRESH_SCORE = ("(COALESCE(e.score, -1) - MIN(20.0, MAX(0.0,"
+                    " (julianday('now') - julianday(l.first_seen)) * 12.0)))")  # -0.5 points per hour, max -20
+    _API_SORTS = {
+        "best": f"{_FRESH_SCORE} DESC, l.first_seen DESC",
+        "score": "COALESCE(e.score, -1) DESC, l.first_seen DESC",
+        "fresh": "l.first_seen DESC",
+        "newest": "l.first_seen DESC",
+        "profit": "COALESCE(e.profit, -1e9) DESC, l.first_seen DESC",
+        "price": "COALESCE(l.price, 1e9) ASC, l.first_seen DESC",
+        "roi": "COALESCE(json_extract(e.data, '$.roi'), -1e9) DESC, l.first_seen DESC",
+        "distance": "CASE WHEN json_extract(l.data, '$.distance_km') IS NULL THEN 1 ELSE 0 END,"
+                    " json_extract(l.data, '$.distance_km') ASC, COALESCE(e.score, -1) DESC",
+        "ending": "CASE WHEN json_extract(l.data, '$.ends_at') IS NULL"
+                  " OR julianday(json_extract(l.data, '$.ends_at')) < julianday('now') THEN 1 ELSE 0 END,"
+                  " julianday(json_extract(l.data, '$.ends_at')) ASC, l.first_seen DESC",
+        "updated": "COALESCE(s.updated_at, l.first_seen) DESC, l.first_seen DESC",
+    }
+    _API_DEAL_SELECT = (
+        "SELECT l.data AS l_data, e.data AS e_data, s.status AS status, s.note AS note,"
+        " s.bought_price AS bought_price, s.bought_at AS bought_at, s.sold_price AS sold_price,"
+        " s.sold_at AS sold_at, s.extra_costs AS extra_costs, s.hidden_reason AS hidden_reason,"
+        " s.contacted_at AS contacted_at, s.seen_at AS seen_at, s.updated_at AS updated_at,"
+        " EXISTS(SELECT 1 FROM notifications n WHERE n.ad_id = l.ad_id) AS notified"
+        " FROM listings l"
+        " LEFT JOIN evaluations e ON e.ad_id = l.ad_id"
+        " LEFT JOIN deal_state s ON s.ad_id = l.ad_id"
+    )
+    _API_DEAL_COUNT = ("SELECT COUNT(*) FROM listings l LEFT JOIN evaluations e ON e.ad_id = l.ad_id"
+                       " LEFT JOIN deal_state s ON s.ad_id = l.ad_id")
+
+    def _migrate_deal_state(self) -> None:
+        """deal_state columns of the pipeline (safe on old databases: only adds what's missing)."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(deal_state)")}
+        for col, kind in self._DEAL_STATE_EXTRA:
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE deal_state ADD COLUMN {col} {kind}")
+
+    @classmethod
+    def _state_extra(cls, row: sqlite3.Row) -> dict[str, Any]:
+        keys = set(row.keys())
+        out: dict[str, Any] = {}
+        for name in ("bought_price", "sold_price", "extra_costs", "hidden_reason"):
+            out[name] = row[name] if name in keys else None
+        for name in cls._STATE_TIMES:
+            raw = row[name] if name in keys else None
+            out[name] = datetime.fromisoformat(raw) if raw else None
+        return out
+
+    def deal_extras(self, ad_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """Pipeline data per ad: bought/sold prices and times, extra costs, hidden reason, when the
+        seller was contacted, when the user opened it (seen_at), last change (updated_at)."""
+        ids = list(dict.fromkeys(ad_ids))
+        out: dict[str, dict[str, Any]] = {}
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            rows = self._query(f"SELECT * FROM deal_state WHERE ad_id IN ({','.join('?' * len(chunk))})", chunk)
+            for row in rows:
+                out[row["ad_id"]] = self._state_extra(row)
+        return out
+
+    def update_deal_state(self, ad_id: str, **changes: Any) -> dict[str, Any]:
+        """Partial update of the user's state of a deal (keys of _STATE_FIELDS; datetimes allowed);
+        fields left out keep their value. Returns deal_extras() after the change."""
+        unknown = set(changes) - set(self._STATE_FIELDS)
+        if unknown:
+            raise ValueError(f"unknown deal_state fields: {sorted(unknown)}")
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM deal_state WHERE ad_id = ?", (ad_id,)).fetchone()
+            current: dict[str, Any] = {name: None for name in self._STATE_FIELDS}
+            current.update(status="new", note="")
+            if row is not None:
+                current.update({name: row[name] for name in self._STATE_FIELDS if name in row.keys()})
+            for key, value in changes.items():
+                current[key] = _ts(value) if isinstance(value, datetime) else value
+            if current["status"] not in DEAL_STATUSES:
+                raise ValueError(f"unknown status {current['status']!r}; expected one of {DEAL_STATUSES}")
+            current["note"] = current["note"] or ""
+            cols = ["ad_id", *self._STATE_FIELDS, "updated_at"]
+            values = [ad_id, *(current[name] for name in self._STATE_FIELDS), _ts(utcnow())]
+            updates = ", ".join(f"{c} = excluded.{c}" for c in cols[1:])
+            self._conn.execute(
+                f"INSERT INTO deal_state ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})"
+                f" ON CONFLICT(ad_id) DO UPDATE SET {updates}", values)
+            self._conn.commit()
+        return self.deal_extras([ad_id]).get(ad_id, {})
+
+    def mark_seen(self, ad_ids: Iterable[str], *, at: datetime | None = None) -> int:
+        """The user opened these deals (the feed's "не смотрел" filter). Returns how many were new."""
+        when = _ts(at or utcnow())
+        count = 0
+        with self._lock:
+            for ad_id in dict.fromkeys(ad_ids):
+                cur = self._conn.execute(
+                    "INSERT INTO deal_state (ad_id, status, note, updated_at, seen_at) VALUES (?, 'new', '', ?, ?)"
+                    " ON CONFLICT(ad_id) DO UPDATE SET seen_at = COALESCE(deal_state.seen_at, excluded.seen_at)"
+                    " WHERE deal_state.seen_at IS NULL", (ad_id, when, when))
+                count += cur.rowcount
+            self._conn.commit()
+        return count
+
+    @staticmethod
+    def _api_deal_where(
+        *,
+        verdicts: list[str] | None = None,
+        actions: list[str] | None = None,
+        statuses: list[str] | None = None,
+        include_ignored: bool = False,
+        purpose: str | None = None,
+        source: str | None = None,
+        search_names: list[str] | None = None,
+        q: str | None = None,
+        min_score: float | None = None,
+        min_profit: float | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
+        max_km: float | None = None,
+        shipping: bool | None = None,
+        no_flags: bool = False,
+        unseen: bool = False,
+        ai_checked: bool | None = None,
+        since: datetime | None = None,
+        ad_ids: list[str] | None = None,
+    ) -> tuple[str, list[Any]]:
+        where: list[str] = []
+        params: list[Any] = []
+
+        def among(expr: str, values: list[Any]) -> None:
+            where.append(f"{expr} IN ({','.join('?' * len(values))})")
+            params.extend(values)
+
+        if verdicts:
+            parts: list[str] = []
+            real = [v for v in verdicts if v != "none"]
+            if real:
+                parts.append(f"e.verdict IN ({','.join('?' * len(real))})")
+                params.extend(real)
+            if "none" in verdicts:
+                parts.append("e.ad_id IS NULL")
+            where.append("(" + " OR ".join(parts) + ")")
+        if actions:
+            among("json_extract(e.data, '$.action')", actions)
+        if statuses:
+            among("COALESCE(s.status, 'new')", statuses)
+        elif not include_ignored:
+            where.append("COALESCE(s.status, 'new') != 'ignored'")
+        if purpose:
+            where.append("e.purpose = ?")
+            params.append(purpose)
+        if source:
+            where.append("COALESCE(json_extract(l.data, '$.source'), 'kleinanzeigen') = ?")
+            params.append(source)
+        if search_names:
+            among("l.search_name", search_names)
+        if ad_ids:
+            among("l.ad_id", ad_ids)
+        if q:
+            where.append("(LOWER(l.title) LIKE ? OR l.ad_id = ?)")
+            params += [f"%{q.lower()}%", q.strip()]
+        if min_score is not None:
+            where.append("e.score >= ?")
+            params.append(min_score)
+        if min_profit is not None:
+            where.append("e.profit >= ?")
+            params.append(min_profit)
+        if min_price is not None:
+            where.append("l.price >= ?")
+            params.append(min_price)
+        if max_price is not None:
+            where.append("l.price <= ?")
+            params.append(max_price)
+        if max_km is not None:
+            where.append("json_extract(l.data, '$.distance_km') <= ?")
+            params.append(max_km)
+        if shipping is True:
+            where.append("(json_extract(l.data, '$.shipping_possible') = 1"
+                         " OR json_extract(l.data, '$.shipping_cost') IS NOT NULL)")
+        elif shipping is False:
+            where.append("(COALESCE(json_extract(l.data, '$.shipping_possible'), 0) = 0"
+                         " AND json_extract(l.data, '$.shipping_cost') IS NULL)")
+        if no_flags:
+            where.append("COALESCE(json_array_length(json_extract(e.data, '$.red_flags')), 0) = 0"
+                         " AND COALESCE(json_array_length(json_extract(e.data, '$.ai.red_flags')), 0) = 0"
+                         " AND COALESCE(json_array_length(json_extract(e.data, '$.ai_second.red_flags')), 0) = 0")
+        if unseen:
+            where.append("s.seen_at IS NULL")
+        if ai_checked is not None:
+            where.append("json_extract(e.data, '$.ai_checked') = ?")
+            params.append(1 if ai_checked else 0)
+        if since is not None:
+            where.append("l.first_seen >= ?")
+            params.append(_ts(since))
+        return (" WHERE " + " AND ".join(where)) if where else "", params
+
+    def find_deals(
+        self, *, sort: str = "best", limit: int = 50, offset: int = 0, **filters: Any
+    ) -> tuple[list[tuple[DealView, dict[str, Any]]], int]:
+        """Deals for the JSON API (filters of _api_deal_where, sorts of _API_SORTS, a page).
+        -> ([(deal, deal_extras), ...], total matching)."""
+        where, params = self._api_deal_where(**filters)
+        order = self._API_SORTS.get(sort, self._API_SORTS["best"])
+        rows = self._query(self._API_DEAL_SELECT + where + f" ORDER BY {order} LIMIT ? OFFSET ?",
+                           params + [max(0, int(limit)), max(0, int(offset))]) if limit > 0 else []
+        total = int(self._query(self._API_DEAL_COUNT + where, params)[0][0])
+        return [(self._deal_from_row(r), self._state_extra(r)) for r in rows], total
+
+    def count_deals_v1(self, **filters: Any) -> int:
+        where, params = self._api_deal_where(**filters)
+        return int(self._query(self._API_DEAL_COUNT + where, params)[0][0])
+
+    def get_deal_extras(self, ad_id: str) -> tuple[DealView, dict[str, Any]] | None:
+        rows = self._query(self._API_DEAL_SELECT + " WHERE l.ad_id = ?", (ad_id,))
+        return (self._deal_from_row(rows[0]), self._state_extra(rows[0])) if rows else None
+
+    def pipeline_rows(self) -> list[dict[str, Any]]:
+        """Every deal on the pipeline (starred / contacted / bought / sold) with its money data."""
+        rows = self._query(
+            "SELECT s.ad_id, s.status, s.bought_price, s.bought_at, s.sold_price, s.sold_at, s.extra_costs,"
+            " s.contacted_at, s.updated_at, e.profit AS expected_profit, e.purpose AS purpose,"
+            " json_extract(e.data, '$.estimate.market_price') AS market_price, l.price AS price"
+            " FROM deal_state s JOIN listings l ON l.ad_id = s.ad_id LEFT JOIN evaluations e ON e.ad_id = s.ad_id"
+            " WHERE s.status IN ('starred', 'contacted', 'bought', 'sold')")
+        out = []
+        for r in rows:
+            item = {k: r[k] for k in r.keys()}
+            for name in ("bought_at", "sold_at", "contacted_at", "updated_at"):
+                item[name] = datetime.fromisoformat(item[name]) if item[name] else None
+            out.append(item)
+        return out
+
+    def search_stats(self) -> dict[str, dict[str, Any]]:
+        """Per search name: ads seen (total / 24 h), buy / maybe verdicts (total / 7 days), still
+        unevaluated, newest ad, and search_state (first/last run, end of the learning pass)."""
+        day_ago = _ts(utcnow() - timedelta(days=1))
+        week_ago = _ts(utcnow() - timedelta(days=7))
+        out: dict[str, dict[str, Any]] = {}
+        for r in self._query(
+            "SELECT l.search_name AS name, COUNT(*) AS ads,"
+            " SUM(CASE WHEN l.first_seen >= ? THEN 1 ELSE 0 END) AS ads_24h,"
+            " SUM(CASE WHEN e.verdict = 'buy' THEN 1 ELSE 0 END) AS buy,"
+            " SUM(CASE WHEN e.verdict = 'buy' AND l.first_seen >= ? THEN 1 ELSE 0 END) AS buy_7d,"
+            " SUM(CASE WHEN e.verdict = 'maybe' THEN 1 ELSE 0 END) AS maybe,"
+            " SUM(CASE WHEN e.ad_id IS NULL THEN 1 ELSE 0 END) AS pending,"
+            " MAX(l.first_seen) AS last_new_at"
+            " FROM listings l LEFT JOIN evaluations e ON e.ad_id = l.ad_id"
+            " WHERE l.search_name != '' GROUP BY l.search_name", (day_ago, week_ago)):
+            out[r["name"]] = {
+                "ads": int(r["ads"] or 0), "ads_24h": int(r["ads_24h"] or 0), "buy": int(r["buy"] or 0),
+                "buy_7d": int(r["buy_7d"] or 0), "maybe": int(r["maybe"] or 0), "pending": int(r["pending"] or 0),
+                "last_new_at": datetime.fromisoformat(r["last_new_at"]) if r["last_new_at"] else None,
+            }
+        empty = {"ads": 0, "ads_24h": 0, "buy": 0, "buy_7d": 0, "maybe": 0, "pending": 0, "last_new_at": None}
+        for r in self._query("SELECT name, first_run_at, last_run_at, baseline_at FROM search_state"):
+            info = out.setdefault(r["name"], dict(empty))
+            for key in ("first_run_at", "last_run_at", "baseline_at"):
+                info[key] = datetime.fromisoformat(r[key]) if r[key] else None
+        for info in out.values():
+            for key in ("first_run_at", "last_run_at", "baseline_at"):
+                info.setdefault(key, None)
+        return out
+
+    def activity_since(self, since: datetime) -> dict[str, list[Any]]:
+        """Raw timestamps (ISO text) for statistics per day, all since `since`: listings
+        (first_seen), evaluated (evaluated_at), deals ((first_seen, verdict, purpose, profit, status,
+        action) of buy/maybe), notified (first delivery per ad), bought ((when, price)), sold ((when,
+        bought_price, sold_price, extra_costs))."""
+        s = _ts(since)
+        return {
+            "listings": [r[0] for r in self._query("SELECT first_seen FROM listings WHERE first_seen >= ?", (s,))],
+            "evaluated": [r[0] for r in self._query(
+                "SELECT evaluated_at FROM evaluations WHERE evaluated_at >= ?", (s,))],
+            "deals": [tuple(r) for r in self._query(
+                "SELECT l.first_seen, e.verdict, e.purpose, e.profit, COALESCE(st.status, 'new'),"
+                " COALESCE(json_extract(e.data, '$.action'), '')"
+                " FROM evaluations e JOIN listings l ON l.ad_id = e.ad_id"
+                " LEFT JOIN deal_state st ON st.ad_id = e.ad_id"
+                " WHERE e.verdict IN ('buy', 'maybe') AND l.first_seen >= ?", (s,))],
+            "notified": [r[0] for r in self._query(
+                "SELECT MIN(sent_at) AS first FROM notifications WHERE channel NOT LIKE '\\_%' ESCAPE '\\'"
+                " GROUP BY ad_id HAVING MIN(sent_at) >= ?", (s,))],
+            "bought": [tuple(r) for r in self._query(
+                "SELECT COALESCE(bought_at, updated_at), bought_price FROM deal_state"
+                " WHERE status IN ('bought', 'sold') AND COALESCE(bought_at, updated_at) >= ?", (s,))],
+            "sold": [tuple(r) for r in self._query(
+                "SELECT COALESCE(sold_at, updated_at), bought_price, sold_price, extra_costs FROM deal_state"
+                " WHERE status = 'sold' AND COALESCE(sold_at, updated_at) >= ?", (s,))],
+        }
+
+    def notify_candidates(self, since: datetime, *, min_score: float, verdicts: list[str]) -> list[str]:
+        """first_seen of evaluated deals since `since` that pass a notification threshold
+        (verdict + score, not hidden, not no_alert) — for "how many alerts would I have got"."""
+        if not verdicts:
+            return []
+        rows = self._query(
+            "SELECT l.first_seen FROM evaluations e JOIN listings l ON l.ad_id = e.ad_id"
+            " LEFT JOIN deal_state s ON s.ad_id = e.ad_id"
+            f" WHERE e.verdict IN ({','.join('?' * len(verdicts))}) AND e.score >= ? AND l.first_seen >= ?"
+            " AND COALESCE(s.status, 'new') != 'ignored'"
+            " AND COALESCE(json_extract(e.data, '$.no_alert'), 0) = 0",
+            [*verdicts, min_score, _ts(since)])
+        return [r[0] for r in rows]
+
+    def delivery_problems(self, since: datetime) -> list[dict[str, Any]]:
+        """Channels with deliveries that failed since `since` and never went through."""
+        rows = self._query(
+            "SELECT a.channel AS channel, COUNT(*) AS failed, MAX(a.last_at) AS last_at, a.last_error AS last_error"
+            " FROM notify_attempts a WHERE a.last_at >= ?"
+            " AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.ad_id = a.ad_id AND n.channel = a.channel)"
+            " GROUP BY a.channel ORDER BY a.channel", (_ts(since),))
+        return [{"channel": r["channel"], "failed": int(r["failed"]),
+                 "last_at": datetime.fromisoformat(r["last_at"]) if r["last_at"] else None,
+                 "last_error": r["last_error"] or ""} for r in rows]
+
+    def last_deliveries(self) -> dict[str, datetime]:
+        """Per real channel: when the last deal was delivered."""
+        rows = self._query("SELECT channel, MAX(sent_at) AS last FROM notifications"
+                           " WHERE channel NOT LIKE '\\_%' ESCAPE '\\' GROUP BY channel")
+        return {r["channel"]: datetime.fromisoformat(r["last"]) for r in rows if r["last"]}
+
+    def delete_listings(self, ad_ids: Iterable[str]) -> int:
+        """Forget listings with everything attached (evaluation, state, deliveries, own price point)."""
+        ids = list(dict.fromkeys(ad_ids))
+        removed = 0
+        with self._lock:
+            try:
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    marks = ",".join("?" * len(chunk))
+                    for table in ("evaluations", "deal_state", "notifications", "notify_attempts", "alert_queue",
+                                  "price_points"):
+                        self._conn.execute(f"DELETE FROM {table} WHERE ad_id IN ({marks})", chunk)
+                    removed += self._conn.execute(f"DELETE FROM listings WHERE ad_id IN ({marks})", chunk).rowcount
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return removed
+
+    def delete_runs(self, run_ids: Iterable[int]) -> int:
+        ids = [int(i) for i in run_ids]
+        if not ids:
+            return 0
+        return self._execute(f"DELETE FROM runs WHERE id IN ({','.join('?' * len(ids))})", ids).rowcount
+
+    def reset_price_history(self) -> int:
+        """Forget every remembered price (the market is learned again from scratch)."""
+        with self._lock:
+            self._conn.execute("DELETE FROM price_point_words")
+            removed = self._conn.execute("DELETE FROM price_points").rowcount
+            self._conn.commit()
+        return removed
+
+    def reset_all(self) -> dict[str, int]:
+        """Delete all data (listings, verdicts, statuses, runs, prices, bookkeeping); searches in the
+        config stay and start with a new learning pass."""
+        counts: dict[str, int] = {}
+        with self._lock:
+            try:
+                for table in ("price_point_words", "price_points", "evaluations", "deal_state", "notifications",
+                              "notify_attempts", "alert_queue", "listings", "runs", "search_state"):
+                    counts[table] = self._conn.execute(f"DELETE FROM {table}").rowcount
+                self._conn.execute("DELETE FROM kv_state WHERE key NOT LIKE 'migration:%'")
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return counts
+
+    def backup_to(self, target: str | Path) -> None:
+        """Consistent copy of the database file (SQLite online backup)."""
+        dest = sqlite3.connect(str(target))
+        try:
+            with self._lock:
+                self._conn.backup(dest)
+        finally:
+            dest.close()
+
+    def table_counts(self) -> dict[str, int]:
+        return {t: int(self._query(f"SELECT COUNT(*) FROM {t}")[0][0])
+                for t in ("listings", "evaluations", "price_points", "runs", "deal_state")}
