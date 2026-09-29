@@ -610,9 +610,12 @@ def test_monitor_state_run_pause_resume(api) -> None:
 
 
 # ------------------------------------------------------------------ stats / summary
-def test_summary_today_and_stats(api) -> None:
+def test_summary_today_and_stats(api, monkeypatch) -> None:
     c, app, config, db, *_ = api
     config.searches = [SearchConfig(name="x", query="y")]
+    # "today" starts at local midnight: shortly after it the seeded deals would belong to yesterday
+    from ebeyparser.web.api import routes_deals
+    monkeypatch.setattr(routes_deals, "local_midnight", lambda now=None: utcnow() - timedelta(hours=20))
     today = c.get("/api/v1/summary/today").json()
     assert today["count"] >= 1 and today["best"]["id"] and today["headline_ru"].startswith("Найдено")
     assert today["potential_profit"] > 0 and today["unseen_good"] >= today["count"]
