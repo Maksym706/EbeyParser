@@ -228,7 +228,8 @@ function SearchCard({ s, now, icon, editable, onToggle, onDuplicate, onDelete })
   const cfg = s.config || {};
   const place = cfg.location_label || usePlaceName(cfg.location) || cfg.location;
   const chips = [];
-  if (s.source === "ebay") chips.push(cfg.local_pickup_only ? `Самовывоз ${place || ""} · ${cfg.radius_km || 0} км` : "вся Германия");
+  if (s.where_ru && (s.source !== "ebay" || cfg.local_pickup_only)) chips.push(s.where_ru);
+  else if (s.source === "ebay") chips.push(cfg.local_pickup_only ? `Самовывоз ${place || ""} · ${cfg.radius_km || 0} км` : "вся Германия");
   else if (place) chips.push(`${place}${cfg.radius_km ? ` · ${cfg.radius_km} км` : " · только город"}`);
   if (s.purpose === "personal") {
     // «Для себя до 600 € · до 500 €» read as nonsense: one clear chip per number

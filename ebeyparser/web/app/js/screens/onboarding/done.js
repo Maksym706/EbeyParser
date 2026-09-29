@@ -109,7 +109,7 @@ export function DoneStep({ draft, go }) {
       else {
         // a site pause means the first check waits: never promise «уже идёт» then (P1-23)
         await refreshMonitor().catch(() => {});
-        const cd = cooldownOf(appStore.get().monitor);
+        const cd = cooldownOf((res && res.cooldown && { cooldown: res.cooldown }) || appStore.get().monitor);
         toast.success("Готово! Изучаю рынок", {
           message: cd
             ? `${cd.site} попросил паузу — первая проверка начнётся${cd.label ? ` в ${cd.label}` : " сразу после неё"}`
@@ -140,7 +140,11 @@ export function DoneStep({ draft, go }) {
         icon="layout-grid"
         state=${nothing ? "warn" : lostWishes ? "warn" : "ok"}
         text=${whatText}
-        sub=${lostWishes ? `Список «для себя» (${count(draftWishes, "вещь", "вещи", "вещей")}) не сохранится — на шаге «Деньги» выбрана только перепродажа` : ""}
+        sub=${lostWishes
+          ? `Список «для себя» (${count(draftWishes, "вещь", "вещи", "вещей")}) не сохранится — на шаге «Деньги» выбрана только перепродажа`
+          : !rerun && preview && preview.summary_ru && !preview.stale
+            ? `${preview.summary_ru}${preview.summary_ru.endsWith(".") ? "" : "."}`
+            : ""}
       />
       <${Row} go=${go} to="money" icon="wallet" text=${`${strategy} · до ${money(draft.max_price)} за вещь`} />
       <${Row} go=${go} to="ai" icon="scan-eye" state=${draft.ai.done ? "ok" : "skip"} text=${draft.ai.done ? `Нейросеть: ${draft.ai.model || "подключена"}` : "Нейросеть — пропущено"} sub=${draft.ai.done ? "" : "Фото проверять не буду, уведомления придут с пометкой «фото не проверены»"} />

@@ -46,6 +46,7 @@ export function normalize(m) {
   };
 }
 
+const pauseText = (cd) => (cd ? `${cd.site} на паузе${cd.label ? ` до ${cd.label}` : ""} — проверю сразу после` : "Сайт попросил паузу — проверю сразу после неё");
 const siteName = (host) => (/ebay/i.test(String(host || "")) ? "eBay" : "Kleinanzeigen");
 
 /**
@@ -91,17 +92,19 @@ export async function monitorAction(kind) {
   };
   const [loading, done] = labels[kind];
   const cd = kind === "run" ? cooldownOf(appStore.get().monitor) : null;
+  const id = toast({ kind: "loading", title: loading });
+  let started = false;
   try {
-    await toast.promise(api.post(`/monitor/${kind}`), {
-      loading,
-      // during a block pause the site is skipped: say so instead of promising a check
-      success: cd ? `${cd.site} на паузе${cd.label ? ` до ${cd.label}` : ""} — проверю его сразу после` : done,
-      error: (e) => e.message,
-    });
-  } catch {
-    /* toast shown */
+    const res = await api.post(`/monitor/${kind}`);
+    started = kind === "run" && !(res && res.started === false);
+    const paused = kind === "run" && ((res && res.cooldown) || cd);
+    // during a block pause the site is skipped: say so instead of promising a check (P1-23)
+    toast({ id, kind: paused ? "info" : "success", title: (res && res.message_ru) || (paused ? pauseText(cd) : done) });
+  } catch (e) {
+    if (e.code === "cooldown") toast({ id, kind: "info", title: e.message || pauseText(cd) });
+    else toast({ id, kind: "error", title: e.message, details: e.details });
   }
-  if (kind === "run") appStore.set({ monitor: { ...(appStore.get().monitor || {}), running: true } });
+  if (started) appStore.set({ monitor: { ...(appStore.get().monitor || {}), running: true } });
   refreshMonitor();
 }
 

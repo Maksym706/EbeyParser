@@ -161,13 +161,16 @@ function LearningHero({ first, monitor }) {
   const cd = cooldownOf(monitor, now);
   const at = nextCheckAt(monitor, now);
   const stopped = monitor && (monitor.state === "stopped" || monitor.available === false);
+  // the server knows when the first alerts can come (after a pause, the next run); else our estimate
+  const lbl = first.first_alerts_label || "";
+  const around = lbl ? (/^\d/.test(lbl) ? `около ${lbl}` : lbl) : "";
   const when = monitor && monitor.paused
     ? "проверки на паузе — нажми «Продолжить»"
     : stopped
       ? "автопроверка выключена — нажми «Проверить сейчас»"
       : cd
-        ? `первые уведомления после паузы${cd.label ? `, около ${cd.label}` : ""}`
-        : `первые уведомления после следующей проверки${at ? ` (~${hm(at)})` : ""}`;
+        ? `первые уведомления после паузы${around ? `, ${around}` : cd.label ? `, около ${cd.label}` : ""}`
+        : `первые уведомления после следующей проверки${lbl ? ` (${around})` : at ? ` (~${hm(at)})` : ""}`;
   return html`<section class="hero hero--learning" aria-label="Изучаю рынок">
     <div class="hero__main">
       <div class="overline"><${Icon} name="hourglass" size=${12} />Первый запуск</div>

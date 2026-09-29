@@ -25,7 +25,7 @@ const CHANNEL_RU = { telegram: "Telegram", email: "почта", mail: "почт�
 /** GET /health `monitor` + `sites` → the normalised monitor used by the shell helpers. */
 function monitorOf(d) {
   const m = d.monitor || {};
-  return normalize({ ...m, http: m.http && m.http.length ? m.http : d.sites || [] });
+  return normalize({ ...m, cooldown: m.cooldown || d.cooldown || null, http: m.http && m.http.length ? m.http : d.sites || [] });
 }
 
 function clock(seconds) {
@@ -82,7 +82,9 @@ function Overview() {
   if (h.error) return html`<${ErrorState} error=${h.error} onRetry=${h.reload} />`;
   if (!h.data) return html`<${OverviewSkeleton} />`;
   const d = h.data;
-  const channels = ((d.notifications && d.notifications.channels) || []).filter((c) => c.enabled && c.configured !== false);
+  const n = d.notifications || {};
+  const channels = (n.channels || []).filter((c) => c.enabled && c.configured !== false);
+  const anyChannel = n.any_channel ?? channels.length > 0;
   return html`
     <${TopBanner} d=${d} reload=${h.reload} now=${now} />
     <div class="htiles">
@@ -96,9 +98,9 @@ function Overview() {
     <${Runs} runs=${d.runs || []} />
     <p class="heartbeat">
       <${Icon} name="bell-ring" size=${16} />
-      ${!channels.length
+      ${!anyChannel
         ? html`Утренний отчёт «жив» приходит в Telegram или на почту — <a href="/settings/notifications">подключи уведомления</a>, чтобы знать, что программа работает.`
-        : d.notifications && d.notifications.heartbeat_hour != null
+        : n.heartbeat_hour != null && n.heartbeat_active !== false
           ? `Каждый день в ${d.notifications.heartbeat_hour}:00 пришлю отчёт «жив». Нет отчёта — значит, компьютер или программа выключены.`
           : html`Утренний отчёт «жив» выключен — <a href="/settings/notifications">включи его</a>, чтобы знать, что программа работает.`}
     </p>
@@ -443,7 +445,7 @@ function Runs({ runs }) {
       ? html`<div class="runlist">
           ${runs.slice(0, 20).map(
             (r) => html`<div class="runcard">
-              <div class="runcard__top"><b>${dateTime(r.started_at)}</b><span class="muted">${r.duration_seconds != null ? span(r.duration_seconds) : "идёт…"}</span></div>
+              <div class="runcard__top"><b>${r.started_at_label || dateTime(r.started_at)}</b><span class="muted">${r.duration_seconds != null ? span(r.duration_seconds) : "идёт…"}</span></div>
               <div class="runcard__nums num">
                 <span>${r.new_listings} новых</span><span>${r.evaluated} оценено</span><span class=${r.deals_found ? "t-green" : ""}>${r.deals_found} выгодных</span><span>${r.notified} увед.</span>
               </div>
@@ -462,7 +464,7 @@ function Runs({ runs }) {
           <tbody>
             ${runs.slice(0, 30).map(
               (r) => html`<tr>
-                  <td>${dateTime(r.started_at)}</td>
+                  <td>${r.started_at_label || dateTime(r.started_at)}</td>
                   <td class="muted">${r.duration_seconds != null ? span(r.duration_seconds) : "идёт…"}</td>
                   <td class="r num">${number(r.new_listings)}</td>
                   <td class="r num">${number(r.evaluated)}</td>

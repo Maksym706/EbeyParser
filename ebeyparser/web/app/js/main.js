@@ -131,7 +131,8 @@ function App() {
       onEvent("health_alert", (a) => {
         appStore.set({ badges: { ...(appStore.get().badges || {}), health: "dot-red" } });
         // the toast has its own warning icon: drop a leading ⚠ from the text; times in Berlin
-        const text = a && a.text ? humanize(localizeText(String(a.text).replace(/^[\s⚠️❗‼️🚫⛔]+/u, ""))) : null;
+        const raw = a && (a.text_ru || a.text);
+        const text = raw ? humanize(localizeText(String(raw).replace(/^[\s⚠️❗‼️🚫⛔]+/u, ""))) : null;
         if (text && text.message) toast.warning(text.message, { details: text.details, action: { label: "Состояние", href: "/health" } });
       }),
       onEvent("connected", () => refreshMonitor()),

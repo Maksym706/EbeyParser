@@ -341,10 +341,10 @@ function UrlField({ f, set, error, setNamed }) {
   const parse = async (raw) => {
     const url = String(raw || "").trim();
     if (!url) return;
-    if (!/^https?:\/\//i.test(url) || !/kleinanzeigen\.de/i.test(url)) {
-      // say why nothing happened (P1-12)
+    if (!/^https?:\/\//i.test(url) || !/kleinanzeigen\.de|ebay\.[a-z.]+\//i.test(url)) {
+      // say why nothing happened (P1-12); eBay search links are understood by the server too
       setParsed(null);
-      setErr(/ebay\./i.test(url) ? "Это ссылка eBay — для eBay выбери «Новый поиск → eBay»" : "Это не ссылка Kleinanzeigen — открой поиск на kleinanzeigen.de и скопируй адрес из строки браузера");
+      setErr("Это не ссылка Kleinanzeigen — открой поиск на kleinanzeigen.de и скопируй адрес из строки браузера");
       return;
     }
     setBusy(true);
@@ -353,15 +353,20 @@ function UrlField({ f, set, error, setNamed }) {
       const r = await api.post("/searches/parse-url", { url });
       setParsed(r);
       const s = r.search || {};
+      const source = s.source || r.source || "kleinanzeigen";
       set({
         url,
+        source,
         name: s.name || r.suggested_name,
+        query: s.query ?? r.query ?? "",
         category_id: s.category_id ?? r.category_id,
         category_name: s.category_name || r.category_name || "",
-        min_price: r.min_price,
-        max_price: r.max_price,
-        location: r.location || "",
-        radius_km: r.radius_km,
+        min_price: s.min_price ?? r.min_price,
+        max_price: s.max_price ?? r.max_price,
+        location: s.location ?? r.location ?? "",
+        location_label: s.location_label || r.location_label || null,
+        radius_km: s.radius_km ?? r.radius_km,
+        ...(source === "ebay" ? { buying_options: s.buying_options || r.buying_options || [], ebay_category_ids: s.ebay_category_ids || r.ebay_category_ids || [] } : {}),
       });
       setNamed(false);
     } catch (e) {
@@ -381,6 +386,7 @@ function UrlField({ f, set, error, setNamed }) {
         value=${f.url || ""}
         icon="link"
         placeholder="https://www.kleinanzeigen.de/s-berlin/…"
+        invalid=${Boolean(error || err)}
         inputmode="url"
         onChange=${(v) => (setErr(null), set({ url: v }))}
         onBlur=${() => parse(f.url)}
@@ -392,7 +398,8 @@ function UrlField({ f, set, error, setNamed }) {
       />
       <${Button} variant="secondary" loading=${busy} onClick=${() => parse(f.url)}>Разобрать<//>
     </div>
-    ${parsed && html`<p class="sedit__parsed"><${Icon} name="circle-check" size=${16} />${parsed.summary_ru}</p>`}`}
+    ${parsed && html`<p class="sedit__parsed"><${Icon} name="circle-check" size=${16} />${parsed.summary_ru}</p>`}
+    ${parsed && parsed.warning_ru && html`<p class="sedit__parsed sedit__parsed--warn"><${Icon} name="triangle-alert" size=${16} />${parsed.warning_ru}</p>`}`}
   <//>`;
 }
 

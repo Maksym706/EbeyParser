@@ -213,11 +213,12 @@ export function AiConnect({ save = true, onDone, current, onChoice }) {
   const presets = (data && data.gpu_presets) || [];
   const chosen = presets.find((p) => p.key === gpu);
   // AI is set up (a saved model) but nobody answers: LM Studio is just closed — not «install it» (P1-21)
-  if (current && current.model && current.enabled) {
+  if (variant === "not_running" || (current && current.model && current.enabled)) {
+    const title = variant === "not_running" && data.message_ru ? humanize(data.message_ru).message : "LM Studio не отвечает — похоже, он закрыт";
     return html`<div class="ai-card ai-card--amber">
       <div class="ai-card__head">
         <${Icon} name="triangle-alert" size=${20} class="text-amber" />
-        <b>LM Studio не отвечает — похоже, он закрыт</b>
+        <b>${title}</b>
       </div>
       <${Steps}
         items=${[

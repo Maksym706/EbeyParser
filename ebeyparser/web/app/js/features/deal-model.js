@@ -576,6 +576,7 @@ export function ruDateText(text, now = new Date()) {
   if (!t) return "";
   t = t.replace(/^(verkauft|sold|beendet|endet)\s*(am\s*)?/i, "");
   t = t.replace(/\bheute\b,?\s*/i, "сегодня ").replace(/\bgestern\b,?\s*/i, "вчера ").replace(/\bvorgestern\b,?\s*/i, "позавчера ");
+  t = t.replace(/^(сегодня|вчера|позавчера),\s*/, "$1 ");
   t = t.replace(/^(сегодня|вчера|позавчера)\s+(\d{1,2}:\d{2})/, "$1 в $2");
   t = t.replace(/^sofort-?kaufen$/i, "купить сразу");
   const year = String(now.getFullYear());

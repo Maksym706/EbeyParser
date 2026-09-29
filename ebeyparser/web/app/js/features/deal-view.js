@@ -248,7 +248,8 @@ function BottomBar({ deal, dec }) {
 // ------------------------------------------------------------------ title
 function TitleBlock({ deal, menu }) {
   const place = distanceText(deal);
-  const posted = ruDateText(deal.posted_at_text);
+  const posted = ruDateText(deal.posted_at_ru || deal.posted_at_text);
+  const condition = deal.condition_ru || ruCondition(deal.condition);
   const shipping =
     deal.shipping_cost != null && deal.shipping_cost > 0
       ? `+ ${money(deal.shipping_cost, { cents: deal.shipping_cost % 1 !== 0 })} доставка`
@@ -277,7 +278,7 @@ function TitleBlock({ deal, menu }) {
       ${deal.search_name &&
       html`<a class="tag tag--link" href=${`/?search=${encodeURIComponent(deal.search_name)}`}><${Icon} name="radar" size=${12} />${deal.search_name}</a>`}
       ${deal.purpose === "personal" && html`<span class="tag tone-profit"><${Icon} name="piggy-bank" size=${12} />Для себя</span>`}
-      ${deal.condition && html`<span class="tag" title=${deal.condition !== ruCondition(deal.condition) ? deal.condition : undefined}><${Icon} name="package" size=${12} />${ruCondition(deal.condition)}</span>`}
+      ${condition && html`<span class="tag" title=${deal.condition && deal.condition !== condition ? deal.condition : undefined}><${Icon} name="package" size=${12} />${condition}</span>`}
     </div>
   </div>`;
 }
@@ -521,7 +522,7 @@ function Market({ deal, tone }) {
           <span class="comps__meta">
             ${c.sold && !/продано/i.test(c.source_label || "") && html`<span class="tag tone-info">продано</span>`}
             <span class=${cx("tag", c.sold && "tone-info")}>${c.source_label || c.source}</span>
-            ${c.date_text && ruDateText(c.date_text) && html`<span class="muted">${ruDateText(c.date_text)}</span>`}
+            ${(c.date_ru || c.date_text) && ruDateText(c.date_ru || c.date_text) && html`<span class="muted">${ruDateText(c.date_ru || c.date_text)}</span>`}
           </span>
           <span class="comps__price num">${money(c.price)}</span>
         </a>`,
@@ -590,14 +591,18 @@ function AiFindings({ deal }) {
 
 function Description({ deal }) {
   const text = deal.listing && deal.listing.description;
-  const attrs = (deal.listing && deal.listing.attributes) || {};
+  const listing = deal.listing || {};
+  // the server's Russian labels ([{key, key_ru, value, value_ru}]) when present, else our own mapping
+  const attrs = Array.isArray(listing.attributes_ru)
+    ? listing.attributes_ru.map((a) => [a.key_ru || ruAttrKey(a.key), a.value_ru || ruAttrValue(a.key, a.value), a.key])
+    : Object.entries(listing.attributes || {}).map(([k, v]) => [ruAttrKey(k), ruAttrValue(k, v), k]);
   const [open, setOpen] = useState(false);
-  if (!text && !Object.keys(attrs).length) return null;
+  if (!text && !attrs.length) return null;
   const long = text && text.length > 420;
   return html`<section class="dv-sec">
     <h3 class="dv-sec__title"><${Icon} name="file-text" size=${18} />Описание продавца</h3>
-    ${Object.keys(attrs).length > 0 &&
-    html`<dl class="attrs">${Object.entries(attrs).map(([k, v]) => html`<div><dt title=${ruAttrKey(k) !== k ? k : undefined}>${ruAttrKey(k)}</dt><dd>${ruAttrValue(k, v)}</dd></div>`)}</dl>`}
+    ${attrs.length > 0 &&
+    html`<dl class="attrs">${attrs.map(([k, v, de]) => html`<div><dt title=${de && de !== k ? de : undefined}>${k}</dt><dd>${v}</dd></div>`)}</dl>`}
     ${text &&
     html`<p class=${cx("desc", long && !open && "is-clamped")} lang="de">${text}</p>
       ${long && html`<button type="button" class="linkish" onClick=${() => setOpen(!open)}>${open ? "Свернуть" : "Показать полностью"}</button>`}`}
