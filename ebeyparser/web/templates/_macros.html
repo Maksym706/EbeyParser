@@ -40,8 +40,8 @@
     <span class="media-bl">
       {% if c.is_auction %}<span class="media-chip {{ 'urgent' if c.ends_soon }}">{{ icon('gavel') }}{% if c.ends_iso %}<span data-ends-at="{{ c.ends_iso }}">{{ 'заканчивается ' ~ c.ends_text if c.ends_text != 'завершён' else 'аукцион завершён' }}</span>{% else %}Аукцион{% endif %}</span>{% endif %}
       {% if c.purpose == 'personal' %}<span class="media-chip">{{ icon('user') }}Для себя</span>{% endif %}
-      <span class="media-chip media-src"><span class="src src-{{ c.source }}">{{ c.source_label }}</span></span>
     </span>
+    <span class="media-tr"><span class="media-chip media-src"><span class="src src-{{ c.source }}">{{ c.source_label }}</span></span></span>
   </a>
   <div class="deal-body">
     <div class="deal-head">
@@ -66,6 +66,7 @@
     </div>
     {% endif %}
     {% if c.summary %}<p class="summary" title="{{ c.summary }}">{{ icon('sparkles') }}{{ c.summary }}</p>{% endif %}
+    {% if c.unchecked %}<div class="flags"><span class="flag" title="Нейросеть была недоступна — посмотри фото сам">{{ icon('alert') }}<span>Фото не проверены ИИ</span></span></div>{% endif %}
     {% if c.flags %}
     <div class="flags">
       {% for f in c.flags[:2] %}<span class="flag" title="{{ f }}">{{ icon('alert') }}<span>{{ f }}</span></span>{% endfor %}

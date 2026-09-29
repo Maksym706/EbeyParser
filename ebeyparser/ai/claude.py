@@ -10,23 +10,11 @@ import base64
 import logging
 from typing import Any
 
-from .client import LLMError
+from .client import LLMError, image_mime
 
 log = logging.getLogger(__name__)
 
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
-
-
-def _media_type(data: bytes) -> str:
-    if data[:3] == b"\xff\xd8\xff":
-        return "image/jpeg"
-    if data[:8] == b"\x89PNG\r\n\x1a\n":
-        return "image/png"
-    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp"
-    if data[:6] in (b"GIF87a", b"GIF89a"):
-        return "image/gif"
-    return "image/jpeg"
 
 
 class ClaudeVision:
@@ -52,12 +40,15 @@ class ClaudeVision:
     async def chat_json(
         self, system: str, user: str, images: list[bytes] | None = None, schema: dict | None = None
     ) -> str:
+        """Same contract as VisionLLM.chat_json. The evaluator passes the shared extraction
+        schema (prompts.VERDICT_SCHEMA), which Claude's structured outputs accept as is:
+        closed objects, all fields required, nullable via type arrays, no numeric limits."""
         content: list[dict[str, Any]] = [
             {
                 "type": "image",
                 "source": {
                     "type": "base64",
-                    "media_type": _media_type(img),
+                    "media_type": image_mime(img),
                     "data": base64.standard_b64encode(img).decode("ascii"),
                 },
             }

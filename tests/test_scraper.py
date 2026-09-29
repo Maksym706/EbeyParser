@@ -207,8 +207,9 @@ def test_large_image_url() -> None:
 def test_parse_search_results() -> None:
     listings = parse_search_results(fixture("ka_search_page1.html"), search_name="RTX 3090 Berlin")
     by_id = {item.ad_id: item for item in listings}
-    # 7 regular ads + 1 "alternative" ad; banner <li> ignored
-    assert [item.ad_id for item in listings] == [f"289100000{i}" for i in range(1, 9)]
+    # 7 regular ads; the "alternative" ad after the "Alternative Anzeigen" heading and the
+    # banner <li> are ignored
+    assert [item.ad_id for item in listings] == [f"289100000{i}" for i in range(1, 8)]
     assert all(item.search_name == "RTX 3090 Berlin" for item in listings)
     assert all(item.source == "kleinanzeigen" for item in listings)
     assert all(item.url.startswith(f"{BASE_URL}/s-anzeige/") for item in listings)
@@ -252,8 +253,7 @@ def test_parse_search_results() -> None:
     assert (struck.price, struck.negotiable, struck.price_text) == (590.0, False, "590 €")
     assert struck.posted_at_text == "12.09.2025"
 
-    alternative = by_id["2891000008"]
-    assert (alternative.location, alternative.postal_code, alternative.distance_km) == ("14467 Potsdam", "14467", 27.0)
+    assert "2891000008" not in by_id
 
 
 def test_parse_search_results_empty_and_garbage() -> None:
@@ -296,7 +296,11 @@ def test_parse_ad_detail_merges_into_listing() -> None:
         "\n"
         "Abholung in Friedrichshain oder Versand gegen Aufpreis."
     )
-    assert detail.attributes == {"Art": "Grafikkarten", "Zustand": "Sehr Gut", "Versand": "Versand möglich"}
+    assert detail.attributes == {
+        "Art": "Grafikkarten", "Zustand": "Sehr Gut", "Versand": "Versand möglich",
+        # seller trust signals from the contact box
+        "Nutzertyp": "Privater Nutzer", "Aktiv seit": "03.04.2016", "Bewertung": "TOP Zufriedenheit, Sehr freundlich",
+    }
     assert detail.condition == "Sehr Gut"
     assert detail.image_urls == [
         f"{IMG}?rule=$_59.AUTO",
@@ -391,7 +395,7 @@ async def test_search_two_pages_follows_redirect_and_next_link() -> None:
         listings = await scraper.search(search, max_pages=5)
 
     ids = [item.ad_id for item in listings]
-    assert ids == [f"289100000{i}" for i in range(1, 9)] + ["2891000009", "2891000010"]
+    assert ids == [f"289100000{i}" for i in range(1, 8)] + ["2891000009", "2891000010"]
     assert len(set(ids)) == len(ids)
     assert all(item.search_name == "rtx" for item in listings)
     # form -> redirect -> page 1, then page 2; page 2 has no "next" link, so we stop
@@ -411,7 +415,7 @@ async def test_search_respects_max_pages() -> None:
     async with client:
         listings = await KleinanzeigenScraper(client).search(SearchConfig(name="x", url=KA_PRETTY_URL), max_pages=1)
     assert calls == [KA_PRETTY_URL]
-    assert len(listings) == 8
+    assert len(listings) == 7
 
 
 async def test_search_falls_back_to_page_url_and_stops_without_new_ads() -> None:
@@ -427,7 +431,7 @@ async def test_search_falls_back_to_page_url_and_stops_without_new_ads() -> None
     async with client:
         listings = await KleinanzeigenScraper(client).search(SearchConfig(name="x", url=KA_PRETTY_URL), max_pages=5)
     assert calls == [KA_PRETTY_URL, KA_PAGE2_URL]  # page 2 built with page_url, then stop (no new ids)
-    assert len(listings) == 8
+    assert len(listings) == 7
 
 
 async def test_fetch_detail() -> None:
@@ -464,10 +468,10 @@ async def test_comparables_filters_and_paginates() -> None:
         comps = await KleinanzeigenScraper(client).comparables(
             "rtx 3090", exclude_ad_id="2891000005", min_price=300, max_price=1000
         )
-    # skipped: top ad (01), 1250 € > max (02), free (03), VB only (04), excluded (05), "Suche ..." (07)
+    # skipped: top ad (01), 1250 € > max (02), free (03), VB only (04), excluded (05), "Suche ..." (07),
+    # "alternative" ad (08)
     assert [(c.title, c.price) for c in comps] == [
         ("Gigabyte RTX 3090 Gaming OC", 590.0),
-        ("EVGA RTX 3090 FTW3 Ultra", 680.0),
         ("Palit RTX 3090 GameRock OC", 610.0),
         ("RTX 3090 Founders Edition", 575.0),
     ]
@@ -501,8 +505,8 @@ async def test_download_images() -> None:
         assert request.headers["Accept"].startswith("image/")
         if url.startswith(IMG):
             return httpx.Response(200, content=b"img1", headers={"Content-Type": "image/jpeg"})
-        if url.startswith(img2):  # large variant missing -> fallback to the original URL
-            if "rule=$_59.JPG" in url or "rule=%24_59.JPG" in url:
+        if url.startswith(img2):  # medium variant missing -> fallback to the original URL
+            if "rule=$_57.JPG" in url or "rule=%24_57.JPG" in url:
                 return httpx.Response(404)
             return httpx.Response(200, content=b"img2-small")
         return httpx.Response(500)  # third image broken: skipped silently
@@ -516,7 +520,7 @@ async def test_download_images() -> None:
         scraper = KleinanzeigenScraper(client)
         images = await scraper.download_images(listing, max_images=3)
         assert images == [b"img1", b"img2-small"]
-        assert "59.JPG" in requested[0]
+        assert "57.JPG" in requested[0]  # medium size for the AI, not the largest
         assert not any("-4?" in u for u in requested)  # only the first max_images photos
 
         requested.clear()

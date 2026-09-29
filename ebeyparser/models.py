@@ -75,10 +75,17 @@ class PriceEstimate(BaseModel):
     low: float | None = None
     high: float | None = None
     sample_size: int = 0
-    source: Literal["reference", "kleinanzeigen", "ebay_sold", "mixed", "ai", "none"] = "none"
+    # history = our own database of prices seen for this product (no extra requests)
+    source: Literal["reference", "history", "kleinanzeigen", "ebay_sold", "mixed", "ai", "none"] = "none"
     query: str = ""  # query used to find comparables
     comparables: list[Comparable] = Field(default_factory=list)
     notes: str = ""
+    history_days: int | None = None  # source "history": the look-back window
+    age_days: float | None = None  # source "history": weighted mean age of the prices used
+    # how many of the comparables shown to the AI it called the same product variant
+    # (None = not asked / no answer; 0 = none: the market price may belong to another variant)
+    ai_variant_matches: int | None = None
+    warning: str = ""  # shown as a reason, e.g. a reference price that disagrees with the market
 
 
 class AIVerdict(BaseModel):
@@ -94,6 +101,14 @@ class AIVerdict(BaseModel):
     confidence: float = 0.0  # 0..1
     reasoning: str = ""  # short explanation in Russian
     model: str = ""
+    # structured extraction (v0.2): what the photos/text show, used for hard vetoes in code
+    item_type: Literal[
+        "single", "bundle", "complete_pc", "laptop", "part", "accessory", "box_only", "wanted", "unclear"
+    ] = "unclear"
+    variant: dict[str, str] = Field(default_factory=dict)  # e.g. {"model": "iPhone 13", "storage_gb": "128"}
+    defects: list[str] = Field(default_factory=list)
+    locked: bool | None = None  # iCloud / activation / account lock visible or mentioned
+    stock_photos: bool | None = None  # photos look like catalogue/internet images
 
 
 class Evaluation(BaseModel):
@@ -106,6 +121,17 @@ class Evaluation(BaseModel):
     ai: AIVerdict | None = None  # local model
     ai_second: AIVerdict | None = None  # optional second opinion (e.g. Claude)
     max_buy_price: float | None = None  # highest price/bid that still meets your profit targets
+    # what to do: buy now / haggle (VB, offer_price) / bid (auction, up to max_buy_price) / watch
+    action: Literal["buy", "haggle", "bid", "watch", "skip", ""] = ""
+    offer_price: float | None = None  # suggested offer for VB / Preisvorschlag
+    ai_checked: bool | None = None  # False = AI enabled but unavailable -> photos NOT checked
+    no_alert: bool = False  # never notify (reserved, market known only from the AI)
+    # how far the funnel went: "prefilter" (free checks), "market" (no deal by market data,
+    # no ad page / AI; re-checked when seen again), "full"; "" = evaluated by an older version
+    stage: Literal["", "prefilter", "market", "full", "expired"] = ""
+    # AI enabled but unavailable, and the math alone says "buy": stored as "maybe", still sent
+    # (notifications.unchecked_deals) marked "⚠ ФОТО НЕ ПРОВЕРЕНЫ ИИ — проверь сам"
+    would_buy: bool = False
     fees: float = 0.0  # selling fees when reselling
     shipping_cost: float = 0.0
     expected_profit: float | None = None  # resale: net profit; personal: savings vs market
@@ -140,3 +166,14 @@ class RunSummary(BaseModel):
     deals_found: int = 0  # verdict == "buy"
     notified: int = 0
     errors: list[str] = Field(default_factory=list)
+    # funnel (v0.2): how much work the pass did and what it saved
+    prefiltered: int = 0  # dropped by free checks (keywords, wanted ad, below min price)
+    early_skips: int = 0  # market known without requests and no deal -> no ad page / AI
+    history_hits: int = 0  # market price taken from our own price history
+    comps_lookups: int = 0  # comparables searches that went to the network (cache hits are free)
+    details_fetched: int = 0  # ad pages opened
+    ai_calls: int = 0  # local AI evaluations
+    deferred: int = 0  # left for the next pass because a budget was used up
+    expired: int = 0  # deferred too long (general PENDING_MAX_AGE): given up, marked as expired
+    queued_alerts: int = 0  # deals held back by notifications.max_alerts_per_hour (sent later as a digest)
+    health_alerts: int = 0  # "AI down" / "site blocked" / heartbeat messages sent

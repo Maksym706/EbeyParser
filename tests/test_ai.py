@@ -211,20 +211,36 @@ def test_schema_is_strict_and_complete():
     props = VERDICT_SCHEMA["properties"]
     assert set(props) == {
         "product",
-        "search_query",
-        "photo_matches_description",
+        "item_type",
+        "variant",
         "condition",
+        "defects",
+        "locked",
+        "stock_photos",
+        "photo_matches_description",
         "red_flags",
+        "same_variant_indexes",
         "estimated_market_price",
+        "search_query",
+        "reasoning",
         "verdict",
         "confidence",
-        "reasoning",
     }
     assert set(VERDICT_SCHEMA["required"]) == set(props)
     assert VERDICT_SCHEMA["additionalProperties"] is False
+    variant = props["variant"]
+    assert variant["additionalProperties"] is False and set(variant["required"]) == set(variant["properties"])
+    assert set(variant["properties"]) == {"model", "storage_gb", "ram_gb", "vram_gb", "edition"}
+    assert all(p == {"type": ["string", "null"]} for p in variant["properties"].values())
+    assert props["defects"]["items"]["enum"] == [
+        "screen_broken", "water_damage", "not_working", "missing_parts", "battery_bad", "locked", "other"]
+    assert props["locked"] == {"type": ["boolean", "null"]}
     dumped = json.dumps(VERDICT_SCHEMA)
-    for forbidden in ("minimum", "maximum", "minLength", "maxLength"):
+    for forbidden in ("minimum", "maximum", "minLength", "maxLength", "minItems", "maxItems", "pattern"):
         assert forbidden not in dumped
+    # reasoning is generated before the verdict (think first, decide after)
+    order = list(props)
+    assert order.index("reasoning") < order.index("verdict") and order[0] == "product"
     assert "Russian" in SYSTEM_PROMPT and "JSON" in SYSTEM_PROMPT
 
 
@@ -245,8 +261,10 @@ def test_build_user_prompt_kleinanzeigen():
     assert "Zustand: Gut" in text
     assert "privat" in text
     assert "Fotos: 3 angehängt (von 4" in text
-    assert "~600 €" in text and "550 €" in text and "12" in text
-    assert text.count("RTX 3090 #") == 5
+    # no anchoring: our market estimate is not in the prompt, only numbered comparables
+    assert "600 €" not in text and "650 €" not in text and "Typischer" not in text
+    assert text.count("RTX 3090 #") == 8 and "[0] RTX 3090 #0 — 500 € (verkauft)" in text
+    assert "[7] RTX 3090 #7 — 507 € (verkauft)" in text and "same_variant_indexes" in text
     assert "x" * 2500 in text and "x" * 2600 not in text
     assert "resale" in text
 
@@ -372,7 +390,10 @@ async def test_openai_body_with_data_urls_and_auth():
     assert req.headers["authorization"] == "Bearer sk-local"
     body = rec.body()
     assert body["model"] == "qwen2-vl"
-    assert body["response_format"] == {"type": "json_object"}
+    assert body["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "verdict", "strict": True, "schema": VERDICT_SCHEMA},
+    }
     assert body["temperature"] == 0.2
     assert body["messages"][0] == {"role": "system", "content": "SYS"}
     parts = body["messages"][1]["content"]
@@ -404,6 +425,18 @@ async def test_openai_retries_without_response_format():
     assert len(rec.requests) == 2
     assert "response_format" in rec.body(0)
     assert "response_format" not in rec.body(1)
+
+
+async def test_openai_falls_back_from_json_schema_to_json_object():
+    rec = Recorder(
+        httpx.Response(400, json={"error": "response_format json_schema is not supported"}),
+        openai_reply('{"verdict": "buy"}'),
+    )
+    llm = make_llm(rec, provider="openai", base_url="http://localhost:1234")
+    out = await llm.chat_json("s", "u", [JPEG], VERDICT_SCHEMA)
+    assert out == '{"verdict": "buy"}'
+    assert rec.body(0)["response_format"]["type"] == "json_schema"
+    assert rec.body(1)["response_format"] == {"type": "json_object"}
 
 
 async def test_openai_other_400_is_error_without_retry():
@@ -498,3 +531,47 @@ async def test_evaluator_unexpected_exception_does_not_raise():
     cfg = AIConfig()
     v = await AIEvaluator(Broken(), cfg).evaluate(make_listing(), [])  # type: ignore[arg-type]
     assert v.verdict == "maybe" and v.confidence == 0.0 and "boom" in v.reasoning
+
+
+# --------------------------------------------------------------------------- model name resolution
+
+
+def test_canonical_model_names_and_find_model():
+    from ebeyparser.ai.client import canonical_model_name, find_model, looks_like_vision_model
+
+    same = ["qwen2.5-vl-7b-instruct", "qwen/qwen2.5-vl-7b", "Qwen2.5-VL-7B-Instruct-GGUF",
+            "qwen2.5vl:7b", "lmstudio-community/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf"]
+    assert {canonical_model_name(n) for n in same} == {"qwen25vl7b"}
+    assert canonical_model_name("qwen2.5-vl-3b-instruct") != canonical_model_name("qwen2.5-vl-7b")
+    served = ["text-embedding-nomic-embed-text-v1.5", "google/gemma-3-12b", "qwen/qwen2.5-vl-7b"]
+    assert find_model("qwen2.5-vl-7b-instruct", served) == "qwen/qwen2.5-vl-7b"
+    assert find_model("gemma-3-12b-it", served) == "google/gemma-3-12b"
+    assert find_model("qwen2.5-vl-3b-instruct", served) is None
+    assert looks_like_vision_model("qwen/qwen2.5-vl-7b") and looks_like_vision_model("google/gemma-3-12b")
+    assert not looks_like_vision_model("text-embedding-nomic-embed-text-v1.5")
+    assert not looks_like_vision_model("deepseek-r1-distill-qwen-7b")
+
+
+async def test_health_resolves_lmstudio_id_and_reports_server_ok():
+    rec = Recorder(httpx.Response(200, json={"data": [{"id": "qwen/qwen2.5-vl-7b"}]}))
+    llm = make_llm(rec, provider="openai", base_url="http://localhost:1234/v1", model="qwen2.5-vl-7b-instruct")
+    info = await llm.health()
+    assert info["server_ok"] and info["ok"] and info["resolved_model"] == "qwen/qwen2.5-vl-7b"
+    assert llm.model_name == "qwen/qwen2.5-vl-7b"
+
+    rec = Recorder(httpx.Response(200, json={"data": [{"id": "google/gemma-3-12b"}]}))
+    info = await make_llm(rec, provider="openai", base_url="http://x/v1", model="qwen2.5-vl-7b").health()
+    assert info["server_ok"] and not info["ok"] and info["models"] == ["google/gemma-3-12b"]
+
+
+async def test_openai_retries_with_server_model_id_after_model_not_found():
+    rec = Recorder(
+        httpx.Response(404, json={"error": {"message": "Model qwen2.5-vl-7b-instruct not found"}}),
+        httpx.Response(200, json={"data": [{"id": "qwen/qwen2.5-vl-7b"}]}),
+        openai_reply('{"verdict": "buy"}'),
+    )
+    llm = make_llm(rec, provider="openai", base_url="http://localhost:1234/v1", model="qwen2.5-vl-7b-instruct")
+    assert await llm.chat_json("s", "u", [JPEG], VERDICT_SCHEMA) == '{"verdict": "buy"}'
+    assert rec.body(0)["model"] == "qwen2.5-vl-7b-instruct"
+    assert rec.requests[1].url.path == "/v1/models"
+    assert rec.body(2)["model"] == "qwen/qwen2.5-vl-7b"

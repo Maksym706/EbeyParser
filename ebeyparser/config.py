@@ -6,17 +6,26 @@ Secrets (SMTP password, Telegram token) can live in environment variables or a
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from .models import Purpose, Source
 
+log = logging.getLogger(__name__)
+
 DEFAULT_CONFIG_PATH = Path("config.yaml")
+# "reference_prices:[]" / "model:qwen" — a missing space after the key's colon
+_MISSING_SPACE_RE = re.compile(r"^(\s*(?:-\s+)?[A-Za-z_][\w-]*):(?=[^\s/])", re.MULTILINE)
+
+
+class ConfigError(Exception):
+    """config.yaml can't be read; the message says where and why, in plain Russian."""
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
 
@@ -38,6 +47,7 @@ class SearchConfig(BaseModel):
     location_id: int | None = None  # Kleinanzeigen internal id (optional)
     radius_km: int | None = None
     category_id: int | None = None  # e.g. 225 = "PC-Zubehör & Software"
+    category_name: str = ""  # display only
     min_price: float | None = None
     max_price: float | None = None
     purpose: Purpose = "resale"
@@ -73,6 +83,17 @@ class GeneralConfig(BaseModel):
     user_agent: str | None = None
     data_dir: str = "data"
     max_new_per_search: int = 25  # cap work per search per run
+    # Funnel budgets per monitoring pass (category scans see many ads; only candidates get the
+    # expensive steps). Comparables lookups and ad pages hit the site; AI calls cost time.
+    max_comps_lookups_per_run: int = 40
+    max_details_per_run: int = 40
+    max_ai_per_run: int = 30
+    min_listing_price: float = 10.0  # ignore cheaper paid ads (junk); free ads are still considered
+    # Ban protection: hard cap of HTML pages per hour per site, and a growing, persisted cooldown
+    # after 403/429/captcha (hours for the 1st, 2nd, 3rd, ... block in a row).
+    max_requests_per_hour: int = 150
+    block_cooldown_hours: list[float] = Field(default_factory=lambda: [1.0, 2.0, 4.0, 12.0])
+    baseline_first_run: bool = True  # first pass of a NEW search only learns prices, no alerts
 
     @field_validator("request_delay_seconds", mode="before")
     @classmethod
@@ -93,6 +114,14 @@ class PricingConfig(BaseModel):
     use_kleinanzeigen_comps: bool = True
     use_ebay_sold_comps: bool = True
     comps_limit: int = 30
+    use_price_history: bool = True  # learn prices from every ad seen; estimate without extra requests
+    vb_expected_discount: float = 0.10  # "VB" ads usually go ~10 % below the asking price
+    max_capital: float | None = None  # never recommend buying above this (your budget)
+    min_comparables: int = 6  # fewer data points -> at most "maybe"
+    max_price_spread: float = 0.4  # IQR/median above this -> market too unclear -> at most "maybe"
+    paypal_fixed_fee: float = 0.0  # e.g. 0.35 for PayPal goods & services
+    history_days: int = 60
+    history_min_points: int = 6
     reference_prices: list[ReferencePrice] = Field(default_factory=list)
 
 
@@ -111,6 +140,8 @@ class LLMSettings(BaseModel):
     max_images: int = 3
     timeout_seconds: float = 240.0
     temperature: float = 0.2  # ignored for Claude
+    max_tokens: int = 700  # cap on the model's answer (a looping 7B model otherwise runs to the timeout)
+    image_max_side: int = 1024  # photos are downscaled to this many px (needs Pillow; otherwise sent as is)
 
 
 class SecondOpinionConfig(LLMSettings):
@@ -177,6 +208,10 @@ class NotificationsConfig(BaseModel):
     min_score: float = 70.0
     verdicts: list[Literal["buy", "maybe", "skip"]] = Field(default_factory=lambda: ["buy"])
     mode: Literal["instant", "digest"] = "instant"  # digest = one message per run
+    max_alerts_per_hour: int = 10  # more deals than this in an hour -> the rest go into one digest
+    health_alerts: bool = True  # tell me when the AI is down, the site blocks us or parsing breaks
+    heartbeat_hour: int | None = 9  # daily "I'm alive: checked N ads, M deals" at this local hour; None = off
+    unchecked_deals: bool = True  # AI down: still send would-be deals, marked "фото НЕ проверены"
     email: EmailConfig = Field(default_factory=EmailConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
 
@@ -185,6 +220,7 @@ class WebConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8000
     run_monitor: bool = True  # run the monitor loop inside the web server
+    allowed_hosts: list[str] = Field(default_factory=list)  # extra host names allowed to open the web UI
 
 
 class AppConfig(BaseModel):
@@ -242,8 +278,39 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     load_dotenv(cfg_path.parent / ".env")
     if not cfg_path.is_file():
         return AppConfig()
-    data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-    return parse_config(data)
+    data = _read_yaml(cfg_path)
+    try:
+        return parse_config(data)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in exc.errors()[:5]
+        )
+        raise ConfigError(f"В {cfg_path} неверные значения — {problems}") from exc
+
+
+def _read_yaml(cfg_path: Path) -> dict[str, Any]:
+    text = cfg_path.read_text(encoding="utf-8-sig")
+    try:
+        return yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        fixed = _MISSING_SPACE_RE.sub(r"\1: ", text)
+        if fixed != text:
+            try:
+                data = yaml.safe_load(fixed) or {}
+            except yaml.YAMLError:
+                pass
+            else:
+                lines = [n + 1 for n, (a, b) in enumerate(zip(text.splitlines(), fixed.splitlines())) if a != b]
+                log.warning("В %s после двоеточия не хватает пробела (строки %s) — прочитал как `ключ: значение`,"
+                            " но лучше поправь файл", cfg_path, ", ".join(map(str, lines)))
+                return data
+        mark = getattr(exc, "problem_mark", None)
+        where = f", строка {mark.line + 1}" if mark is not None else ""
+        problem = getattr(exc, "problem", None) or str(exc)
+        raise ConfigError(
+            f"Не могу прочитать {cfg_path}{where}: {problem}. Частые причины: нет пробела после двоеточия"
+            " (надо `ключ: значение`), сбиты отступы (только пробелы, по 2), табы вместо пробелов."
+        ) from exc
 
 
 def save_searches(path: str | Path, searches: list[SearchConfig]) -> None:

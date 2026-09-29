@@ -10,6 +10,7 @@
   <link rel="stylesheet" href="/static/style.css?v={{ static_v }}">
   <script>
     try { var t = localStorage.getItem("ebp-theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}
+    try { if (localStorage.getItem("ebp-hide-cat-hint")) document.documentElement.classList.add("hide-cat-hint"); } catch (e) {}
   </script>
 </head>
 <body class="page-{{ nav | default('') }}">
@@ -22,6 +23,7 @@
       <nav class="nav" aria-label="Разделы">
         <a href="/" class="{{ 'active' if nav == 'deals' }}">{{ icon('tag') }}<span>Сделки</span></a>
         <a href="/searches" class="{{ 'active' if nav == 'searches' }}">{{ icon('search') }}<span>Поиски</span></a>
+        <a href="/setup" class="{{ 'active' if nav == 'setup' }}">{{ icon('settings') }}<span>Настройка</span></a>
         <a href="/status" class="{{ 'active' if nav == 'status' }}">{{ icon('activity') }}<span>Статус</span></a>
       </nav>
       <button class="icon-btn theme-toggle" type="button" data-theme-toggle title="Светлая / тёмная тема" aria-label="Переключить тему">

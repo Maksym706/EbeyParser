@@ -349,4 +349,153 @@
       if (!window.confirm(form.dataset.confirm)) ev.preventDefault();
     });
   });
+
+  // ------------------------------------------------ dismissible hint banner
+  $$("[data-dismiss-hint]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      try { localStorage.setItem("ebp-hide-cat-hint", "1"); } catch (e) { /* private mode */ }
+      document.documentElement.classList.add("hide-cat-hint");
+    });
+  });
+
+  // ---------------------------------------------------------- setup wizard
+  var setupForm = $("[data-setup]");
+  if (setupForm) {
+    $$("[data-js-only]", setupForm).forEach(function (el) { el.hidden = false; });
+    var countEl = $("[data-setup-count]", setupForm);
+    var estimateEl = $("[data-estimate]", setupForm);
+    var num = function (el) { var v = parseFloat(String(el && el.value || "").replace(",", ".")); return isFinite(v) ? v : 0; };
+    var updateSetup = function () {
+      var cats = $$('input[name="category"]:checked', setupForm).length;
+      var wishes = $$('input[name="wish_item"]', setupForm).filter(function (i) { return i.value.trim(); }).length;
+      if (countEl) {
+        countEl.textContent = (cats || wishes)
+          ? "Будет создано: " + cats + " " + plural(cats, "поиск", "поиска", "поисков") + " по категориям" +
+            (wishes ? " и " + wishes + " «для себя»" : "")
+          : "Выбери хотя бы одну категорию или добавь вещь «для себя»";
+      }
+      if (estimateEl) {  // same formula as RequestEstimate / suggest_interval in scraper/categories.py
+        var d = estimateEl.dataset;
+        var cap = parseFloat(d.cap) || 0;
+        var pagesRun = cats * parseFloat(d.scanPages) + wishes * parseFloat(d.kwPages);
+        var steps = [10, 15, 20, 30, 45, 60, 90, 120];
+        var wanted = Math.max(10, cap ? pagesRun * 60 / (cap * parseFloat(d.share)) : 2 * (cats + wishes));
+        var suggested = steps.filter(function (s) { return s >= wanted - 1e-9; })[0] || Math.ceil(wanted / 30) * 30;
+        var interval = Math.max(1, num($('[name="interval_minutes"]', setupForm)) || suggested);
+        var pagesHour = Math.round(pagesRun * 60 / interval);
+        var raw = Math.round((pagesRun + (pagesRun ? parseFloat(d.extra) : 0)) * 60 / interval);
+        var perHour = cap ? Math.max(pagesHour, Math.min(raw, cap)) : raw;
+        var tight = cap && pagesHour > cap / 2;
+        var parts = [];
+        if (cats) parts.push(cats + " " + plural(cats, "категория", "категории", "категорий") + " × до 3 стр.");
+        if (wishes) parts.push(wishes + " " + plural(wishes, "поиск", "поиска", "поисков") + " по словам");
+        var text = "Раз в " + interval + " мин: до " + pagesHour + " стр. выдачи в час" +
+          (parts.length ? " (" + parts.join(", ") + ")" : "") + ", всего с оценкой объявлений — не больше " + perHour +
+          " запросов в час (~" + perHour * 24 + " в сутки).";
+        if (cap) {
+          text += " На оценку объявлений (страница объявления + 2–3 стр. цен аналогов) остаётся ~" +
+            Math.max(0, cap - pagesHour) + " в час из лимита " + cap + ".";
+        }
+        if (tight) text += " ⚠ Слишком часто: на оценку объявлений почти не останется запросов — поставь раз в " + suggested + " мин.";
+        var textEl = $("[data-estimate-text]", estimateEl);
+        if (textEl) textEl.textContent = text;
+        var sugEl = $("[data-suggested]", setupForm);
+        if (sugEl) sugEl.textContent = suggested;
+        estimateEl.classList.toggle("warn", !!tight);
+      }
+    };
+    var syncPurpose = function () {
+      var checked = $('input[name="purpose"]:checked', setupForm);
+      var value = checked ? checked.value : "resale";
+      $$("[data-purpose-only]", setupForm).forEach(function (el) { el.hidden = el.dataset.purposeOnly !== value; });
+    };
+    setupForm.addEventListener("change", function () { updateSetup(); syncPurpose(); });
+    setupForm.addEventListener("input", updateSetup);
+    setupForm.addEventListener("click", function (ev) {
+      var sel = ev.target.closest("[data-cat-select]");
+      if (sel) {
+        $$('input[name="category"]', setupForm).forEach(function (box) {
+          box.checked = sel.dataset.catSelect === "recommended" ? box.dataset.recommended === "1" : false;
+        });
+        updateSetup();
+        return;
+      }
+      if (ev.target.closest("[data-wish-add]")) {
+        var tpl = $("[data-wish-template]", setupForm);
+        var list = $("[data-wish-list]", setupForm);
+        if (tpl && list) {
+          list.appendChild(tpl.content.cloneNode(true));
+          var items = $$('input[name="wish_item"]', list);
+          items[items.length - 1].focus();
+        }
+        return;
+      }
+      var rm = ev.target.closest("[data-wish-remove]");
+      if (rm) {
+        var row = rm.closest("[data-wish-row]");
+        if (row && $$("[data-wish-row]", setupForm).length > 1) row.remove();
+        else if (row) $$("input", row).forEach(function (i) { i.value = ""; });
+        updateSetup();
+      }
+    });
+    $$("[data-busy-on-click]", setupForm).forEach(function (btn) {
+      btn.addEventListener("click", function () { setTimeout(function () { btn.classList.add("is-busy"); }, 0); });
+    });
+    syncPurpose();
+    updateSetup();
+  }
+
+  // --------------------------------------------------------------- settings
+  $$("[data-ai-check]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var out = $("[data-ai-result]");
+      btn.classList.add("is-busy");
+      api("GET", "/api/ai/check").then(function (d) {
+        if (!out) return;
+        out.className = "result " + (d.ok && d.model_available !== false ? "ok" : "err");
+        out.textContent = d.ok && d.model_available !== false
+          ? "✓ Работает: " + (d.resolved_model || d.model) + " на " + d.base_url
+          : "✗ " + (d.error || (d.ok ? "Сервер работает, но модели «" + d.model + "» на нём нет" : "Нет ответа"));
+        out.hidden = false;
+      }).catch(function (e) { toast(e.message, "err"); })
+        .then(function () { btn.classList.remove("is-busy"); });
+    });
+  });
+  $$("[data-ai-detect]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var box = $("[data-ai-servers]");
+      btn.classList.add("is-busy");
+      api("GET", "/api/ai/detect").then(function (d) {
+        if (!box) return;
+        box.innerHTML = "";
+        if (!d.servers.length) {
+          box.textContent = "Не нашёл: LM Studio (порт 1234) и Ollama (порт 11434) не отвечают. Запусти сервер и нажми ещё раз.";
+          return;
+        }
+        d.servers.forEach(function (s) {
+          var head = document.createElement("div");
+          head.className = "small";
+          head.textContent = s.name + " · " + s.base_url + " — нажми на модель, чтобы подставить:";
+          box.appendChild(head);
+          var list = document.createElement("div");
+          list.className = "model-list";
+          s.models.forEach(function (m) {
+            var b = document.createElement("button");
+            b.type = "button";
+            b.textContent = m;
+            if (s.vision_models.indexOf(m) >= 0) { b.className = "vision"; b.title = "Видит фото"; }
+            b.addEventListener("click", function () {
+              var f = btn.closest("form");
+              $('[name="provider"]', f).value = s.provider;
+              $('[name="base_url"]', f).value = s.base_url;
+              $('[name="model"]', f).value = m;
+            });
+            list.appendChild(b);
+          });
+          box.appendChild(list);
+        });
+      }).catch(function (e) { toast(e.message, "err"); })
+        .then(function () { btn.classList.remove("is-busy"); });
+    });
+  });
 })();

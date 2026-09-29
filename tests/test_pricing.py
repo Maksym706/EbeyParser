@@ -369,11 +369,15 @@ def test_evaluate_ai_defective_condition_is_severe():
 
 def test_evaluate_free_item():
     listing = make_listing(title="Stuhl Vitra", price=None, is_free=True)
-    ev = evaluate(listing, sold_estimate(200), None, RESALE, PRICING)
+    ev = evaluate(listing, sold_estimate(100), None, RESALE, PRICING)
     assert ev.buy_price == 0.0
-    assert ev.expected_profit == pytest.approx(180.0)
+    assert ev.expected_profit == pytest.approx(90.0)
     assert ev.verdict == "buy"
     assert any("бесплатно" in r for r in ev.reasons)
+    # v0.2 final round (N11): something worth 150 €+ given away is usually a lure
+    dear = evaluate(listing, sold_estimate(200), None, RESALE, PRICING)
+    assert dear.verdict == "maybe" and dear.action == "watch"
+    assert "Бесплатно дорогая вещь — часто приманка" in dear.reasons
 
 
 def test_evaluate_no_price():
@@ -383,7 +387,8 @@ def test_evaluate_no_price():
     assert ev.expected_profit is None and ev.roi is None
     assert "Цена не указана — уточни у продавца" in ev.reasons
     assert ev.max_buy_price == 432
-    assert "Торгуйся: выгодно до 432 €" in ev.reasons
+    # v0.2 fix round: a "skip" never carries a haggle hint (action and reasons must agree)
+    assert "Выгодно только при цене до 432 €" in ev.reasons and ev.action == "skip"
     ev_ai = evaluate(listing, sold_estimate(600), AI_BUY, RESALE, PRICING)
     assert ev_ai.verdict == "maybe"
     assert ev_ai.score <= 40
@@ -404,10 +409,13 @@ def test_evaluate_no_market_data():
 
 
 def test_evaluate_ai_market_price_fallback():
+    # v0.2: a market price only guessed by the AI is never a "buy" and never alerts
     ai = AI_BUY.model_copy(update={"estimated_market_price": 600.0})
     ev = evaluate(make_listing(price=250), PriceEstimate(), ai, RESALE, PRICING)
     assert ev.estimate.source == "ai" and ev.estimate.market_price == 600
-    assert ev.verdict == "buy"  # AI is sure (0.8)
+    assert ev.verdict == "maybe" and ev.no_alert and ev.score <= 55
+    assert ev.expected_profit == pytest.approx(290.0)  # profit still shown
+    assert "⚠ Рынок оценён только ИИ — проверь цены сам" in ev.reasons
     unsure = ai.model_copy(update={"confidence": 0.5})
     assert evaluate(make_listing(price=250), PriceEstimate(), unsure, RESALE, PRICING).verdict == "maybe"
 
@@ -424,10 +432,11 @@ def test_evaluate_search_overrides_and_fees():
     search = SearchConfig(name="s", min_profit=300, min_roi=0.1)
     pricing = PricingConfig(selling_fee_percent=10, payment_fee_percent=0, default_shipping_cost=10)
     ev = evaluate(make_listing(price=250), sold_estimate(600), None, search, pricing)
-    # resale 540, fees 54, shipping 10 -> profit 226 < min_profit 300 -> maybe
-    assert ev.fees == pytest.approx(54.0)
+    # v0.2: fees on the resale price itself: 600 - 60 margin - 60 fees - 10 shipping - 250
+    # = 220 < min_profit 300 -> maybe
+    assert ev.fees == pytest.approx(60.0)
     assert ev.shipping_cost == 10
-    assert ev.expected_profit == pytest.approx(226.0)
+    assert ev.expected_profit == pytest.approx(220.0)
     assert ev.verdict == "maybe"
 
 
@@ -453,21 +462,24 @@ def test_evaluate_photo_mismatch_caps():
     assert "⚠ Фото не совпадает с описанием" in ev.reasons
 
 
-def test_evaluate_ai_skip_overrides():
+def test_evaluate_ai_verdict_no_longer_overrides_the_math():
+    # v0.2 final round (N4): the AI's own buy/skip opinion doesn't veto; only its structured
+    # findings do (stock photos -> at most "maybe", a sure broken screen -> skip)
     ai = AI_BUY.model_copy(update={"verdict": "skip", "confidence": 0.8, "reasoning": "Стоковые фото"})
     ev = evaluate(make_listing(price=250), sold_estimate(600), ai, RESALE, PRICING)
-    assert ev.verdict == "skip"
-    assert ev.score <= 25
-    weak = ai.model_copy(update={"confidence": 0.4})
-    assert evaluate(make_listing(price=250), sold_estimate(600), weak, RESALE, PRICING).verdict == "buy"
+    assert ev.verdict == "buy"
+    stock = ai.model_copy(update={"stock_photos": True})
+    assert evaluate(make_listing(price=250), sold_estimate(600), stock, RESALE, PRICING).verdict == "maybe"
+    broken = ai.model_copy(update={"defects": ["screen_broken"]})
+    assert evaluate(make_listing(price=250), sold_estimate(600), broken, RESALE, PRICING).verdict == "skip"
 
 
-def test_evaluate_ai_upgrades_maybe_to_buy():
-    # profit 40*0.9=36..40, roi just under 25%: maybe without AI, buy with a confident AI
+def test_evaluate_ai_never_upgrades_maybe_to_buy():
+    # v0.2: the AI may only downgrade — roi just under 25% stays "maybe" even with a sure AI
     listing = make_listing(price=175)
     est = sold_estimate(240)  # resale 216 -> profit 41, roi 0.234
     assert evaluate(listing, est, None, RESALE, PRICING).verdict == "maybe"
-    assert evaluate(listing, est, AI_BUY, RESALE, PRICING).verdict == "buy"
+    assert evaluate(listing, est, AI_BUY, RESALE, PRICING).verdict == "maybe"
 
 
 def test_evaluate_includes_delivery_cost():
@@ -488,20 +500,22 @@ def test_evaluate_auction_running_is_capped():
         ends_at=utcnow() + timedelta(days=2),
     )
     ev = evaluate(listing, sold_estimate(600), AI_BUY, RESALE, PRICING)
-    assert ev.verdict == "maybe"
+    assert ev.verdict == "maybe" and ev.action == "bid"
     assert ev.score <= 60
+    assert ev.expected_profit is None and ev.roi is None  # never from the current bid
     assert "Аукцион ещё идёт — итоговая цена будет выше" in ev.reasons
-    assert "Аукцион: ставь максимум 432 €" in ev.reasons
+    assert "Аукцион: ставь максимум 432 € (сейчас 250 €)" in ev.reasons
     assert any("5 ставок" in r for r in ev.reasons)
 
 
-def test_evaluate_auction_ending_soon_can_be_buy():
+def test_evaluate_auction_ending_soon_is_a_bid_not_a_buy():
+    # v0.2: an auction is never "buy" — the answer is how high to bid
     now = utcnow()
     listing = make_listing(
         price=250, buying_options=["AUCTION"], bid_count=3, ends_at=now + timedelta(hours=1)
     )
     ev = evaluate(listing, sold_estimate(600), AI_BUY, RESALE, PRICING, now=now)
-    assert ev.verdict == "buy"
+    assert ev.verdict == "maybe" and ev.action == "bid" and ev.max_buy_price == 432
     assert any("3 ставки" in r and "1 ч" in r for r in ev.reasons)
     ended = listing.model_copy(update={"ends_at": now - timedelta(minutes=5)})
     assert evaluate(ended, sold_estimate(600), AI_BUY, RESALE, PRICING, now=now).verdict == "skip"
@@ -543,3 +557,84 @@ def test_fmt_money():
     assert fmt_money(290) == "290 €"
     assert fmt_money(7.5) == "7,50 €"
     assert fmt_money(-30) == "-30 €"
+
+
+def test_exclude_keywords_are_word_start_and_negation_aware():
+    ex = ["defekt", "bastler", "tausch", "suche", "mining"]
+    ok = "Privatverkauf, kein Umtausch und keine Rücknahme. Nie für Mining genutzt, keine Defekte."
+    assert matches_keywords(ok, [], ex)
+    for bad in ("Karte defekt, für Bastler", "Nur Tausch gegen PS5", "Tausche gegen 4070",
+                "Wurde fürs Mining benutzt", "Suche RTX 3080"):
+        assert not matches_keywords(bad, [], ex), bad
+    from ebeyparser.pricing.text import matched_exclude_keyword
+
+    assert matched_exclude_keyword("Nur Tausch", ex) == "tausch"
+    assert matched_exclude_keyword(ok, ex) is None
+
+
+def test_prefilter_keeps_kein_umtausch_ads():
+    from ebeyparser.config import SearchConfig
+    from ebeyparser.models import Listing
+    from ebeyparser.pricing.estimator import prefilter
+
+    search = SearchConfig(name="gpu", exclude_keywords=["defekt", "tausch", "mining"])
+    listing = Listing(ad_id="1", url="u", title="ZOTAC RTX 3080 Trinity OC LHR 10GB", price=320,
+                      description="Läuft einwandfrei, nie für Mining. Privatverkauf, kein Umtausch.")
+    assert prefilter(listing, search) == (True, [])
+    # v0.2: stop words look at the title only ("immer mit Hülle benutzt" in a description killed
+    # real deals); a swap-only description is caught by the red flags instead
+    assert prefilter(listing.model_copy(update={"description": "Nur Tausch"}), search) == (True, [])
+    keep, reasons = prefilter(listing.model_copy(update={"title": "RTX 3080 – nur Tausch"}), search)
+    assert not keep and reasons == ["Стоп-слова: «tausch»"]
+
+
+@pytest.mark.parametrize(("title", "query"), [
+    ("MSI NVIDIA RTX 3080 Ti VENTUS 3X 12G OC Gaming Grafikkarte", "rtx 3080 ti"),
+    ("ZOTAC RTX 3080 Trinity OC LHR 10GB GDDR6X – kaum genutzt", "rtx 3080"),
+    ("Gigabyte RTX3090 24GB", "rtx 3090"),
+    ("AMD Radeon RX 7900 XTX", "rx 7900 xtx"),
+    ("Apple iPhone 13 Pro Max 256GB", "apple iphone 13 pro max"),
+])
+def test_make_search_query_keeps_model_and_suffix(title, query):
+    assert make_search_query(title) == query
+
+
+@pytest.mark.parametrize(("query", "title", "relevant"), [
+    ("rtx 3080", "Gigabyte GeForce RTX 3080 Gaming OC 10G", True),
+    ("rtx 3080", "RTX3080 MSI Ventus", True),
+    ("rtx 3080", "Gaming PC mit RTX 3080, Ryzen 7 5800X, 32GB", False),
+    ("rtx 3080", "Gaming-PC RTX 3080", False),
+    ("rtx 3080", "MSI RTX 3080 Ti Suprim X", False),
+    ("rtx 3080", "RTX 3080Ti Founders Edition", False),
+    ("rtx 3080", "EVGA RTX 3080 FTW3 Kühler", False),
+    ("rtx 3080", "Alphacool Eisblock RTX 3080 waterblock", False),
+    ("rtx 3080", "Laptop Lenovo Legion RTX 3080", False),
+    ("rtx 3080", "Suche RTX 3080", False),
+    ("rtx 3080", "RTX 3080 defekt", False),
+    ("rtx 3080", "RTX 3070", False),
+    ("rtx 3080 ti", "MSI RTX 3080 Ti Suprim X", True),
+    ("apple iphone 13 pro max", "iPhone 13 Pro Max 256GB Graphit", True),
+    ("apple iphone 13", "Apple iPhone 13 Pro 128GB", False),
+    ("apple iphone 13", "iPhone 13 128GB", True),
+    ("lenovo thinkpad t480", "Lenovo ThinkPad T480 Laptop i5 16GB", True),
+    ("sony ps5", "PS5 Disc Edition", True),
+])
+def test_comparable_relevance(query, title, relevant):
+    from ebeyparser.pricing.estimator import comparable_is_relevant
+
+    assert comparable_is_relevant(query, title) is relevant
+
+
+def test_gaming_pcs_no_longer_inflate_gpu_market_price():
+    from ebeyparser.models import Comparable
+    from ebeyparser.pricing.estimator import estimate_from_comparables, relevant_comparables
+
+    cards = [Comparable(title=f"RTX 3080 {b}", price=p, source="kleinanzeigen")
+             for b, p in [("MSI", 380), ("Zotac", 350), ("Asus TUF", 420), ("Palit", 400), ("Gigabyte", 390)]]
+    pcs = [Comparable(title=f"Gaming PC RTX 3080 Ryzen {i}", price=1100 + 50 * i, source="kleinanzeigen")
+           for i in range(8)]
+    tis = [Comparable(title="RTX 3080 Ti", price=560, source="kleinanzeigen")] * 3
+    everything = cards + pcs + tis
+    assert estimate_from_comparables(everything, asking_price_discount=0.85).market_price > 700
+    clean = estimate_from_comparables(relevant_comparables("rtx 3080", everything), asking_price_discount=0.85)
+    assert clean.sample_size == 5 and 320 <= clean.market_price <= 350

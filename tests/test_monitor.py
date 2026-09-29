@@ -24,10 +24,14 @@ class FakeSource:
         self.comps = comps or []
         self.detail_calls: list[str] = []
         self.search_calls = 0
+        self.search_pages: list[int] = []  # max_pages of each search call
+        self.seen_given: list[bool] = []  # was a `seen` callback passed (stop at known ads)
         self.block_search = False
 
-    async def search(self, search: SearchConfig, max_pages: int = 1) -> list[Listing]:
+    async def search(self, search: SearchConfig, max_pages: int = 1, seen=None) -> list[Listing]:
         self.search_calls += 1
+        self.search_pages.append(max_pages)
+        self.seen_given.append(seen is not None)
         if self.block_search:
             raise BlockedError("captcha")
         return [l.model_copy(update={"search_name": search.name}) for l in self.listings]
@@ -88,7 +92,8 @@ SOLD = [Comparable(title=f"RTX 3080 #{i}", price=p, source="ebay_sold", sold=Tru
 
 def config(**overrides) -> AppConfig:
     data = {
-        "general": {"max_new_per_search": 10},
+        # v0.2: a new search's first pass only learns prices; these tests evaluate right away
+        "general": {"max_new_per_search": 10, "baseline_first_run": False},
         "searches": [{"name": "GPU", "query": "rtx 3080", "exclude_keywords": ["defekt"]}],
         "pricing": {"min_profit": 40, "min_roi": 0.25},
         "notifications": {"min_score": 50, "verdicts": ["buy"]},
@@ -213,7 +218,9 @@ async def test_second_opinion_only_for_top_deals():
     assert second.calls == ["7001"]  # the overpriced one never reaches the paid model
     ev = db.get_evaluation("7001")
     assert ev.ai.model == "fake" and ev.ai_second.model == "claude-opus-5"
-    assert ev.verdict == "skip"  # stronger model vetoed it
+    # v0.2 final round (N4): the second model's photo mismatch caps the deal at "maybe" (no
+    # longer a verdict veto) — and it is still not notified
+    assert ev.verdict == "maybe"
     assert notifier.sent == []
 
 
@@ -271,3 +278,127 @@ def test_ad_id_from_url():
     assert ad_id_from_url("https://www.ebay.de/itm/123456789012?hash=x") == "ebay-123456789012"
     assert ad_id_from_url("https://www.ebay.de/itm/rtx-3080-gaming/123456789012") == "ebay-123456789012"
     assert ad_id_from_url("https://example.com") is None
+
+
+def test_set_ai_model_in_config_only_touches_ai_block(tmp_path):
+    from ebeyparser.cli import set_ai_model_in_config
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "general:\n  interval_minutes: 15\n"
+        "ai:\n  enabled: true\n  provider: openai\n  model: qwen2.5-vl-7b-instruct   # comment\n"
+        "  second_opinion:\n    model: claude-opus-5\n"
+        "web:\n  port: 8000\n", encoding="utf-8")
+    assert set_ai_model_in_config(cfg, "qwen/qwen2.5-vl-7b")
+    text = cfg.read_text(encoding="utf-8")
+    assert "  model: qwen/qwen2.5-vl-7b   # comment\n" in text
+    assert "    model: claude-opus-5\n" in text
+    assert not set_ai_model_in_config(tmp_path / "missing.yaml", "x")
+
+
+def test_ai_check_lists_models_and_fixes_config(tmp_path, monkeypatch, capsys):
+    from ebeyparser import cli
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("ai:\n  enabled: true\n  provider: openai\n  model: qwen2.5-vl-7b-instruct\n", encoding="utf-8")
+
+    async def fake_health(self):
+        return {"ok": False, "server_ok": True, "provider": "openai", "base_url": "http://localhost:1234/v1",
+                "model": "qwen2.5-vl-7b-instruct", "models": ["text-embedding-x", "google/gemma-3-12b"],
+                "model_available": False, "error": "not loaded"}
+
+    monkeypatch.setattr(Monitor, "ai_health", fake_health)
+    assert cli.main(["-c", str(cfg), "ai-check"]) == 1
+    out = capsys.readouterr().out
+    assert "google/gemma-3-12b   ← умеет смотреть фото" in out and "ai-check --fix" in out
+    assert cli.main(["-c", str(cfg), "ai-check", "--fix"]) == 0
+    assert "  model: google/gemma-3-12b\n" in cfg.read_text(encoding="utf-8")
+
+
+async def test_listings_stored_but_not_evaluated_are_retried():
+    """A run interrupted (Ctrl+C) after storing listings must not lose them."""
+    listing = make_listing("8001", "Gigabyte RTX 3080 Gaming OC", 250.0)
+    monitor, db, source, notifier = build(config(), [listing], verdict=GOOD_AI)
+    db.upsert_listing(listing.model_copy(update={"search_name": "GPU"}))  # seen, never evaluated
+    summary = await monitor.run_once()
+    assert summary.new_listings == 0 and summary.evaluated == 1
+    assert db.get_evaluation("8001").verdict == "buy"
+    assert notifier.sent == [["8001"]]
+    again = await monitor.run_once()
+    assert again.evaluated == 0  # evaluated ones are not repeated
+
+
+def test_debug_ad_rejects_placeholder_url(capsys):
+    from ebeyparser import cli
+
+    assert cli.main(["-c", "/nonexistent.yaml", "debug-ad", "https://www.kleinanzeigen.de/s-anzeige/..."]) == 2
+    assert "полная ссылка" in capsys.readouterr().out
+
+
+def test_once_reevaluate_clears_old_verdicts(tmp_path, monkeypatch, capsys):
+    from ebeyparser import cli
+    from ebeyparser.models import Evaluation
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"general:\n  data_dir: {tmp_path / 'data'}\n", encoding="utf-8")
+    db = Database(tmp_path / "data" / "ebeyparser.sqlite3")
+    db.upsert_listing(make_listing("9001", "RTX 3080", 300.0))
+    db.save_evaluation(Evaluation(ad_id="9001", verdict="skip"))
+    db.close()
+
+    async def fake_run_once(self):
+        from ebeyparser.models import RunSummary
+        return RunSummary()
+
+    monkeypatch.setattr(Monitor, "run_once", fake_run_once)
+    cli.main(["-c", str(cfg), "once", "--reevaluate"])
+    assert "Сбросил старые оценки (1 шт.)" in capsys.readouterr().out
+    assert Database(tmp_path / "data" / "ebeyparser.sqlite3").get_evaluation("9001") is None
+
+
+def test_config_missing_space_after_colon_is_tolerated(tmp_path, caplog):
+    from ebeyparser.config import load_config
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("pricing:\n  min_profit: 50\n  reference_prices:[]\nai:\n  model:qwen/qwen2.5-vl-7b\n"
+                   "  base_url: http://localhost:1234/v1\n", encoding="utf-8")
+    config = load_config(cfg)
+    assert config.pricing.reference_prices == [] and config.pricing.min_profit == 50
+    assert config.ai.model == "qwen/qwen2.5-vl-7b" and config.ai.base_url == "http://localhost:1234/v1"
+    assert "строки 3, 5" in caplog.text
+
+
+def test_broken_config_gives_readable_error(tmp_path, capsys):
+    from ebeyparser import cli
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("pricing:\n  min_profit: 50\n   bad_indent: [\n", encoding="utf-8")
+    assert cli.main(["-c", str(cfg), "once"]) == 2
+    out = capsys.readouterr().out
+    assert out.startswith("✖ Не могу прочитать") and "строка" in out
+    cfg.write_text("pricing:\n  min_profit: много\n", encoding="utf-8")
+    assert cli.main(["-c", str(cfg), "once"]) == 2
+    assert "pricing.min_profit" in capsys.readouterr().out
+
+
+def test_cross_check_prefers_careful_market_price():
+    from ebeyparser.models import PriceEstimate
+    from ebeyparser.monitor import _cross_check
+
+    est = PriceEstimate(market_price=850, source="kleinanzeigen", sample_size=20)
+    low_ai = AIVerdict(estimated_market_price=420, confidence=0.7, verdict="buy")
+    checked = _cross_check(est, low_ai)
+    assert checked.market_price == pytest.approx(566.67, abs=0.01) and "осторожную" in checked.notes
+    assert _cross_check(est, AIVerdict(estimated_market_price=800, confidence=0.7)).market_price == 850
+    assert _cross_check(est, AIVerdict(estimated_market_price=420, confidence=0.0)).market_price == 850
+    ref = PriceEstimate(market_price=850, source="reference")
+    assert _cross_check(ref, low_ai).market_price == 850
+
+
+async def test_warns_when_almost_everything_is_a_buy():
+    # v0.2: 250 € (not 200 €) — below 40 % of the market an ad is "suspiciously cheap", never a buy
+    listings = [make_listing(str(9100 + i), f"RTX 3080 #{i}", 250.0) for i in range(6)]
+    monitor, db, _, _ = build(config(), listings, verdict=GOOD_AI)
+    summary = await monitor.run_once()
+    assert summary.deals_found == 6
+    assert any("оценка рынка завышена" in e for e in summary.errors)

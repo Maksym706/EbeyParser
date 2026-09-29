@@ -8,6 +8,7 @@
   </div>
   {% if editable %}
   <div class="head-actions">
+    <a class="btn" href="/setup">{{ icon('settings') }}Мастер настройки</a>
     <a class="btn btn-primary" href="/searches?new=1#form">{{ icon('plus') }}Добавить поиск</a>
   </div>
   {% endif %}
@@ -25,7 +26,8 @@
 <section class="card help">
   <div class="help-icon">{{ icon('info') }}</div>
   <div>
-    <p><b>Самый надёжный способ — настроить поиск на kleinanzeigen.de (регион, радиус, категория, цена), скопировать адрес страницы и вставить в поле URL.</b></p>
+    <p><b>Проще всего — <a class="link" href="/setup">мастер настройки</a>: город, радиус, категории и бюджет. Программа будет просматривать все новые объявления этих категорий рядом с тобой.</b></p>
+    <p>Свой поиск тоже можно: настрой его на kleinanzeigen.de (регион, радиус, категория, цена), скопируй адрес страницы и вставь в поле URL — или укажи запрос и номер категории.</p>
     <p>Для eBay выбери источник «eBay»: укажи запрос, диапазон цен и формат (аукцион / купить сейчас). Хитрость: аукционы, которые заканчиваются в ближайшие часы, часто уходят дешевле рынка.</p>
     <p>«Для себя» — если покупаешь в личное пользование (например, детали для AI-сервера): тогда считается экономия относительно рынка, а не прибыль от перепродажи.</p>
   </div>
@@ -59,7 +61,7 @@
         {% if s.url %}<dt>URL</dt><dd><a class="url-text" href="{{ s.url }}" target="_blank" rel="noopener noreferrer">{{ s.url | truncate(90, true, '…') }}</a></dd>{% endif %}
         {% if s.query %}<dt>Запрос</dt><dd><b>{{ s.query }}</b></dd>{% endif %}
         {% if c.where %}<dt>Где</dt><dd>{{ c.where }}</dd>{% endif %}
-        {% if s.category_id %}<dt>Категория</dt><dd class="num">{{ s.category_id }}</dd>{% endif %}
+        {% if s.category_id %}<dt>Категория</dt><dd>{% if s.category_name %}{{ s.category_name }} <span class="muted num">· {{ s.category_id }}</span>{% else %}<span class="num">{{ s.category_id }}</span>{% endif %}</dd>{% endif %}
         {% if s.ebay_category_ids %}<dt>Категории eBay</dt><dd class="num">{{ s.ebay_category_ids | join(', ') }}</dd>{% endif %}
         {% if c.price %}<dt>Цена</dt><dd class="num">{{ c.price }}</dd>{% endif %}
         {% if c.buying %}<dt>Формат</dt><dd>{{ c.buying | join(', ') }}</dd>{% endif %}
@@ -158,8 +160,9 @@
         </label>
         <label class="field" data-source-only="kleinanzeigen">
           <span>{{ labels.category_id }}</span>
-          <input class="input" name="category_id" inputmode="numeric" value="{{ form.category_id }}" placeholder="225">
-          <small>Число из URL: …/k0<b>c225</b> → 225 (PC-Zubehör)</small>
+          <input class="input" name="category_id" inputmode="numeric" value="{{ form.category_id }}" placeholder="225" list="ka-categories">
+          <datalist id="ka-categories">{% for c in builtin_categories %}<option value="{{ c.id }}">{{ c.label }}</option>{% endfor %}</datalist>
+          <small>Число из URL: …/k0<b>c225</b> → 225 (PC-Zubehör). Список: <code>python -m ebeyparser categories</code></small>
         </label>
         <label class="field" data-source-only="kleinanzeigen">
           <span>{{ labels.location_id }}</span>

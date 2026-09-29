@@ -16,6 +16,27 @@
     </form>
   </div>
 </section>
+{% if not has_searches %}
+<section class="card setup-banner" aria-label="Первая настройка">
+  <span class="setup-banner-icon">{{ icon('sparkles') }}</span>
+  <div class="grow">
+    <h2>Настрой поиски за 2 минуты</h2>
+    <p>Выбери город, радиус, категории и бюджет — программа сама будет сканировать Kleinanzeigen целиком по категориям и покажет, что можно выгодно купить.</p>
+  </div>
+  <a class="btn btn-primary btn-lg" href="/setup">{{ icon('settings') }}Начать настройку</a>
+</section>
+{% endif %}
+{% if keyword_only %}
+<section class="card setup-banner" data-cat-hint aria-label="Подсказка">
+  <span class="setup-banner-icon">{{ icon('search') }}</span>
+  <div class="grow">
+    <h2>Сейчас только поиски по словам</h2>
+    <p>Программа умеет просматривать целые категории в твоём районе — телефоны, ноутбуки, консоли, комплектующие — и сама находит то, что дешевле рынка. Так выгодных находок намного больше.</p>
+  </div>
+  <a class="btn btn-primary" href="/setup">{{ icon('settings') }}Сканировать категории</a>
+  <button class="icon-btn" type="button" data-dismiss-hint title="Больше не показывать" aria-label="Скрыть подсказку">{{ icon('x') }}</button>
+</section>
+{% endif %}
 {% if last_run %}
 <p class="last-run muted">
   Последняя проверка {{ last_run.started_at | ago }} · новых {{ last_run.new_listings }} · выгодных {{ last_run.deals_found }}
@@ -66,7 +87,7 @@
       <label class="searchbox">
         <span class="sr-only">Поиск по названию</span>
         {{ icon('search') }}
-        <input class="input" type="search" name="q" value="{{ filters.q }}" placeholder="Найти: 3090, ThinkPad…" autocomplete="off">
+        <input class="input" type="search" name="q" value="{{ filters.q }}" placeholder="Найти: 3090, Dyson…" autocomplete="off">
       </label>
       <label class="filters-toggle" for="filters-toggle">
         {{ icon('sliders') }}Фильтры{% if filters.panel_active %} <span class="badge-count">{{ filters.panel_active }}</span>{% endif %}
@@ -149,10 +170,15 @@
   {% if has_searches %}
   <p>Поиски настроены — нажми «Проверить сейчас» или подожди автоматической проверки. Новые находки появятся здесь.</p>
   {% else %}
-  <p>Сначала добавь, что искать: например «RTX 3090 в Берлине до 500 €». Самый простой способ — настроить поиск на kleinanzeigen.de и вставить ссылку на странице «Поиски».</p>
+  <p>Сначала расскажи, что искать: город, радиус, категории (телефоны, ноутбуки, консоли…) и бюджет. Мастер настройки сделает поиски за тебя.</p>
   {% endif %}
   <div class="head-actions">
+    {% if has_searches %}
     <a class="btn btn-primary" href="/searches?new=1#form">{{ icon('plus') }}Добавить поиск</a>
+    {% else %}
+    <a class="btn btn-primary" href="/setup">{{ icon('settings') }}Настроить за 2 минуты</a>
+    <a class="btn" href="/searches?new=1#form">{{ icon('plus') }}Добавить поиск</a>
+    {% endif %}
     <a class="btn" href="/status">{{ icon('activity') }}Статус системы</a>
   </div>
   <p class="small">Хочешь просто посмотреть интерфейс? Запусти <code>python -m ebeyparser demo</code> — появятся демо-сделки.</p>

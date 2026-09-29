@@ -1,0 +1,182 @@
+{% extends "base.html" %}
+{% block title %}Настройка{% endblock %}
+{% macro wish_row(item='', price='', first=false, js_only=true) -%}
+<div class="wish-row" data-wish-row>
+  <input class="input" name="wish_item" value="{{ item }}" maxlength="80" placeholder="{{ 'RTX 3090' if first else 'например: DDR4 ECC 64GB' }}" aria-label="Что ищешь">
+  <input class="input" name="wish_price" value="{{ price }}" inputmode="decimal" placeholder="{{ '550' if first else '€' }}" aria-label="Максимальная цена, €">
+  <button class="icon-btn" type="button" data-wish-remove title="Убрать строку" aria-label="Убрать строку"{% if js_only %} data-js-only hidden{% endif %}>{{ icon('x') }}</button>
+</div>
+{%- endmacro %}
+{% block content %}
+{% set cats_selected = form.category_ids | length %}
+{% set wishes = rows | selectattr(0) | list | length %}
+<section class="page-head">
+  <div>
+    <h1>Настройка за 2 минуты</h1>
+    <p>Город, категории и бюджет — программа сама создаст поиски и будет проверять все новые объявления</p>
+  </div>
+</section>
+<nav class="subnav" aria-label="Настройка">
+  <a href="/setup" class="active" aria-current="page">{{ icon('search') }}Что искать</a>
+  <a href="/settings">{{ icon('sliders') }}Нейросеть, уведомления, выгода</a>
+</nav>
+
+{% if not editable or errors %}
+<div class="stack" style="margin-bottom: 18px">
+  {% if not editable %}
+  <div class="notice warn">{{ icon('alert') }}<div><b>Только просмотр.</b> Приложение запущено без файла конфигурации, поэтому сохранить поиски отсюда нельзя. Настрой всё в терминале: <code>python -m ebeyparser setup</code>, затем запусти <code>python -m ebeyparser run</code>.</div></div>
+  {% endif %}
+  {% if errors %}
+  <div class="notice error" role="alert">{{ icon('alert') }}<div><b>Проверь поля:</b><ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul></div></div>
+  {% endif %}
+</div>
+{% endif %}
+
+<form class="setup-form" method="post" action="/setup" data-setup novalidate>
+  {# ----------------------------------------------------------- 1. region #}
+  <section class="card step">
+    <div class="step-head">
+      <span class="step-num">1</span>
+      <div><h2>Где искать</h2><p>Город или почтовый индекс и радиус вокруг него</p></div>
+    </div>
+    <div class="form-grid">
+      <label class="field">
+        <span>Город или индекс *</span>
+        <input class="input" name="location" value="{{ form.location }}" required maxlength="80" placeholder="Berlin или 10115" autocomplete="off">
+      </label>
+      <label class="field">
+        <span>Радиус</span>
+        <select class="select" name="radius">
+          {% for r in radius_choices %}<option value="{{ r }}" {{ 'selected' if r == form.radius }}>{{ 'только сам город / индекс' if r == 0 else r ~ ' км' }}</option>{% endfor %}
+        </select>
+      </label>
+    </div>
+  </section>
+
+  {# ------------------------------------------------------- 2. categories #}
+  <section class="card step">
+    <div class="step-head">
+      <span class="step-num">2</span>
+      <div><h2>Какие категории сканировать</h2><p>Программа смотрит все новые объявления выбранных категорий в радиусе и ищет те, что дешевле рынка</p></div>
+    </div>
+    {% if categories.live %}
+    <div class="notice success compact">{{ icon('check') }}<div>Категории и число объявлений — с kleinanzeigen.de для «{{ form.location }}»{% if form.radius %} + {{ form.radius }} км{% endif %}{% if categories.fetched_at and not refreshed %}, проверено {{ categories.fetched_at | dt }}{% endif %}.</div></div>
+    {% elif refreshed %}
+    <div class="notice warn compact">{{ icon('alert') }}<div>С сайта список получить не удалось{% if categories.error %}: {{ categories.error }}{% endif %}. Показываю встроенный справочник — сохранять можно.</div></div>
+    {% else %}
+    <div class="notice compact">{{ icon('info') }}<div>Встроенный справочник категорий — без запросов к сайту. Можно сверить его с kleinanzeigen.de и узнать, сколько объявлений в твоём радиусе (1–2 запроса, запомню на 7 дней).</div></div>
+    {% endif %}
+    {% for title, cats in groups %}
+    <h3 class="subhead">{{ title }}</h3>
+    <div class="cat-grid">
+      {% for c in cats %}
+      <label class="cat-option">
+        <input type="checkbox" name="category" value="{{ c.id }}" {{ 'checked' if c.id in form.category_ids }} data-recommended="{{ '1' if c.recommended else '0' }}">
+        <input type="hidden" name="cat_name_{{ c.id }}" value="{{ c.name_de }}">
+        <span class="cat-text">
+          <span class="cat-name">{{ c.name_de }}</span>
+          {% if c.name_ru %}<span class="cat-ru">{{ c.name_ru }}</span>{% endif %}
+          {% if c.count is not none or c.recommended %}
+          <span class="cat-meta">
+            {% if c.recommended %}<span class="chip chip-buy">рекомендуем</span>{% endif %}
+            {% if c.count is not none %}<span class="cat-count">{{ c.count | num }} {{ plural(c.count, 'объявление', 'объявления', 'объявлений') }}</span>{% endif %}
+          </span>
+          {% endif %}
+        </span>
+      </label>
+      {% endfor %}
+    </div>
+    {% endfor %}
+    <div class="inline-actions">
+      <button class="btn btn-sm" type="submit" formaction="/setup" formmethod="get" formnovalidate name="refresh" value="1" data-busy-on-click>{{ icon('refresh') }}Сверить с сайтом для этого места</button>
+      <button class="btn btn-ghost btn-sm" type="button" data-cat-select="recommended" data-js-only hidden>{{ icon('star') }}Только рекомендуемые</button>
+      <button class="btn btn-ghost btn-sm" type="button" data-cat-select="none" data-js-only hidden>{{ icon('x') }}Снять все</button>
+    </div>
+  </section>
+
+  {# --------------------------------------------------- 3. purpose, budget #}
+  <section class="card step">
+    <div class="step-head">
+      <span class="step-num">3</span>
+      <div><h2>Цель и бюджет</h2><p>Как считать выгоду и сколько ты готов вложить в одну вещь</p></div>
+    </div>
+    <div class="choice-grid" role="radiogroup" aria-label="Цель">
+      <label class="choice">
+        <input type="radio" name="purpose" value="resale" {{ 'checked' if form.purpose != 'personal' }}>
+        <span><b>Перепродажа</b><small>Купить дешевле рынка и продать — считаем чистую прибыль</small></span>
+      </label>
+      <label class="choice">
+        <input type="radio" name="purpose" value="personal" {{ 'checked' if form.purpose == 'personal' }}>
+        <span><b>Для себя</b><small>Купить выгодно в личное пользование — считаем экономию</small></span>
+      </label>
+    </div>
+    <div class="form-grid" style="margin-top: 14px">
+      <label class="field">
+        <span>Максимальная цена за одну вещь, €</span>
+        <input class="input" name="max_price" inputmode="decimal" value="{{ form.max_price }}" placeholder="{{ default_budget | num }}">
+        <small>Дороже и дешевле порога категории — не присылаю, но такие цены учитываются для оценки рынка</small>
+      </label>
+      <label class="field" data-purpose-only="resale">
+        <span>Минимальная прибыль со сделки, €</span>
+        <input class="input" name="min_profit" inputmode="decimal" value="{{ form.min_profit }}" placeholder="{{ default_min_profit | num }}">
+        <small>Сделки с меньшей чистой прибылью не считаются выгодными</small>
+      </label>
+    </div>
+  </section>
+
+  {# --------------------------------------------------------- 4. wishlist #}
+  <section class="card step">
+    <div class="step-head">
+      <span class="step-num">4</span>
+      <div>
+        <h2>Для себя: список желаний <span class="muted small">необязательно</span></h2>
+        <p>Что хочешь купить себе и за сколько — например, «RTX 3090» до 550 €. Покажем и чуть дороже (до&nbsp;+20&nbsp;%): с продавцом можно поторговаться.</p>
+      </div>
+    </div>
+    <div class="wish-row wish-head" aria-hidden="true"><span>Что ищешь</span><span>Макс. цена, €</span><span></span></div>
+    <div class="wish-list" data-wish-list>
+      {% for item, price in rows %}{{ wish_row(item, price, loop.first) }}{% endfor %}
+    </div>
+    <template data-wish-template>{{ wish_row(js_only=false) }}</template>
+    <div class="inline-actions" data-js-only hidden>
+      <button class="btn btn-ghost btn-sm" type="button" data-wish-add>{{ icon('plus') }}Ещё строка</button>
+    </div>
+  </section>
+
+  {# --------------------------------------------------------- 5. interval #}
+  <section class="card step">
+    <div class="step-head">
+      <span class="step-num">5</span>
+      <div><h2>Как часто проверять</h2><p>Чаще — раньше увидишь выгодное объявление, но выше риск, что Kleinanzeigen временно заблокирует. Каждая категория — до 3 страниц выдачи за проверку, а часть лимита запросов нужна на оценку объявлений. Для {{ cats_selected + wishes }} {{ plural(cats_selected + wishes, 'поиска', 'поисков', 'поисков') }} безопасно раз в <span data-suggested>{{ suggested_interval }}</span> мин или реже.</p></div>
+    </div>
+    <div class="form-grid">
+      <label class="field">
+        <span>Интервал, минут</span>
+        <input class="input" name="interval_minutes" inputmode="numeric" value="{{ form.interval_minutes }}" placeholder="{{ suggested_interval }}">
+        <small>Сейчас в конфиге: раз в {{ current_interval | num }} мин</small>
+      </label>
+    </div>
+    <div class="estimate {{ 'warn' if estimate.tight }}" data-estimate data-scan-pages="{{ budget.scan_pages }}" data-kw-pages="{{ budget.keyword_pages }}" data-extra="{{ budget.extra }}" data-cap="{{ budget.cap }}" data-share="{{ budget.share }}" data-interval="{{ suggested_interval }}">
+      {{ icon('activity') }}
+      <span data-estimate-text>{{ estimate.describe() }}</span>
+    </div>
+  </section>
+
+  {# ------------------------------------------------------------- save #}
+  <section class="card setup-save">
+    <div class="grow">
+      <b data-setup-count>
+        {%- if cats_selected or wishes -%}
+        Будет создано: {{ cats_selected }} {{ plural(cats_selected, 'поиск', 'поиска', 'поисков') }} по категориям{% if wishes %} и {{ wishes }} «для себя»{% endif %}
+        {%- else -%}Выбери хотя бы одну категорию или добавь вещь «для себя»{%- endif -%}
+      </b>
+      {% if existing_count %}
+      <label class="check"><input type="checkbox" name="replace" value="1" {{ 'checked' if form.replace }}> Заменить текущие поиски ({{ existing_count }}) — копия {{ config_path.name if config_path else 'config.yaml' }} сохранится как .bak</label>
+      {% else %}
+      <p class="muted small">Поиски появятся на странице «Поиски» — там их можно поправить или выключить.</p>
+      {% endif %}
+    </div>
+    <button class="btn btn-primary btn-lg" type="submit" {% if not editable %}disabled title="Только просмотр: приложение запущено без config.yaml"{% endif %}>{{ icon('check') }}Сохранить поиски</button>
+  </section>
+</form>
+{% endblock %}

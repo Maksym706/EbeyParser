@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+{% block title %}Настройки{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <h1>Настройки</h1>
+    <p>Нейросеть, уведомления и что считать выгодной сделкой</p>
+  </div>
+</section>
+<nav class="subnav" aria-label="Настройка">
+  <a href="/setup">{{ icon('search') }}Что искать</a>
+  <a href="/settings" class="active" aria-current="page">{{ icon('sliders') }}Нейросеть, уведомления, выгода</a>
+</nav>
+
+{% if notice or errors or not editable %}
+<div class="stack" style="margin-bottom: 18px">
+  {% if notice %}<div class="notice success">{{ icon('check') }}<div>{{ notice }} — записано в <code>{{ config_path.name }}</code>, комментарии в файле не тронуты. Монитор уже использует новые настройки.</div></div>{% endif %}
+  {% if errors %}<div class="notice error" role="alert">{{ icon('alert') }}<div><b>Проверь поля:</b><ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul></div></div>{% endif %}
+  {% if not editable %}<div class="notice warn">{{ icon('alert') }}<div><b>Только просмотр.</b> Приложение запущено без файла конфигурации — сохранить настройки отсюда нельзя. Запусти <code>python -m ebeyparser setup</code>, затем <code>python -m ebeyparser run</code>.</div></div>{% endif %}
+</div>
+{% endif %}
+
+<div class="settings-grid">
+  {# --------------------------------------------------------------- AI #}
+  <form class="card settings-card" id="ai" method="post" action="/settings/ai" novalidate>
+    <div class="status-card-head">
+      <span class="status-icon">{{ icon('cpu') }}</span>
+      <div class="grow"><h2>Локальная нейросеть</h2><div class="muted small">Смотрит фото и описание каждого перспективного объявления</div></div>
+    </div>
+    <label class="check"><input type="checkbox" name="enabled" value="1" {{ 'checked' if v.ai_enabled }}> Проверять объявления нейросетью</label>
+    <div class="form-grid">
+      <label class="field">
+        <span>Сервер</span>
+        <select class="select" name="provider">
+          <option value="openai" {{ 'selected' if v.provider == 'openai' }}>LM Studio (OpenAI-совместимый)</option>
+          <option value="ollama" {{ 'selected' if v.provider == 'ollama' }}>Ollama</option>
+          {% if v.provider not in ('openai', 'ollama') %}<option value="{{ v.provider }}" selected>{{ v.provider }}</option>{% endif %}
+        </select>
+      </label>
+      <label class="field">
+        <span>Адрес</span>
+        <input class="input" name="base_url" value="{{ v.base_url }}" placeholder="http://localhost:1234/v1" autocomplete="off">
+      </label>
+      <label class="field span-2">
+        <span>Модель (должна видеть фото)</span>
+        <input class="input" name="model" value="{{ v.model }}" placeholder="qwen/qwen2.5-vl-7b" autocomplete="off">
+        <small>LM Studio: скачай Qwen2.5-VL-7B во вкладке Discover, затем Developer → Start Server.</small>
+      </label>
+    </div>
+    <div class="small" data-ai-servers></div>
+    <div class="actions">
+      <button class="btn btn-primary" type="submit" {% if not editable %}disabled{% endif %}>{{ icon('check') }}Сохранить</button>
+      <button class="btn" type="button" data-ai-detect>{{ icon('search') }}Найти LM Studio / Ollama</button>
+      <button class="btn btn-ghost" type="button" data-ai-check {% if not has_monitor %}disabled title="Монитор не подключён"{% endif %}>{{ icon('activity') }}Проверить</button>
+    </div>
+    <div class="result" data-ai-result hidden></div>
+  </form>
+
+  {# --------------------------------------------------------- Telegram #}
+  <form class="card settings-card" id="telegram" method="post" action="/settings/telegram" novalidate autocomplete="off">
+    <div class="status-card-head">
+      <span class="status-icon">{{ icon('send') }}</span>
+      <div class="grow"><h2>Telegram</h2><div class="muted small">Сообщение с фото и кнопкой, как только найдётся выгодное</div></div>
+    </div>
+    <ol class="muted small" style="margin: 0; padding-left: 18px">
+      <li>Напиши <b>@BotFather</b> → <code>/newbot</code> → он пришлёт токен.</li>
+      <li>Напиши своему боту любое сообщение, свой chat_id узнай у <b>@userinfobot</b>.</li>
+    </ol>
+    <label class="check"><input type="checkbox" name="enabled" value="1" {{ 'checked' if v.tg_enabled }}> Присылать уведомления в Telegram</label>
+    <div class="form-grid">
+      <label class="field span-2">
+        <span>Токен бота</span>
+        <input class="input" name="bot_token" type="password" value="" placeholder="{{ 'задан — оставь пустым, чтобы не менять' if token_set else '123456789:AAH…' }}" autocomplete="new-password">
+        <small>Хранится в файле .env рядом с config.yaml, не в самом конфиге.</small>
+      </label>
+      <label class="field">
+        <span>chat_id</span>
+        <input class="input" name="chat_id" value="{{ v.chat_id }}" inputmode="numeric" placeholder="123456789">
+      </label>
+    </div>
+    <div class="actions">
+      <button class="btn btn-primary" type="submit" {% if not editable %}disabled{% endif %}>{{ icon('check') }}Сохранить</button>
+      <button class="btn" type="button" data-notify-test {% if not has_notifiers %}disabled title="Каналы уведомлений не подключены"{% endif %}>{{ icon('send') }}Тест</button>
+    </div>
+    <div class="results" data-notify-results></div>
+  </form>
+
+  {# ---------------------------------------------------------- pricing #}
+  <form class="card settings-card" id="pricing" method="post" action="/settings/pricing" novalidate>
+    <div class="status-card-head">
+      <span class="status-icon">{{ icon('wallet') }}</span>
+      <div class="grow"><h2>Что считать выгодным</h2><div class="muted small">Для перепродажи; для поисков «для себя» считается экономия</div></div>
+    </div>
+    <div class="form-grid">
+      <label class="field">
+        <span>Минимальная прибыль, €</span>
+        <input class="input" name="min_profit" inputmode="decimal" value="{{ v.min_profit }}" placeholder="40">
+        <small>Чистыми, после запаса на торг и доставку</small>
+      </label>
+      <label class="field">
+        <span>Минимальный ROI, %</span>
+        <input class="input" name="min_roi" inputmode="decimal" value="{{ v.min_roi }}" placeholder="25">
+        <small>Прибыль относительно цены покупки</small>
+      </label>
+      {% if has_capital %}
+      <label class="field">
+        <span>Максимум на одну покупку, €</span>
+        <input class="input" name="max_capital" inputmode="decimal" value="{{ v.max_capital }}" placeholder="без лимита">
+        <small>Дороже этого «покупать» не посоветую</small>
+      </label>
+      {% endif %}
+      {% if has_vb %}
+      <label class="field">
+        <span>Скидка при торге (VB), %</span>
+        <input class="input" name="vb_discount" inputmode="decimal" value="{{ v.vb_discount }}" placeholder="10">
+        <small>Насколько обычно уступают, если в цене «VB»</small>
+      </label>
+      {% endif %}
+    </div>
+    <div class="actions">
+      <button class="btn btn-primary" type="submit" {% if not editable %}disabled{% endif %}>{{ icon('check') }}Сохранить</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

@@ -27,6 +27,10 @@ class Notifier(Protocol):
         """Deliver `deals`; raise NotifyError on failure. Empty list -> no-op."""
         ...
 
+    async def send_text(self, text: str) -> None:
+        """Deliver a short service message (health alert, heartbeat); raise NotifyError on failure."""
+        ...
+
 
 def _host_is_local(host: str) -> bool:
     return is_local_url(f"smtp://{host.strip()}") if host.strip() else False

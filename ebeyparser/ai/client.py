@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
+import re
 from typing import Any, Protocol
 
 import httpx
@@ -17,6 +19,15 @@ log = logging.getLogger(__name__)
 # Photos are expensive in tokens: 3 images at ~1000 tokens each overflow Ollama's
 # default 2k/4k context, so ask for a bigger window.
 OLLAMA_NUM_CTX = 8192
+# The JSON answer is ~300-450 tokens; the cap stops a 7B model that starts rambling or
+# repeating (the parser salvages a cut-off answer).
+MAX_OUTPUT_TOKENS = 700
+# Images for the model: long side <= 1024 px (a 7B VL model gains nothing from more,
+# each extra pixel costs tokens and time), JPEG q85, and a cap on the total payload.
+IMAGE_MAX_SIDE = 1024
+IMAGE_JPEG_QUALITY = 85
+IMAGE_REENCODE_BYTES = 350_000  # re-compress even small-dimension images above this size
+MAX_TOTAL_IMAGE_BYTES = 3_000_000
 
 
 class LLMError(Exception):
@@ -35,8 +46,8 @@ class ChatModel(Protocol):
     async def aclose(self) -> None: ...
 
 
-def image_mime(data: bytes) -> str:
-    """Mime type from magic bytes (jpeg/png/webp/gif); jpeg if unknown."""
+def _sniff_mime(data: bytes) -> str | None:
+    """Mime type from magic bytes (jpeg/png/webp/gif), None if not one of those."""
     if data[:3] == b"\xff\xd8\xff":
         return "image/jpeg"
     if data[:8] == b"\x89PNG\r\n\x1a\n":
@@ -45,11 +56,79 @@ def image_mime(data: bytes) -> str:
         return "image/webp"
     if data[:6] in (b"GIF87a", b"GIF89a"):
         return "image/gif"
-    return "image/jpeg"
+    return None
+
+
+def image_mime(data: bytes) -> str:
+    """Mime type from magic bytes (jpeg/png/webp/gif); jpeg if unknown."""
+    return _sniff_mime(data) or "image/jpeg"
 
 
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
+
+
+def _shrink(data: bytes, max_side: int, quality: int) -> bytes | None:
+    """Downscale/re-encode one image with Pillow (optional dependency).
+    Returns the new bytes, the input when nothing needs to change, or None when the
+    bytes are not an image at all (e.g. an HTML error page)."""
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:  # Pillow not installed: pass through unchanged
+        return data
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            fmt = (img.format or "").upper()
+            too_big = max(img.size) > max_side
+            if not too_big and fmt in ("JPEG", "PNG") and len(data) <= IMAGE_REENCODE_BYTES:
+                return data
+            img.seek(0)  # first frame of a GIF / animated WebP
+            out = ImageOps.exif_transpose(img)
+            if out.mode not in ("RGB", "L"):
+                out = out.convert("RGBA")
+                background = Image.new("RGB", out.size, (255, 255, 255))  # transparent -> white
+                background.paste(out, mask=out.getchannel("A"))
+                out = background
+            if too_big:
+                out.thumbnail((max_side, max_side), getattr(Image, "Resampling", Image).LANCZOS)
+            buf = io.BytesIO()
+            out.convert("RGB").save(buf, "JPEG", quality=quality, optimize=True)
+    except Exception as exc:  # noqa: BLE001 - broken/truncated file or odd format
+        if _sniff_mime(data) is not None:
+            log.debug("Pillow could not process an image (%s), sending it unchanged", exc)
+            return data
+        log.info("Skipping a download that is not an image (%d bytes)", len(data))
+        return None
+    small = buf.getvalue()
+    # WebP/GIF/... always become JPEG (not every local server decodes them)
+    return small if too_big or fmt not in ("JPEG", "PNG") or len(small) < len(data) else data
+
+
+def prepare_images(
+    images: list[bytes] | None,
+    *,
+    max_side: int = IMAGE_MAX_SIDE,
+    quality: int = IMAGE_JPEG_QUALITY,
+    max_total_bytes: int = MAX_TOTAL_IMAGE_BYTES,
+) -> list[bytes]:
+    """Images ready for a vision model: long side <= `max_side` px as JPEG (when Pillow is
+    installed; otherwise unchanged), non-images dropped, and no more than
+    `max_total_bytes` in total (later images are dropped, the first one is always kept).
+    Idempotent: prepared images pass through unchanged."""
+    out: list[bytes] = []
+    total = 0
+    for data in images or []:
+        if not data:
+            continue
+        small = _shrink(data, max_side, quality)
+        if small is None:
+            continue
+        if out and total + len(small) > max_total_bytes:
+            log.info("Image payload cap %d bytes reached, sending %d image(s)", max_total_bytes, len(out))
+            break
+        out.append(small)
+        total += len(small)
+    return out
 
 
 def _model_names_match(wanted: str, available: str) -> bool:
@@ -63,6 +142,51 @@ def _model_names_match(wanted: str, available: str) -> bool:
     return w in (tail, tail.removesuffix(".gguf"))
 
 
+_NOISE_TOKENS = re.compile(
+    r"(?:^|[-_.:\s])(?:instruct|it|chat|gguf|mlx|latest|hf|q\d[\w]*|\d+bit|fp16|bf16|f16)(?=$|[-_.:\s])"
+)
+
+
+def canonical_model_name(name: str) -> str:
+    """'qwen/Qwen2.5-VL-7B-Instruct-GGUF' and 'qwen2.5vl:7b' both -> 'qwen25vl7b'."""
+    tail = name.strip().lower().replace("\\", "/").rsplit("/", 1)[-1].removesuffix(".gguf")
+    previous = None
+    while previous != tail:  # tokens can be adjacent: "-instruct-q4_k_m"
+        previous, tail = tail, _NOISE_TOKENS.sub("", tail)
+    return re.sub(r"[^a-z0-9]", "", tail)
+
+
+def find_model(wanted: str, available: list[str]) -> str | None:
+    """The server's own id for the configured model: exact, then publisher/path, then fuzzy."""
+    for name in available:
+        if _model_names_match(wanted, name):
+            return name
+    key = canonical_model_name(wanted)
+    if key:
+        for name in available:
+            if canonical_model_name(name) == key:
+                return name
+    return None
+
+
+def _model_missing(body: str) -> bool:
+    low = body.lower()
+    return "model" in low and any(
+        w in low for w in ("not found", "not loaded", "no model", "does not exist", "invalid model",
+                           "unknown model", "failed to load")
+    )
+
+
+VISION_HINTS = ("vl", "vision", "llava", "gemma-3", "gemma3", "minicpm-v", "minicpmv", "pixtral",
+                "moondream", "internvl", "molmo", "multimodal", "mistral-small-3", "glm-4.1v",
+                "glm-4.5v", "kimi-vl", "qwen3-vl", "qwen2.5-omni", "llama-4")
+
+
+def looks_like_vision_model(name: str) -> bool:
+    low = name.lower()
+    return any(h in low for h in VISION_HINTS) and "embed" not in low
+
+
 class VisionLLM:
     """chat_json / health / aclose for Ollama and OpenAI-compatible servers."""
 
@@ -73,6 +197,8 @@ class VisionLLM:
             )
         self.cfg = cfg
         self.provider = cfg.provider
+        self._resolved_model: str | None = None  # the server's exact id for cfg.model
+        self._resolve_tried = False
         base = (cfg.base_url or "").strip().rstrip("/")
         if not base:
             base = "http://localhost:11434" if cfg.provider == "ollama" else "http://localhost:1234"
@@ -83,6 +209,9 @@ class VisionLLM:
                     base = base[: -len(suffix)]
         self.base_url = base
         headers = {"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else {}
+        # optional config knobs (not in LLMSettings yet): ai.max_tokens / ai.image_max_side
+        self._max_tokens = int(getattr(cfg, "max_tokens", None) or MAX_OUTPUT_TOKENS)
+        self._image_max_side = int(getattr(cfg, "image_max_side", None) or IMAGE_MAX_SIDE)
         timeout = httpx.Timeout(cfg.timeout_seconds, connect=min(10.0, cfg.timeout_seconds))
         self._client = httpx.AsyncClient(timeout=timeout, headers=headers, transport=transport)
 
@@ -158,10 +287,10 @@ class VisionLLM:
         self, system: str, user: str, images: list[bytes] | None = None, schema: dict | None = None
     ) -> str:
         """Ask for a JSON answer; returns the raw text content of the reply."""
-        images = [img for img in (images or []) if img]
+        images = prepare_images(images, max_side=self._image_max_side)
         if self.provider == "ollama":
             return await self._chat_ollama(system, user, images, schema)
-        return await self._chat_openai(system, user, images)
+        return await self._chat_openai(system, user, images, schema)
 
     async def _chat_ollama(
         self, system: str, user: str, images: list[bytes], schema: dict | None
@@ -170,11 +299,15 @@ class VisionLLM:
         if images:
             user_msg["images"] = [_b64(img) for img in images]
         payload: dict[str, Any] = {
-            "model": self.cfg.model,
+            "model": self.model_name,
             "messages": [{"role": "system", "content": system}, user_msg],
             "stream": False,
             "format": schema or "json",
-            "options": {"temperature": self.cfg.temperature, "num_ctx": OLLAMA_NUM_CTX},
+            "options": {
+                "temperature": self.cfg.temperature,
+                "num_ctx": OLLAMA_NUM_CTX,
+                "num_predict": self._max_tokens,
+            },
         }
         resp = await self._request("POST", self._chat_url(), payload)
         if resp.status_code == 400 and schema and "format" in resp.text.lower():
@@ -191,7 +324,9 @@ class VisionLLM:
             raise LLMError(f"Неожиданный ответ Ollama: {json.dumps(data)[:200]}") from exc
         return content if isinstance(content, str) else json.dumps(content)
 
-    async def _chat_openai(self, system: str, user: str, images: list[bytes]) -> str:
+    async def _chat_openai(
+        self, system: str, user: str, images: list[bytes], schema: dict | None = None
+    ) -> str:
         if images:
             content: Any = [{"type": "text", "text": user}] + [
                 {
@@ -203,22 +338,31 @@ class VisionLLM:
         else:
             content = user  # plain string: some servers reject list content without images
         payload: dict[str, Any] = {
-            "model": self.cfg.model,
+            "model": self.model_name,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": content},
             ],
             "temperature": self.cfg.temperature,
+            "max_tokens": self._max_tokens,
             "stream": False,
-            "response_format": {"type": "json_object"},
         }
-        url = self._chat_url()
-        resp = await self._request("POST", url, payload)
-        if resp.status_code in (400, 422) and "response_format" in resp.text.lower():
-            # e.g. LM Studio only accepts json_schema; the prompt demands JSON anyway
-            log.info("Server rejected response_format, retrying without it")
-            payload.pop("response_format")
-            resp = await self._request("POST", url, payload)
+        # Strictest first: json_schema (LM Studio, llama.cpp, vLLM constrain the output to
+        # the schema), then json_object, then plain text (the prompt demands JSON anyway).
+        formats: list[dict[str, Any] | None] = [{"type": "json_object"}, None]
+        if schema:
+            formats.insert(0, {
+                "type": "json_schema",
+                "json_schema": {"name": "verdict", "strict": True, "schema": schema},
+            })
+        resp = await self._post_openai(payload, formats)
+        if resp.status_code in (400, 404, 422) and _model_missing(resp.text) and not self._resolve_tried:
+            # e.g. config says "qwen2.5-vl-7b-instruct", LM Studio calls it "qwen/qwen2.5-vl-7b"
+            await self._resolve_model()
+            if self._resolved_model and self._resolved_model != payload["model"]:
+                log.info("Using server model id %r for %r", self._resolved_model, self.cfg.model)
+                payload["model"] = self._resolved_model
+                resp = await self._post_openai(payload, formats)
         if resp.status_code >= 400:
             raise self._http_error(resp)
         data = self._json(resp)
@@ -233,10 +377,45 @@ class VisionLLM:
             )
         return content_out or ""
 
+    async def _post_openai(
+        self, payload: dict[str, Any], formats: list[dict[str, Any] | None]
+    ) -> httpx.Response:
+        url = self._chat_url()
+        for i, fmt in enumerate(formats):
+            if fmt is None:
+                payload.pop("response_format", None)
+            else:
+                payload["response_format"] = fmt
+            resp = await self._request("POST", url, payload)
+            rejected = resp.status_code in (400, 422) and any(
+                word in resp.text.lower() for word in ("response_format", "json_schema", "json_object")
+            )
+            if not rejected or i == len(formats) - 1:
+                return resp
+            log.info("Server rejected response_format %s, trying a simpler one", fmt and fmt["type"])
+        return resp
+
+    @property
+    def model_name(self) -> str:
+        """What we send as "model": the server's exact id when we found it, else the config value."""
+        return self._resolved_model or self.cfg.model
+
+    async def _resolve_model(self) -> None:
+        """Once per client: map e.g. 'qwen2.5-vl-7b-instruct' to LM Studio's 'qwen/qwen2.5-vl-7b'."""
+        if self._resolve_tried:
+            return
+        self._resolve_tried = True
+        try:
+            await self.health()
+        except Exception as exc:  # never block a chat on this
+            log.debug("Model name resolution failed: %s", exc)
+
     async def health(self) -> dict:
         """Is the server up and is the configured model installed/loaded?"""
         info: dict[str, Any] = {
             "ok": False,
+            "server_ok": False,
+            "resolved_model": None,
             "provider": self.provider,
             "base_url": self.base_url,
             "model": self.cfg.model,
@@ -252,11 +431,16 @@ class VisionLLM:
         except LLMError as exc:
             info["error"] = str(exc)
             return info
+        info["server_ok"] = True
         key, field = ("models", "name") if self.provider == "ollama" else ("data", "id")
         items = data.get(key, []) if isinstance(data, dict) else []
         names = [str(m.get(field) or m.get("model") or "") for m in items if isinstance(m, dict)]
         info["models"] = [n for n in names if n]
-        info["model_available"] = any(_model_names_match(self.cfg.model, n) for n in info["models"])
+        match = find_model(self.cfg.model, info["models"])
+        if match is not None:
+            self._resolved_model = match
+            info["resolved_model"] = match
+        info["model_available"] = match is not None
         info["ok"] = info["model_available"]
         if not info["model_available"]:
             if self.provider == "ollama":

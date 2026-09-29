@@ -110,8 +110,9 @@
 
       {% if ev %}
       <div class="metrics">
-        <div class="metric {{ 'pos' if card.profit and card.profit.positive else ('neg' if card.profit else '') }}">
-          <span>{{ 'Экономия' if card.purpose == 'personal' else 'Прибыль' }}</span>
+        {% set p = ev.expected_profit %}
+        <div class="metric {{ '' if p is none else ('pos' if p > 0 else 'neg') }}">
+          <span>{{ 'Экономия' if card.purpose == 'personal' else 'Прибыль' }}{% if card.haggle %} по цене объявления{% endif %}</span>
           <b>{{ (ev.expected_profit | round if ev.expected_profit is not none else none) | money(sign=card.purpose != 'personal') }}</b>
         </div>
         <div class="metric"><span>ROI</span><b>{{ ev.roi | pct }}</b></div>
@@ -120,6 +121,18 @@
       </div>
       {% endif %}
 
+      {% if card.unchecked %}
+      <div class="notice error">{{ icon('alert') }}<div><b>Фото не проверены ИИ — проверь сам.</b> Когда оценивалось это объявление, нейросеть была недоступна: фото и описание никто не сравнил.</div></div>
+      {% endif %}
+      {% if card.haggle %}
+      <div class="highlight">
+        {{ icon('message') }}
+        <div>
+          <div><b>{{ card.haggle }}</b></div>
+          <div class="muted">В цене «VB» — продавец готов торговаться. Прибыль выше посчитана по цене в объявлении.</div>
+        </div>
+      </div>
+      {% endif %}
       {% if card.max_buy_text %}
       <div class="highlight {{ 'over' if card.max_buy_ok == false }}">
         {{ icon('target') }}
