@@ -489,6 +489,79 @@ def toast_text(state: ProjectState, drafts: list[AlertDraft]) -> str:
     return f"Сборка «{project.name}»: {offer_title(first.offer)} за {_money(first.offer.unit_cost)} — ниже цели"
 
 
+def monitor_covers(config: Any, db: Any, ad_id: str, evaluation: Evaluation | None) -> bool:
+    """Does (or will) the monitor's normal deal alert go out for this ad? Then the project context
+    rides along in THAT message (notify.extras) and no second message is sent. The same rules as
+    Monitor._should_notify: not no_alert, verdict + score over the threshold (or an AI-unchecked
+    would-be buy), not hidden — or it was already delivered."""
+    notifications = getattr(config, "notifications", None)
+    if notifications is None:
+        return False
+    try:
+        if db.was_notified(ad_id):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    if evaluation is None or evaluation.no_alert:
+        return False
+    unchecked = (evaluation.would_buy and evaluation.ai_checked is False
+                 and getattr(notifications, "unchecked_deals", False) and "buy" in notifications.verdicts)
+    if not unchecked and (evaluation.verdict not in notifications.verdicts
+                          or evaluation.score < notifications.min_score):
+        return False
+    try:
+        deal = db.get_deal(ad_id)
+    except Exception:  # noqa: BLE001
+        return False
+    return deal is not None and deal.status != "ignored"
+
+
+def find_offer(state: ProjectState, ad_id: str) -> Offer | None:
+    for ss in state.slots.values():
+        for offer in [*ss.offers, *(o for offers in ss.alternatives.values() for o in offers)]:
+            if offer.ad_id == ad_id:
+                return offer
+    return None
+
+
+def total_with(state: ProjectState, offer: Offer) -> tuple[float, bool]:
+    """The build total if THIS offer is bought (other units / parts: their best offers, else the
+    market), and whether every part has a real offer."""
+    t = state.totals
+    ss = state.slots[offer.slot]
+    need = max(1, ss.need)
+    typical = ss.price.typical or 0.0
+    now_cost = (ss.best_cost or 0.0) + typical * max(0, ss.need - len(ss.picked))
+    others = [o for o in ss.offers if o.ad_id != offer.ad_id][: need - 1]
+    with_cost = offer.unit_cost + sum(o.unit_cost for o in others) + typical * max(0, need - 1 - len(others))
+    complete_elsewhere = all(s.best_complete for k, s in state.slots.items() if k != offer.slot and s.need > 0)
+    return t["estimated_total"] - now_cost + with_cost, complete_elsewhere and len(others) >= need - 1
+
+
+def context_line(state: ProjectState, offer: Offer) -> str:
+    """«📦 Для сборки «LLM-сервер»: RTX 3090 24 ГБ за 580 € → итог 1 240 € из 1 500 € · ниже цели 600 €»."""
+    project = state.project
+    ss = state.slots[offer.slot]
+    head = f"📦 Для сборки «{project.name}»: "
+    if offer.option != ss.rs.slot.chosen:
+        opt = ss.rs.slot.option(offer.option)
+        chosen = ss.rs.part.label if ss.rs.part else ss.rs.slot.label
+        text = head + f"вместо {chosen} — {offer_title(offer)} за {_money(offer.unit_cost)}"
+        target = opt.target_price if opt is not None else None
+        if target and offer.unit_cost <= target:
+            text += f" · ниже цели {_money(target)}"
+        return text
+    total, complete = total_with(state, offer)
+    text = head + f"{offer_title(offer)} за {_money(offer.unit_cost)} → итог {'' if complete else '~'}{_money(total)}"
+    if project.budget:
+        text += f" из {_money(project.budget)}"
+    if ss.target_unit and offer.unit_cost <= ss.target_unit:
+        text += f" · ниже цели {_money(ss.target_unit)}"
+    if project.budget and complete and total <= project.budget:
+        text += " ✓ в бюджете"
+    return text
+
+
 Publish = Callable[[dict[str, Any]], Any]
 
 
@@ -512,6 +585,44 @@ class ProjectAlerter:
         self._signatures: dict[int, str] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
         self.sent: list[str] = []  # texts sent (tests / diagnostics)
+
+    def configure(self, *, config: Callable[[], Any] | None = None, notifiers: Callable[[], list[Any]] | None = None,
+                  publish: Publish | None = None, project_url: Callable[[int], str | None] | None = None,
+                  market: Market | None = None) -> None:
+        """Late wiring (the web app attaches to a monitor the CLI already wired): given values win."""
+        if config is not None:
+            self._config = config
+        if notifiers is not None:
+            self._notifiers = notifiers
+        if publish is not None:
+            self._publish = publish
+        if project_url is not None:
+            self._project_url = project_url
+        if market is not None:
+            self.market = market
+
+    async def drain(self, timeout: float = 120.0) -> None:
+        """Wait for the checks scheduled by events (a single `once` pass ends right after its
+        run_finished: the sweep must not be cancelled with the event loop)."""
+        pending = [t for t in list(self._tasks) if not t.done()]
+        if pending:
+            await asyncio.wait(pending, timeout=timeout)
+
+    def context_lines(self, listing: Listing, evaluation: Evaluation | None = None) -> list[str]:
+        """notify.extras provider: the project context of an ad the monitor alerts on."""
+        search = listing.search_name or self.store.listing_search(listing.ad_id)
+        if not search:
+            return []
+        lines: list[str] = []
+        for pid in self.store.projects_for_search(search):
+            project = self.store.get(pid)
+            if project is None or project.status != "tracking":
+                continue
+            state = project_state(project, self.store, self.market)
+            offer = find_offer(state, listing.ad_id)
+            if offer is not None:
+                lines.append(context_line(state, offer))
+        return lines[:2]
 
     # ------------------------------------------------------------- events
     def on_event(self, kind: str, data: dict[str, Any]) -> None:
@@ -596,6 +707,16 @@ class ProjectAlerter:
         drafts = alert_candidates(state, self.store.alerted(project.id), only_ad=only_ad)
         if not drafts:
             return 0
+        # one ad -> one message: ads the monitor's normal deal alert covers get the project context in
+        # that message (notify.extras); only the rest get a message of their own
+        config = self._config() if self._config is not None else None
+        covered = [d for d in drafts if monitor_covers(config, self.db, d.offer.ad_id, d.offer.evaluation)]
+        if covered:
+            self._record_covered(state, covered)
+            drafts = [d for d in drafts if d not in covered]
+            if not drafts:
+                self._announce(project, "offer", state, ad_id=covered[0].offer.ad_id)
+                return 0
         url = self._project_url(project.id) if self._project_url else None
         text = alert_text(state, drafts, project_url=url)
         claimed = []
@@ -622,6 +743,17 @@ class ProjectAlerter:
                                                        "delivered": delivered > 0,
                                                        "ad_id": drafts[0].offer.ad_id})
         return len(claimed)
+
+    def _record_covered(self, state: ProjectState, drafts: list[AlertDraft]) -> None:
+        project = state.project
+        for d in drafts:
+            record = AlertRecord(project_id=project.id, ad_id=d.offer.ad_id, kind=d.kind, slot=d.slot,  # type: ignore[arg-type]
+                                 price=d.offer.unit_cost, total=state.totals.get("best_total"),
+                                 text=context_line(state, d.offer) + " (в уведомлении о сделке)", delivered=True)
+            self.store.claim_alert(record)
+        if any(d.kind == "budget_fit" for d in drafts) and not project.fits_alerted:
+            project.fits_alerted = True
+            self.store.save(project)
 
     async def _send(self, text: str) -> tuple[int, int]:
         try:
@@ -654,6 +786,7 @@ class ProjectAlerter:
 
 __all__ = [
     "AlertDraft", "Offer", "ProjectAlerter", "ProjectState", "SlotState", "alert_candidates", "alert_text",
-    "budget_ratio", "collect_offers", "option_target", "price_trend", "project_state", "rank_gpu_offers",
-    "round_price", "spent_total", "stretch_label", "toast_text", "totals",
+    "budget_ratio", "collect_offers", "context_line", "find_offer", "monitor_covers", "option_target", "price_trend",
+    "project_state", "rank_gpu_offers", "round_price", "spent_total", "stretch_label", "toast_text", "total_with",
+    "totals",
 ]

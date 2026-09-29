@@ -441,7 +441,77 @@ Reading it:
 
 ### 14.2 Real-LLM smoke test
 
-(filled in below)
+**Setup.** Hugging Face is blocked from this sandbox (proxy 403). The llama.cpp release (b10830, CPU) came from GitHub
+releases, and `qwen2.5-1.5b-instruct-q4_k_m.gguf` from a GitHub release mirror (size matches the official file). The
+model research downloaded the Qwen3.5 GGUFs, and the smoke test used **Qwen3.5-2B Q4_K_M** (the catalog's T0 pick)
+read-only. `llama-server` (OpenAI-compatible, private port) went through the **real** `VisionLLM` client
+(`json_schema` response format, thinking off) and the **real** `TriageEngine` (batch 8). The ads were
+`scratchpad/ai/triage_testset.py`: 40 realistic German Kleinanzeigen-style ads (16 gems, 12 traps, 12 normal), 16 of
+them used here (every other one: 8 gems, 6 traps, 2 normal).
+
+**The CPU was shared.** Another agent was benchmarking models on the same 4 vCPUs the whole time (load 5–8). With 4
+threads, llama.cpp slowed to 0.39 tok/s from oversubscription, so this run used **1 thread**. Treat the speed as a
+worst case. The clean-machine numbers are the model research's measurements (`AI_MODELS.md` §4: 2B ≈ 6 s/ad, 4B ≈
+15.5 s/ad on this VM).
+
+| metric | result |
+|---|---|
+| ads / calls | 16 / 4 (final batch size 4) |
+| valid JSON items (matched by index) | **16/16** (100 %), script fallback 0 |
+| kind correct | 69 % |
+| product / model tokens correct | 94 % |
+| gems identified **and grounded** | 7/8 |
+| gems with interest ≥ 6 | 7/8 |
+| traps with interest ≤ 4 | 5/6 |
+| risky ads flagged (risk tag or wanted/defect/box/swap kind) | 1/4 |
+| wall time, s/ad (1 contended thread) | 304.4 s, **19.02 s/ad** |
+
+Per ad (K = kind ok, M = model ok, G = product grounded in the ad text):
+
+| | title | kind | product | contents | s | risks | reason |
+|---|---|---|---|---|---|---|---|
+| KMG | Alter Rechner vom Dachboden | pc | Intel Core i5-9600K | RTX 3070, 16GB RAM | 9 |  | старый ПК, RTX 3070, i5 9600k |
+| ··· | Iphne 13 128gb blau | acc | Apple iPad Air 5 64GB |  | 6 |  | iPad Air 5 с опечаткой в названии |
+| KMG | Playstaion 5 mit Laufwerk | bundle | PlayStation 5 Disc |  | 0 |  | игра на PS5 |
+| KMG | Grafikkarte von Nvidia | part | NVIDIA GeForce RTX 3070 Ti |  | 6 |  | GeForce RTX 3070 Ti |
+| KMG | Kiste Technik aus Haushaltsauflösung | bundle | Sony WH-1000XM4 | GoPro Hero 11 Black, Ladekabel | 6 |  | Sony WH-1000XM4 с GoPro |
+| ·MG | Spielzeug Drohne | acc | DJI Mini 3 |  | 6 |  | дрона DJI Mini 3 |
+| ·MG | Tablet Apple | acc | Apple iPad Air 5 64GB |  | 6 |  | iPad Air 5 с опечаткой в названии |
+| KMG | Gaming PC günstig | pc | Intel Core i7-8700K | GTX 1080 Ti 11GB, 32GB RAM, 1TB SSD | 9 |  | i7 8700K, GTX 1080 Ti, 32GB RAM |
+| KM· | Gaming PC ohne Grafikkarte | pc | Gaming PC ohne Grafikkarte |  | 9 |  | PC без видеокарты, i5, 16GB RAM, 650W |
+| KM· | Suche alten PC mit Grafikkarte | wanted | PC mit RTX 3080 |  | 0 |  | старый ПК с видеокартой |
+| KMG | iPhone 14 Pro iCloud gesperrt | defect | Apple iPhone 14 Pro |  | 0 | locked | iCloud заблокирован |
+| ·MG | Konvolut defekte Handys | bundle | iPhone 12 |  | 0 |  | конволут с поломанным экраном |
+| ·MG | Airpods Pro 2 original | acc | AirPods Pro 2 |  | 0 |  | наушники с пробным периодом |
+| KMG | Hülle für iPhone 13 | acc | Silikon Hülle iPhone 13 |  | 3 |  | чехол для iPhone 13 из силикона |
+| KMG | iPhone 13 128GB Mitternacht | single | Apple iPhone 13 128GB |  | 6 |  | iPhone 13 с опечаткой в названии |
+| KMG | Nintendo Switch Lite Türkis | single | Nintendo Switch Lite |  | 0 |  | Switch Lite с зарядкой и чехлом |
+
+Reading it:
+
+* **The format holds on a 2B model.** All 16 answers were valid JSON matched by index, with no script fallback. The
+  first call (8 ads, 588 output tokens, 168 s) went over the time cap, so the engine cut the batch to 4 and re-asked
+  for the one missing item. Output was 1104 tokens for 16 ads (**~69 tokens/ad**). llama.cpp reuses the cached system
+  prompt, so after the first call the prompts were only 137–357 tokens.
+* **What it finds is the script's blind spot.** Both PCs were read as `pc` with the GPU in the parts (RTX 3070 in
+  «Alter Rechner vom Dachboden», GTX 1080 Ti in «Gaming PC günstig»). It also found:
+  * the unnamed «Grafikkarte von Nvidia» (RTX 3070 Ti);
+  * the «Kiste Technik» contents (Sony WH-1000XM4 + GoPro Hero 11);
+  * the «Playstaion» typo.
+* **Its mistakes are the ones grounding is for.** The 2B model mixed up two neighbouring ads in one batch: «Iphne 13
+  128gb blau» came back as "Apple iPad Air 5 64GB", the next ad's product, and «Tablet Apple» got the iPhone ad's
+  reason. The product is not in the iPhone ad's text, so it is ungrounded, and that ad simply takes the script path.
+  «Gaming PC ohne Grafikkarte» got interest 9. Still:
+  * its product is negated («ohne»), so it is ungrounded;
+  * it has no parts, so it is not usable.
+  
+  So the scout does not promote it; the script and the photo check decide as before.
+* **Kinds and risk tags are weak at 2B** (kind 69 %; only the iCloud lock was tagged). The WhatsApp-only €40 AirPods
+  and the broken-phones lot were not tagged, but got interest 0, so they rank last. The existing scam/defect rules
+  still apply to every ad, because the scout never overrules them. This matches the model research: 4B is much
+  better on kind (87 %) and scam (100 %), and is the pick when the home server can afford ~15 s/ad.
+* **Speed** here, 19 s/ad on one contended thread, is a worst case. On a free 4-core CPU the research measured ≈ 6
+  s/ad for 2B, i.e. ~600 ads/hour, which is what `max_per_hour` 600 assumes.
 
 ## 15. Open issues / next steps
 
@@ -454,3 +524,8 @@ Reading it:
 * **Too-cheap gems**: a real gem at < 40 % of market is capped at «maybe / проверь, не развод» by the existing
   anti-scam rule. The scout's `hidden` tags could relax this for clearly clueless sellers with pickup, but only after
   real-world evidence.
+* **Output length**: ~69 output tokens/ad in the smoke test, against 46–55 in the model research's shorter schema.
+  On a CPU, output tokens are the cost. Dropping `q` (the scout's search phrase, often the product again) or
+  shortening `r` could buy ~20–30 % more ads per hour. Measure before cutting: `q` feeds the comparables lookup.
+* **Batch cross-talk** on 2B models (one ad's product given to its neighbour) is caught by grounding. If it shows up
+  often in real use, a batch of 4 for 1.5–2B models is the cheap fix (`ai.scout.max_batch`).
