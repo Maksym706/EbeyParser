@@ -5,12 +5,15 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import pytest
+
 from ebeyparser.ai.evaluator import SAME_VARIANT_KEY
 from ebeyparser.config import parse_config
 from ebeyparser.db import Database
 from ebeyparser.models import AIVerdict, Comparable, Evaluation, PriceEstimate, utcnow
 from ebeyparser.monitor import Monitor, _comparables_for_ai
 from ebeyparser.pricing.estimator import product_query
+from ebeyparser.pricing.text import make_search_query
 from ebeyparser.scraper.http import BlockedError, RateBudgetExceeded
 
 from test_monitor import GOOD_AI, SOLD, FakeEvaluator, FakeNotifier, FakeSource, make_listing
@@ -61,9 +64,9 @@ def build(listings, *, verdict=GOOD_AI, sold=SOLD, general=None, search=None, **
     return monitor, db, source, ebay, evaluator, notifier
 
 
-def teach(db: Database, price: float = 560.0, n: int = 10, key: str = "rtx 3080", title: str = "RTX 3080",
+def teach(db: Database, price: float = 560.0, n: int = 10, key: str = "rtx|3080", title: str = "RTX 3080",
           start: int = 0) -> None:
-    """Price history: n asking prices around `price`."""
+    """Price history: n asking prices around `price`, under the identity key (v0.2 fix round)."""
     db.add_price_points(key, [
         Comparable(title=f"{title} {i}", price=price + (i % 5) * 5, url=KA.format(700000 + start + i),
                    source="kleinanzeigen")
@@ -106,12 +109,23 @@ async def test_thin_history_no_deal_is_verified_with_comparables():
     assert db.get_evaluation("1").stage == "full"
 
 
-async def test_no_early_skip_for_keys_without_model_number():
-    listing = make_listing("1", "Bugaboo Kinderwagen", 600.0)
-    monitor, db, _, ebay, _, _ = build([listing], verdict=None, sold=[])
-    teach(db, key="bugaboo kinderwagen", title="Bugaboo Kinderwagen", n=10)
+async def test_vague_title_is_not_priced_from_title_comparables():
+    # v0.2 fix round: "Tablet zu verkaufen" was priced from "Switch nur Tablet" ads (93 € vs 330 €)
+    listing = make_listing("1", "Tablet zu verkaufen", 195.0)
+    monitor, db, source, ebay, _, _ = build([listing], verdict=None, sold=[])
     summary = await monitor.run_once()
-    assert summary.early_skips == 0 and ebay.calls == 1
+    assert summary.early_skips == 0 and ebay.calls == 0 and source.comps_queries == []
+    ev = db.get_evaluation("1")
+    assert ev.verdict != "buy" and "Непонятно, что за товар — уточни" in ev.reasons
+
+
+async def test_vague_title_is_priced_from_the_ai_query():
+    ai = GOOD_AI.model_copy(update={"search_query": "RTX 3080"})
+    monitor, db, _, ebay, evaluator, _ = build([make_listing("1", "Grafikkarte zu verkaufen", 300.0)], verdict=ai)
+    await monitor.run_once()
+    ev = db.get_evaluation("1")
+    assert ebay.queries == ["RTX 3080"] and ev.estimate.market_price is not None  # the AI's own wording
+    assert "Непонятно, что за товар — уточни" not in ev.reasons and ev.verdict == "buy"
 
 
 async def test_early_skip_is_rechecked_when_history_changes():
@@ -232,10 +246,15 @@ async def test_category_scan_with_empty_query():
     assert monitor.config.searches[0].query == ""
     summary = await monitor.run_once()
     assert summary.evaluated == 2 and not summary.errors
-    # every ad gets its own product key / comparables query
-    expected = [product_query(l.title) for l in listings]
+    # every ad gets its own product key / comparables query; with no comparables at all it also
+    # tries the title's own words once (identity's canonical phrase may not be how sellers write)
+    expected: list[str] = []
+    for l in listings:
+        expected.append(product_query(l.title))
+        if make_search_query(l.title) != expected[-1]:
+            expected.append(make_search_query(l.title))
     assert source.comps_queries == ebay.queries == expected
-    assert "iphone 13 128gb" in expected[0] and "s21 ultra 256gb" in expected[1]
+    assert "iphone 13 128gb" in expected[0] and any("s21 ultra 256gb" in q for q in expected)
     assert db.get_listing("1").search_name == "Handys"
 
 
@@ -506,3 +525,89 @@ def test_comparables_for_ai_are_the_typical_ones():
     spread = _comparables_for_ai(PriceEstimate(comparables=comps))
     assert len(spread) == 8 and spread[0].price == 50  # no market yet: a spread of prices
     assert _comparables_for_ai(PriceEstimate()) == []
+
+
+# ---------------------------------------------------------------------------- identity kinds (fix round)
+
+
+def sold_as(title: str, prices) -> list[Comparable]:
+    return [Comparable(title=title, price=float(p), url=f"https://www.ebay.de/itm/{500000000000 + i}",
+                       source="ebay_sold", sold=True) for i, p in enumerate(prices)]
+
+
+async def test_accessories_boxes_and_wanted_ads_are_skipped_for_free():
+    listings = [make_listing("1", "Hülle für iPhone 13", 15.0), make_listing("2", "iPhone 13 nur OVP", 12.0),
+                make_listing("3", "Wer verkauft iPhone 13?", 300.0)]
+    monitor, db, source, ebay, _, _ = build(listings, verdict=None, general={"min_listing_price": 0})
+    summary = await monitor.run_once()
+    assert summary.prefiltered == 3 and ebay.calls == 0 and source.detail_calls == []
+    assert db.get_evaluation("1").reasons == ["Аксессуар, а не сам товар"]
+
+
+async def test_a_search_for_parts_prices_parts():
+    ad = make_listing("1", "Kühler für RTX 3080 Founders Edition", 30.0)
+    monitor, db, _, ebay, _, _ = build([ad], verdict=None, sold=[],
+                                       search={"name": "Kühler", "query": "rtx 3080 kühler"})
+    summary = await monitor.run_once()
+    assert summary.prefiltered == 0 and db.get_evaluation("1").stage == "full"
+
+
+async def test_bundles_are_priced_from_bundles_only():
+    bundle = make_listing("1", "Sony PS5 Disc + 2 Controller + 5 Spiele", 300.0)
+    bare = sold_as("Sony PS5 Disc Edition", [420, 430, 440, 450, 460, 470, 480])
+    monitor, db, _, _, _, _ = build([bundle], verdict=None, sold=bare)
+    await monitor.run_once()
+    ev = db.get_evaluation("1")
+    assert ev.estimate.market_price is None and ev.verdict != "buy"  # bare consoles don't count
+    bundles = sold_as("PS5 Disc + 2 Controller + Spiele", [520, 530, 540, 550, 560, 570, 580])
+    monitor, db, _, _, _, _ = build([bundle], verdict=None, sold=bare + bundles)
+    await monitor.run_once()
+    ev = db.get_evaluation("1")
+    assert ev.estimate.market_price == pytest.approx(550) and ev.verdict == "buy"
+
+
+async def test_bare_product_is_not_priced_from_bundles():
+    ad = make_listing("1", "Sony PS5 Disc Edition", 300.0)
+    bundles = sold_as("PS5 Disc + 2 Controller + Spiele", [520, 530, 540, 550, 560, 570, 580])
+    bare = sold_as("Sony PS5 Disc Edition", [420, 430, 440, 450, 460, 470, 480])
+    monitor, db, _, _, _, _ = build([ad], verdict=None, sold=bare + bundles)
+    await monitor.run_once()
+    assert db.get_evaluation("1").estimate.market_price == pytest.approx(450)
+
+
+async def test_title_words_are_tried_when_the_canonical_query_finds_nothing():
+    class SoldByQuery(RecordingSold):
+        async def sold_comparables(self, query: str, limit: int = 30):
+            self.queries.append(query)
+            return list(self.comps) if query == make_search_query(ad.title) else []
+
+    ad = make_listing("1", "IPAD 10 64 GB Notverkauf", 150.0)
+    monitor, db, _, _, _, _ = build([ad], verdict=None)
+    comps = sold_as("Apple iPad 10 64GB WiFi", [300, 310, 320, 330, 340, 350, 360])
+    monitor._ebay = ebay = SoldByQuery(comps)
+    summary = await monitor.run_once()
+    assert len(ebay.queries) == 2 and ebay.queries[0] == product_query(ad.title)
+    assert summary.comps_lookups == 2 and db.get_evaluation("1").estimate.market_price is not None
+
+
+async def test_ai_query_never_overrides_the_ads_own_variant():
+    # noisy AI said "DeWalt DCD796" for a solo tool: kit prices must not price the bare tool
+    ai = GOOD_AI.model_copy(update={"search_query": "DeWalt DCD796"})
+    ad = make_listing("1", "DeWalt DCD796 solo", 60.0, description="Nur das Gerät, ohne Akku und ohne Ladegerät.")
+    kits = sold_as("DeWalt DCD796 Schlagbohrschrauber", [150, 155, 160, 165, 170, 175, 180])
+    monitor, db, _, _, _, _ = build([ad], verdict=ai, sold=kits)
+    await monitor.run_once()
+    ev = db.get_evaluation("1")
+    assert ev.estimate.market_price is None or ev.estimate.market_price < 120
+    assert ev.verdict != "buy"
+
+
+async def test_solo_tool_never_reuses_the_kits_cached_estimate():
+    kit_ad = make_listing("1", "DeWalt DCD796", 100.0)
+    solo_ad = make_listing("2", "DeWalt DCD796 solo", 90.0)
+    kits = sold_as("DeWalt DCD796 Schlagbohrschrauber", [150, 155, 160, 165, 170, 175, 180])
+    monitor, db, _, _, _, _ = build([kit_ad, solo_ad], verdict=None, sold=kits)
+    await monitor.run_once()
+    assert db.get_evaluation("1").estimate.market_price is not None
+    solo = db.get_evaluation("2")
+    assert solo.estimate.market_price is None and solo.verdict != "buy"

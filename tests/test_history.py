@@ -14,6 +14,7 @@ from ebeyparser.pricing.estimator import (
     combine_estimates,
     estimate_from_history,
     evaluate,
+    history_key_for,
     history_worthy,
     is_single_item,
 )
@@ -159,17 +160,27 @@ def test_history_wired_into_scoring():
     assert combine_estimates(ka_est, est).market_price in (500, est.market_price)  # same rank
 
 
-def test_only_single_real_offers_go_into_history():
-    assert history_worthy(make_listing("1", "RTX 3080 Gaming", 400.0))
-    assert not history_worthy(make_listing("2", "RTX 3080", None))
-    assert not history_worthy(make_listing("3", "RTX 3080", 1.0))  # "1 € VB" placeholder
-    assert not history_worthy(make_listing("4", "RTX 3080", 0.0, is_free=True))
-    assert not history_worthy(make_listing("5", "Suche RTX 3080", 300.0))
-    assert not history_worthy(make_listing("6", "RTX 3080 defekt", 90.0))
-    assert not history_worthy(make_listing("7", "Konvolut Grafikkarten RTX 3080", 900.0))
-    assert not history_worthy(make_listing("8", "iPhone 13 Hülle", 12.0))
+def test_only_real_offers_go_into_history_and_other_kinds_never_under_the_product():
+    # v0.2 fix round: identity keys; bundles/accessories get a kind prefix instead of being dropped
+    assert history_key_for(make_listing("1", "RTX 3080 Gaming", 400.0)) == "rtx|3080"
+    assert history_key_for(make_listing("2", "RTX 3080", None)) is None
+    assert history_key_for(make_listing("3", "RTX 3080", 1.0)) is None  # "1 € VB" placeholder
+    assert history_key_for(make_listing("4", "RTX 3080", 0.0, is_free=True)) is None
+    assert history_key_for(make_listing("5", "Suche RTX 3080", 300.0)) is None
+    assert history_key_for(make_listing("6", "RTX 3080 defekt", 90.0)) is None
+    assert history_key_for(make_listing("7", "Tablet zu verkaufen", 90.0)) is None  # names no product
     auction = make_listing("9", "RTX 3080", 50.0, buying_options=["AUCTION"])
-    assert not history_worthy(auction)  # current bid, not a price
+    assert history_key_for(auction) is None  # current bid, not a price
+    for title in ("PS5 + 2 Controller + 5 Spiele", "Hülle für iPhone 13", "Gaming PC Ryzen 7 + RTX 3080"):
+        key = history_key_for(make_listing("8", title, 300.0))
+        assert key is None or ":" in key, (title, key)  # never the bare product's key
+    # parts missing that the price includes: not stored at all (they dragged "dewalt dcd796" down)
+    kit_less = make_listing("10", "DeWalt DCD796", 90.0,
+                            description="Verkaufe nur das Grundgerät, Akkus und Lader behalte ich.")
+    assert not history_worthy(kit_less) and history_key_for(kit_less) is None
+    assert history_key_for(make_listing("11", "DeWalt DCD796 solo", 90.0)) == "dewalt|dcd796|solo"
+    phone = make_listing("12", "Apple iPhone 13 128GB", 400.0, description="Mit Ladekabel, ohne Netzteil.")
+    assert history_key_for(phone) == "iphone|13||128gb"  # phones never come with a brick
     assert is_single_item("Lenovo ThinkPad T480 Laptop") and not is_single_item("Panzerglas iPhone 13")
 
 
@@ -192,15 +203,17 @@ def monitor_for(listings, *, search=None, sold_comps=None, **cfg):
 
 async def test_search_results_and_comparables_feed_the_history():
     comps = [sold(i, f"RTX 3080 Gaming {i}", 520 + 10 * i) for i in range(6)]
-    comps.append(sold(99, "Gaming PC RTX 3080 Ryzen", 1500))  # irrelevant: not stored
+    comps.append(sold(99, "Gaming PC RTX 3080 Ryzen", 1500))  # another kind: never under the card
     listings = [make_listing("1", "MSI RTX 3080 Ventus", 480.0), make_listing("2", "Suche RTX 3080", 300.0)]
     monitor, db, _, ebay = monitor_for(listings, sold_comps=comps)
     await monitor.run_once()
     assert ebay.calls == 1
-    titles = {c.title for c in db.price_history("rtx 3080")}
+    titles = {c.title for c, _ in db.price_history_prefix("rtx|3080")}
     assert "MSI RTX 3080 Ventus" in titles and "RTX 3080 Gaming 0" in titles
     assert "Suche RTX 3080" not in titles and "Gaming PC RTX 3080 Ryzen" not in titles
-    assert db.count_price_points() == 7
+    assert db.count_price_points("rtx|3080") == 7
+    assert all(key.startswith("complete_pc:") for key in
+               {r["product_key"] for r in db._query("SELECT product_key FROM price_points")} - {"rtx|3080"})
 
 
 async def test_price_filtered_search_does_not_teach_the_history():
@@ -217,7 +230,7 @@ async def test_price_filtered_search_does_not_teach_the_history():
 async def test_history_estimate_replaces_the_comparables_lookup():
     monitor, db, _, ebay = monitor_for([make_listing("100", "Zotac RTX 3080 Trinity", 300.0)],
                                        sold_comps=[sold(1, "RTX 3080", 500)] * 3)
-    db.add_price_points("rtx 3080", [ka(str(i), f"RTX 3080 #{i}", 560 + 5 * i) for i in range(8)])
+    db.add_price_points("rtx|3080", [ka(str(i), f"RTX 3080 #{i}", 560 + 5 * i) for i in range(8)])
     summary = await monitor.run_once()
     assert ebay.calls == 0  # no network lookup
     ev = db.get_evaluation("100")
@@ -228,7 +241,7 @@ async def test_history_estimate_replaces_the_comparables_lookup():
 async def test_history_can_be_switched_off():
     monitor, db, _, ebay = monitor_for([make_listing("100", "Zotac RTX 3080 Trinity", 300.0)],
                                        pricing={"use_price_history": False})
-    db.add_price_points("rtx 3080", [ka(str(i), f"RTX 3080 #{i}", 560) for i in range(8)])
+    db.add_price_points("rtx|3080", [ka(str(i), f"RTX 3080 #{i}", 560) for i in range(8)])
     await monitor.run_once()
     assert ebay.calls == 1 and db.get_evaluation("100").estimate.source != "history"
 
@@ -268,16 +281,8 @@ def test_identity_unifies_history_keys_and_checks_variants():
     assert _is_model_key("iphone 13 128gb") and not _is_model_key("bugaboo kinderwagen")
 
 
-def test_single_item_uses_identity_kinds(monkeypatch):
-    from types import SimpleNamespace
-
-    from ebeyparser.pricing import estimator
-
-    kinds = {"iPhone 13": "item", "iPhone 13 Hülle": "accessory", "Gaming PC RTX 3080": "complete_pc",
-             "ThinkPad T480": "laptop"}
-    fake = SimpleNamespace(classify_kind=lambda title, description="": kinds[title])
-    monkeypatch.setattr(estimator, "_identity", lambda: fake)
-    assert is_single_item("iPhone 13") and is_single_item("ThinkPad T480")
-    assert not is_single_item("iPhone 13 Hülle") and not is_single_item("Gaming PC RTX 3080")
-    monkeypatch.setattr(estimator, "_identity", lambda: None)  # not installed: word list
-    assert is_single_item("iPhone 13") and not is_single_item("iPhone 13 Hülle")
+def test_single_item_uses_identity_kinds():
+    assert is_single_item("iPhone 13") and is_single_item("Lenovo ThinkPad T480")  # a laptop is the item
+    assert is_single_item("Apple Mac mini M1 8GB")  # so is a Mac mini
+    assert not is_single_item("iPhone 13 Hülle") and not is_single_item("Gaming PC RTX 3080 Ryzen 5")
+    assert not is_single_item("PS5 + 2 Controller + 5 Spiele")

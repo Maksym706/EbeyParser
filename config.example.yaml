@@ -36,7 +36,7 @@ general:
 # По ссылке: настрой поиск на kleinanzeigen.de и вставь адрес страницы в url.
 # purpose: resale — перепродажа (считаем чистую прибыль) | personal — для себя (считаем экономию,
 #   target_price — сколько готов заплатить).
-# min_price отсекает чехлы, кабели и прочую мелочь; exclude_keywords — объявления с этими словами
+# min_price отсекает чехлы, кабели и прочую мелочь; exclude_keywords — объявления с этими словами в ЗАГОЛОВКЕ
 #   пропускаются (defekt, bastler — сломано; suche — «куплю»; tausch — обмен; ersatzteil — на запчасти).
 # min_profit у поиска переопределяет pricing.min_profit.
 # source: ebay — через официальный API (нужны ключи в разделе ebay ниже).

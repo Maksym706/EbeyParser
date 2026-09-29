@@ -271,9 +271,20 @@ _WANTED_ANYWHERE = frozenset({"gesucht", "ankauf", "wanted"})
 _OFFER_FIRST = frozenset({"verkaufe", "verkauf", "biete", "tausche", "tausch"})
 
 
+# "zahle gut", "brauche dringend", "wer verkauft ...?", "kaufe ... an": buyer phrasings in a title
+_WANTED_TITLE_RE = re.compile(
+    r"\bzahle (?:gut|gute|guten|fair|faire|top|sofort|bar|bis|mehr|hoechstpreis\w*)\b"
+    r"|^(?:brauche|benoetige|wer verkauft|wer hat|biete bis)\b"
+    r"|\b(?:suche|brauche|benoetige) dringend\b"
+    r"|\b(?:kaufe|kaufen)\b(?:\s+\w+){0,5}\s+an\b"
+)
+
+
 def is_wanted_ad(title: str) -> bool:
-    """True for "Suche ...", "Kaufe ...", "Ankauf", "... gesucht" — someone buying, not selling."""
-    tokens = normalize(title).split()
+    """True for "Suche ...", "Kaufe ...", "Ankauf", "... gesucht", "... – zahle gut",
+    "Brauche dringend ...", "Wer verkauft ...?" — someone buying, not selling."""
+    norm = normalize(title)
+    tokens = norm.split()
     if not tokens:
         return False
     if tokens[0] in _WANTED_FIRST:
@@ -281,6 +292,8 @@ def is_wanted_ad(title: str) -> bool:
     if tokens[:2] in (["wir", "kaufen"], ["ich", "kaufe"], ["ich", "suche"], ["wir", "suchen"]):
         return True
     if _WANTED_ANYWHERE.intersection(tokens):
+        return True
+    if _WANTED_TITLE_RE.search(norm):
         return True
     return "suche" in tokens and tokens[0] not in _OFFER_FIRST
 
@@ -304,10 +317,11 @@ FLAG_WHATSAPP = "Просит связь через WhatsApp"
 FLAG_RESERVED = "Возможно, уже зарезервировано"
 FLAG_DELETED = "Объявление удалено"
 FLAG_TOO_GOOD = "Подозрительно дёшево и только пересылка — похоже на развод"
+FLAG_BAIT = "Подозрительно дёшево и уводит в WhatsApp / предоплату — похоже на развод"
 
 SEVERE_FLAGS: frozenset[str] = frozenset(
     {FLAG_WANTED, FLAG_DEFECT, FLAG_BOX_ONLY, FLAG_LOCKED, FLAG_FAKE, FLAG_SCAM, FLAG_SWAP, FLAG_RENT,
-     FLAG_DELETED, FLAG_TOO_GOOD}
+     FLAG_DELETED, FLAG_TOO_GOOD, FLAG_BAIT}
 )
 
 _PUNCT = frozenset(":?!.,;")
@@ -358,7 +372,12 @@ def _rule(
 
 _PACKAGING = "ovp karton verpackung box schachtel packung originalverpackung huelle tasche"
 # "keine Garantie oder Rücknahme bei Defekten" is the usual private-sale disclaimer, not a defect
-_DISCLAIMER = "garantie gewaehrleistung ruecknahme haftung umtausch sachmaengelhaftung garantieanspruch"
+_DISCLAIMER = (
+    "garantie gewaehrleistung ruecknahme haftung umtausch sachmaengelhaftung garantieanspruch "
+    # "für eventuelle / etwaige / spätere Defekte wird nicht gehaftet": hypothetical, not a report
+    "eventuelle eventuellen eventuell evtl etwaige etwaigen moegliche moeglichen spaetere spaeteren "
+    "kuenftige kuenftigen auftretende auftretenden"
+)
 
 _RULES: tuple[_Rule, ...] = (
     _rule(
@@ -371,13 +390,38 @@ _RULES: tuple[_Rule, ...] = (
             r"ohne funktion",
             r"funktionslos",
             r"geht nicht (?:mehr )?an",
+            r"geht (?:seitdem |seit dem |leider |jetzt |seit \w+ )?nicht mehr",
+            r"geht (?:ab und zu|manchmal|oefters?|staendig|immer wieder|einfach) (?:\w+ ){0,2}aus",
+            r"schaltet sich (?:\w+ ){0,2}nicht (?:mehr )?(?:ein|an)",
             r"(?:startet|bootet|zuendet) nicht(?: mehr)?",
+            r"(?:laedt|ladet) (?:\w+ )?nicht(?: mehr)?",
+            r"(?:ladebuchse|ladeanschluss|ladeport|buchse|anschluss|akku|display|bildschirm|touch|touchscreen|"
+            r"lautsprecher|mikrofon|kamera|mainboard|platine|luefter|motor) " + _GAP4 + r"(?:hinueber|im eimer|tot)",
+            r"(?:ist|sind|scheint|wohl|vermutlich|leider) hinueber",
+            r"defec?kt\w*",
+            r"(?:face ?id|touch ?id|touch|touchscreen|kamera|mikrofon|lautsprecher|wlan|wifi|bluetooth|"
+            r"homebutton|home button|lautstaerketaste) (?:geht|funktioniert|reagiert|klappt) (?:\w+ ){0,4}nicht",
+            r"(?:bildschirm|display) bleibt (?:\w+ )?schwarz",
+            r"bleibt (?:der |das )?(?:bildschirm|display) (?:\w+ )?schwarz",
+            r"(?:akku|batterie) " + _GAP2 + r"(?:aufgeblaeht|aufgequollen|gebläht|blaeht)",
+            r"(?:linie|linien|streifen|pixelfehler|flecken|fleck|schatten) im (?:display|bildschirm)",
+            r"artefakt\w*",
+            r"bildfehler\w*",
+            r"gimbal ?fehler\w*",
+            r"(?:autofokus|fokus|zoom|objektiv|gimbal) " + _GAP2 + r"spinnt",
+            r"luefter " + _GAP2 + r"(?:schleift|rattert|klackert|klappert)",
+            r"ueberhitz\w*",
+            r"wird (?:zu|sehr|extrem|ziemlich|schnell) heiss",
+            r"wasser(?:kontakt|einbruch)",
+            r"(?:ins wasser|in die toilette|ins klo) gefallen",
             r"(?:funktioniert|funktionieren|funktionierte) nicht(?: mehr| richtig)?",
             r"laesst sich nicht (?:mehr )?(?:einschalten|anschalten|starten|laden)",
             r"kein (?:bild|signal)",
             r"(?:wasser|sturz|feuchtigkeits|display|bildschirm)schaden",
             r"(?:display|bildschirm|screen|glas|scheibe) " + _GAP2
             + r"(?:gebrochen|gesprungen|zersprungen|gerissen|zerbrochen|broken|cracked)",
+            r"(?:display|bildschirm|screen|glas|scheibe|rueckseite|backcover|gehaeuse) " + _GAP4
+            + r"(?:einen |einige |ein paar |mehrere )?(?:sprung|spruenge|riss|risse|haarriss\w*|bruch)",
             r"(?:display|bildschirm)(?:bruch|riss|sprung)",
             r"(?:riss|risse|sprung|spruenge) im (?:display|bildschirm|glas)",
             r"wackelkontakt",
@@ -403,6 +447,7 @@ _RULES: tuple[_Rule, ...] = (
             r"originalverpackung|originalkarton)",
             r"leerkarton",
             r"(?:box|karton|ovp|verpackung) ohne (?:inhalt|geraet|handy|konsole)",
+            r"(?:ovp|karton|verpackung|box|schachtel|originalverpackung|originalkarton) (?:ist )?leer",
             r"box only",
             r"empty box",
             r"only (?:the )?box",
@@ -413,14 +458,25 @@ _RULES: tuple[_Rule, ...] = (
     _rule(
         FLAG_LOCKED,
         [
-            r"icloud (?:gesperrt|lock|locked|sperre|aktiv|aktiviert|verknuepft|gebunden|verbunden|drauf|drin)",
-            r"icloud\w*(?:sperre|lock|locked)",
-            r"aktivierungssperre",
+            r"i ?cloud " + _GAP2 + r"(?:gesp?er+t\w{0,2}|gespeert|lock|locked|sperre|aktiv|aktiviert|verknuepft|"
+            r"gebunden|verbunden|drauf|drin|angemeldet|eingeloggt)",
+            r"i ?cloud\w*(?:sperre|lock|locked)",
+            r"aktivi?e?rungs? ?sperre\w*",
+            r"(?:haengt|haenge|steckt|bleibt) (?:\w+ )?(?:in|bei|an) (?:der |dem )?aktivierung\w*",
             r"activation lock",
-            r"gesperrt(?:e|er|es|en)?",
+            r"gesp?er+t(?:e|er|es|en)?",
             r"frp(?: lock| sperre)?",
             r"(?:google|account|konto) (?:lock|sperre)",
-            r"(?:passwort|kennwort|code|pin|passcode|sperrcode|entsperrcode) vergessen",
+            r"(?:google|samsung|xiaomi|huawei|mi) ?(?:konto|account|id) " + _GAP2
+            + r"(?:gesp?er+t\w{0,2}|lock|locked|sperre|drauf|drin|angemeldet|eingeloggt|verknuepft|aktiv)",
+            r"(?:apple ?id|apple konto|apple account|icloud konto|icloud account) " + _GAP4
+            + r"(?:angemeldet|eingeloggt|drauf|drin|verknuepft|verbunden|gebunden|aktiv|unbekannt|vergessen|"
+            r"gesp?er+t\w{0,2})",
+            r"konto " + _GAP4 + r"(?:verbunden|verknuepft|angemeldet|eingeloggt|gebunden)",
+            r"(?:passwort|kennwort|code|pin|passcode|sperrcode|entsperrcode|entsperrmuster|muster) " + _GAP4
+            + r"(?:vergessen|unbekannt|nicht mehr (?:weiss|kenne|bekannt|weiß))",
+            r"(?:passwort|kennwort|code|pin|passcode|sperrcode|entsperrcode) (?:(?:[^\W_]+|,) ){0,6}"
+            r"(?:den|das|die) (?:ich )?(?:[^\W_]+ ){0,2}nicht mehr (?:weiss|kenne)",
             r"blacklist\w*",
             r"mdm",
             r"locked",
@@ -439,6 +495,12 @@ _RULES: tuple[_Rule, ...] = (
             r"imitat",
             r"plagiat",
             r"1 : 1 (?:kopie|replik\w*|replica|nachbau|qualitaet|rep|version|fake)",
+            r"1 ?zu ?1",
+            r"china ?(?:version|ware|kopie|nachbau)",
+            r"chinaware",
+            # "nicht original" — but "nicht original verpackt" is about the box
+            r"(?:nicht|kein|keine) (?:\w+ )?original(?:e|er|es)?(?! verpack\w*| karton| ovp| zubehoer| kabel| ladekabel"
+            r"| netzteil| ladegeraet| rechnung| papiere| box)",
         ],
     ),
     _rule(  # "Kopie der Rechnung" is not a fake
@@ -451,8 +513,9 @@ _RULES: tuple[_Rule, ...] = (
     _rule(
         FLAG_SCAM,
         [
-            r"vor(?:aus)?kasse",
+            r"vor(?:r?aus)? ?kasse",
             r"western union",
+            r"auf montage",
             r"moneygram",
             r"paysafe\w*",
             r"paypal (?:nur )?(?:an )?(?:freunde|friends|familie|family|f f|ff|fnf|fuf)",
@@ -461,7 +524,7 @@ _RULES: tuple[_Rule, ...] = (
             r"(?:whatsapp|whats app|telegram|sms|e mail|email|mail)",
             r"(?:bin|wohne|lebe|arbeite|zurzeit|derzeit|momentan|aktuell|beruflich) " + _GAP2 + r"im ausland",
             r"(?:versand|versende|verschicke) (?:nur )?(?:ins|aus dem|vom) ausland",
-            r"(?:ueberweisung|zahlung|bezahlung) (?:vorab|im voraus)",
+            r"(?:ueberweisung|zahlung|bezahlung) " + _GAP2 + r"(?:vorab|im voraus|vorraus)",
             r"(?:vorab|im voraus) (?:per )?(?:ueberweis\w*|bezahl\w*|zahl\w*)",
         ],
     ),
@@ -470,16 +533,42 @@ _RULES: tuple[_Rule, ...] = (
         [
             r"^tausche?",
             r"nur (?:gegen )?tausch\w*",
-            r"tausche? (?:nur )?" + _GAP4 + r"gegen",
+            r"tausche? (?:nur )?" + _GAP4 + r"(?:gegen|gg)",
             r"(?:swap|trade) only",
             r"only (?:swap|trade)",
         ],
         exclude_near="oder auch gerne evtl eventuell ggf moeglich denkbar optional alternativ "
         "verkauf verkaufe",
     ),
+    _rule(  # swap-only, said the other way round
+        FLAG_SWAP,
+        [
+            r"kein (?:geld|bargeld)",
+            r"kein verkauf(?! an| ins| nach| unter| ueber)",
+            r"verkauf (?:ist )?(?:nicht|leider nicht) (?:gewuenscht|moeglich|gewollt)",
+            r"geld interessiert (?:mich )?(?:eher |leider |gar |ueberhaupt )?nicht",
+        ],
+    ),
+    _rule(  # buyer phrasings anywhere in the text
+        FLAG_WANTED,
+        [
+            r"zahle (?:gut|gute|guten|fair|faire|top|sofort|bar|bis|hoechstpreis\w*)",
+            r"suche dringend",
+            r"bin auf der suche nach",
+            r"bitte alles anbieten",
+            r"wir kaufen (?:dein|deine|deinen|ihr|ihre|ihren|alle|jede|jedes)",
+            r"kaufe (?:dein|deine|deinen|ihr|ihre|ihren|alle|jede|jedes) (?:\w+ ){0,4}an",
+        ],
+    ),
+    _rule(  # "Brauche dringend ein iPhone 13" — but "brauche dringend ein neues / Platz / Geld" is a seller
+        FLAG_WANTED,
+        [r"(?:brauche|benoetige) (?:dringend|unbedingt|sofort) (?:ein|eine|einen)"],
+        exclude_near="neues neue neuen neuer groesseres groessere platz geld deshalb daher darum weil",
+    ),
     _rule(
         FLAG_RENT,
-        [r"mietkauf", r"vermiet\w*", r"zur miete", r"zu mieten", r"mietgeraet"],
+        [r"mietkauf", r"vermiet\w*", r"zur miete", r"zu mieten", r"mietgeraet", r"verleih\w*",
+         r"(?:preis|kosten|miete) (?:pro|je) (?:tag|woche|wochenende|monat)"],
     ),
     _rule(  # financing offered as an *option* by a shop is fine
         FLAG_RENT,
@@ -490,11 +579,24 @@ _RULES: tuple[_Rule, ...] = (
         FLAG_MISSING,
         [
             r"ohne (?:original ?)?(?:netzteil|ladegeraet|ladekabel|netzkabel|kabel|zubehoer|"
-            r"controller|festplatte|ssd|hdd|akku|batterie|fernbedienung|ram|arbeitsspeicher|cpu|"
+            r"controller|festplatte|ssd|hdd|akku|akkus|batterie|fernbedienung|ram|arbeitsspeicher|cpu|"
             r"prozessor|grafikkarte|gpu|lader|ladestation|dock|joycons|joy cons|stift|pen|"
-            r"objektiv|speicherkarte|kuehler|luefter|mainboard|tastatur|maus)",
-            r"(?:netzteil|ladegeraet|ladekabel|controller|akku|festplatte|fernbedienung|zubehoer|"
-            r"kabel|ssd|hdd) (?:fehlt|fehlen|nicht dabei|nicht enthalten|nicht vorhanden|nicht inklusive)",
+            r"objektiv|speicherkarte|kuehler|luefter|mainboard|tastatur|maus|ohrhoerer|ladecase|"
+            r"ladeschale|basisstation|aufsaetze|saugrohr)",
+            r"(?:netzteil|ladegeraet|ladekabel|controller|akku|akkus|festplatte|fernbedienung|zubehoer|"
+            r"kabel|ssd|hdd|objektiv|dock|joy cons|joycons|ladecase|ohrhoerer|lader) (?:(?:und|u|sowie|\w+) ){0,3}"
+            r"(?:ist |sind )?(?:fehlt|fehlen|nicht dabei|nicht enthalten|nicht vorhanden|nicht inklusive)",
+            r"(?:akku|akkus|lader|ladegeraet|netzteil|controller|fernbedienung|objektiv|dock|zubehoer|"
+            r"ohrhoerer) (?:(?:und|u|sowie|\w+) ){0,3}behalte ich",
+            r"(?<!beats )(?<!bose )solo(?! (?:\d|pro|buds|bud|hd|ii|iii))",
+            r"sologeraet\w*",
+            r"nur (?:das |den |der )?grundgeraet",
+            r"nur (?:der |den |das )?(?:body|gehaeuse|kamerabody)",
+            r"body only",
+            r"nur (?:das |den |der )?(?:ladecase|case|ladeschale)",
+            r"nur (?:der |den |das )?(?:linke|linken|linker|rechte|rechten|rechter) "
+            r"(?:ohrhoerer|airpod|kopfhoerer|earbud|stoepsel|controller|joy con)",
+            r"(?:linker|rechter|linken|rechten) (?:ohrhoerer|airpod|earbud) " + _GAP4 + r"verloren",
         ],
     ),
     _rule(FLAG_SIMLOCK, [r"(?:sim|net|netz) ?(?:lock|sperre)", r"providersperre"]),
@@ -575,6 +677,15 @@ def _rule_hits(rule: _Rule, s: str) -> bool:
     return False
 
 
+# Pay first, goods later — normal for shops, a scam pattern with a too-good private offer.
+_PREPAY_PATTERNS = [
+    r"(?:versand|verschicke|versende|lieferung|paket) (?:\w+ ){0,3}(?:erst |nur |direkt |sofort |gleich )?nach "
+    r"(?:dem |der )?(?:zahlungseingang|geldeingang|zahlung|bezahlung|ueberweisung|eingang der zahlung)",
+    r"nach (?:dem )?(?:zahlungseingang|geldeingang|eingang der zahlung)",
+    r"(?:zahlung|bezahlung|ueberweisung) (?:vor|vorab|vor dem) (?:versand|lieferung)",
+    r"(?:bezahlung|zahlung) vorab",
+]
+
 # Seller won't meet: harmless on its own, a scam pattern together with a too-good price.
 _REMOTE_ONLY_RULE = _rule(
     "remote-only",
@@ -584,11 +695,28 @@ _REMOTE_ONLY_RULE = _rule(
         r"(?:abholung|selbstabholung|besichtigung) (?:ist )?(?:nicht|leider nicht) (?:moeglich|drin)",
         r"(?:versand|verkauf) (?:nur )?(?:gegen|per|ueber|via) paypal",
         r"nur (?:per |ueber |via |mit )?paypal",
-        r"vor(?:aus)?kasse",
+        r"vor(?:r?aus)? ?kasse",
         r"only shipping",
         r"no pick ?up",
-    ],
+    ] + _PREPAY_PATTERNS,
 )
+_PREPAY_RULE = _rule("prepay", _PREPAY_PATTERNS)
+_NEW_WORDS = frozenset(
+    "neu neue neuer neues neuwertig unbenutzt ungenutzt ovp originalverpackt originalverpackung versiegelt "
+    "sealed nagelneu brandneu ungeoeffnet".split()
+)
+
+
+def is_prepay_shipping(text: str) -> bool:
+    """"Versand erfolgt direkt nach Zahlungseingang": the buyer pays before seeing anything."""
+    if not text or not text.strip():
+        return False
+    return _rule_hits(_PREPAY_RULE, _flag_text(text))
+
+
+def says_new(text: str) -> bool:
+    """"Neu", "unbenutzt", "OVP versiegelt" — the usual bait of too-good offers."""
+    return bool(_NEW_WORDS.intersection(normalize(text).split()))
 
 
 def is_remote_only(text: str) -> bool:

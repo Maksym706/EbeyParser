@@ -6,26 +6,32 @@ import math
 import re
 from datetime import datetime, timedelta, timezone
 from statistics import median
-from typing import Sequence, TypeVar
+from typing import Callable, Sequence, TypeVar
 
 from ..config import PricingConfig, ReferencePrice, SearchConfig
 from ..models import AIVerdict, Comparable, Evaluation, Listing, PriceEstimate, utcnow
+from .identity import Identity, ProductKey, comparable_matches, identify
 from .text import (
+    FLAG_BAIT,
     FLAG_BOX_ONLY,
     FLAG_DEFECT,
     FLAG_DELETED,
     FLAG_LOCKED,
+    FLAG_MISSING,
     FLAG_RESERVED,
     FLAG_TOO_GOOD,
     FLAG_WANTED,
+    FLAG_WHATSAPP,
     SEVERE_FLAGS,
     detect_red_flags,
+    is_prepay_shipping,
     is_remote_only,
     is_wanted_ad,
     make_search_query,
     matched_exclude_keyword,
     matches_keywords,
     normalize,
+    says_new,
 )
 
 T = TypeVar("T")
@@ -98,6 +104,21 @@ def _clean_pairs(items: list[tuple[float, T]]) -> list[tuple[float, T]]:
         med = median(v for v, _ in kept)
         kept = [(v, x) for v, x in kept if v >= 0.25 * med]
     return kept
+
+
+def _core_band(vals: list[float], weights: list[float] | None = None) -> tuple[list[float], list[float]]:
+    """Values (sorted) without stragglers far from the median (3 scaled MADs, at least ±15 %):
+    a couple of trap prices must not make a clear market look "unclear"."""
+    if len(vals) < 5:
+        return vals, weights or [1.0] * len(vals)
+    med = median(vals)
+    mad = median(abs(v - med) for v in vals) * 1.4826
+    width = max(3 * mad, 0.15 * med)
+    keep = [i for i, v in enumerate(vals) if abs(v - med) <= width]
+    if len(keep) < 3:
+        return vals, weights or [1.0] * len(vals)
+    ws = weights or [1.0] * len(vals)
+    return [vals[i] for i in keep], [ws[i] for i in keep]
 
 
 def robust_prices(prices: list[float]) -> list[float]:
@@ -203,42 +224,157 @@ def comparable_is_relevant(query: str, title: str) -> bool:
         return False
     if is_wanted_ad(title) or any(f in SEVERE_FLAGS for f in detect_red_flags(title)):
         return False
+    if looks_like_bundle(title) != looks_like_bundle(query):
+        return False  # a bundle never stands in for the bare product, nor the other way round
+    if looks_like_addon(title) and not looks_like_addon(query) and not q_set & _STANDALONE_ADDONS:
+        return False
     return _identity_agrees(query, title)
+
+
+# Extras that make an offer a bundle ("PS5 + 2 Controller + 5 Spiele", "ThinkPad mit Monitor,
+# Tastatur und Maus") — for the cases identity's own bundle rule doesn't see.
+_BUNDLE_EXTRA = r"(?:controller|controllern|spiele|games|objektive|objektiven|objektiv|monitor|bildschirm|tastatur)"
+_BUNDLE_RE = re.compile(
+    rf"(?:\+|&|\binkl\.?|\binklusive|\bsamt|\bplus)\s*(?:\d+\s*|zwei\s+|drei\s+)?(?:\w+\s+){{0,2}}{_BUNDLE_EXTRA}\b"
+    rf"|\b(?:[2-9]|zwei|drei|vier|fuenf)\s+{_BUNDLE_EXTRA}\b"
+    r"|\bmit\b[^.]*\b(?:monitor|bildschirm)\b[^.]*\b(?:tastatur|maus)\b"
+    r"|\b(?:bundle|konvolut|paket|zubehoerpaket|komplettpaket|komplettset|werkzeugset)\b"
+    r"|\b(?:zubehoer|werkzeug) ?(?:paket|set)\b"
+    r"|\b(?:viel|allem|reichlich|umfangreichem|jeder menge|jede menge) zubehoer\b"
+)
+
+
+_STANDALONE_ADDONS = frozenset({"controller", "gamepad", "fernbedienung", "ladestation", "dock", "dockingstation"})
+_ADDON_CONNECTORS = frozenset({"mit", "inkl", "inklusive", "samt", "plus", "und", "u", "incl", "zzgl", "ohne",
+                               "ein", "einem", "einen", "zwei", "drei", "vier", "extra", "zusaetzlich"})
+
+
+def looks_like_addon(title: str) -> bool:
+    """"Steam Deck OLED Controller", "Switch Dock", "DJI Mini 3 Fernbedienung": the add-on sold
+    alone (while "PS5 mit Controller" or "PS5 + 2 Controller" is still the console)."""
+    tokens = normalize(title).split()
+    for i, tok in enumerate(tokens[1:], 1):
+        if tok in _STANDALONE_ADDONS:
+            before = tokens[i - 1]
+            return before not in _ADDON_CONNECTORS and not before.isdigit()
+    return False
+
+
+def looks_like_bundle(title: str) -> bool:
+    """Does the title offer the product plus significant extras (consoles with games, laptops
+    with a monitor, cameras with extra lenses)?"""
+    return bool(title) and _BUNDLE_RE.search(_prepare_text(title)) is not None
+
+
+def _prepare_text(text: str) -> str:
+    return " ".join(text.lower().replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").split())
 
 
 def _identity_agrees(query: str, title: str) -> bool:
     """pricing.identity's check (exact variant: "3080" != "3080 ti", 128 GB != 256 GB; same
-    kind of offer) on top of the rules above. True when identity isn't installed."""
-    identity = _identity()
+    kind of offer: a bundle never stands in for the bare product) on top of the rules above."""
     try:
-        matches = getattr(identity, "comparable_matches", None)
-        if matches is not None:
-            return bool(matches(query, title)[0])
-        key_of = getattr(identity, "product_key", None)
-        same = getattr(identity, "same_product", None)
-        if key_of is None or same is None:
-            return True
-        a, b = key_of(query), key_of(title)
-        return a is None or b is None or bool(same(a, b))
+        if not comparable_matches(query, title)[0]:
+            return False
+        q_key, t_key = identify(query).key, identify(title).key
     except Exception:  # noqa: BLE001 - a helper bug must not break pricing
         return True
+    if q_key is None and t_key is not None:
+        # "xbox series" names no model: an ad for exactly the "Series X" is not its comparable
+        words = set(normalize(query).split())
+        needed = [w for part in (t_key.model, *t_key.variant) for w in normalize(part).split()]
+        return all(w in words for w in needed)
+    return True
+
+
+def comparable_fits(reference: str | ProductKey, comp: Comparable) -> bool:
+    """Is `comp` the same product AND the same kind of offer as the ad being priced?
+    `reference` is the ad's full title (so its own kind — item, bundle, ... — counts) or a
+    ProductKey. pricing.identity decides; titles with severe red flags never count."""
+    try:
+        ok = comparable_matches(reference, comp.title)[0]
+    except Exception:  # noqa: BLE001
+        ok = isinstance(reference, str) and comparable_is_relevant(reference, comp.title)
+    ref_bundle = isinstance(reference, str) and looks_like_bundle(reference)
+    if ok and looks_like_bundle(comp.title) != ref_bundle:
+        ok = False  # bundle vs bare product, whatever identity's kinds say
+    if ok and looks_like_addon(comp.title) and not (isinstance(reference, str) and looks_like_addon(reference)):
+        ok = False  # "Steam Deck OLED Controller" is not a Steam Deck
+    return ok and not any(f in SEVERE_FLAGS for f in detect_red_flags(comp.title))
 
 
 def product_query(title: str) -> str:
-    """Comparables query and price-history key of an ad: the exact product per
-    pricing.identity when it recognises a model ('Apple iPhone13 128 GB Blau' ->
-    'iphone 13 128gb'), else the cleaned-up title words (make_search_query)."""
-    identity = _identity()
-    key_of = getattr(identity, "product_key", None)
-    if key_of is not None:
-        try:
-            key = key_of(title)
-            query = key.query().strip() if key is not None else ""
-        except Exception:  # noqa: BLE001
-            query = ""
-        if query:
-            return query
-    return make_search_query(title)
+    """Comparables query of an ad: the exact product per pricing.identity when it recognises
+    a model ('Apple iPhone13 128 GB Blau' -> 'iphone 13 128gb'), else the cleaned-up title words."""
+    try:
+        key = identify(title).key
+    except Exception:  # noqa: BLE001
+        key = None
+    query = key.query().strip() if key is not None else ""
+    return query or make_search_query(title)
+
+
+def listing_identity(listing: Listing) -> Identity:
+    """identity.identify() of an ad (title + description); never raises."""
+    try:
+        return identify(listing.title, listing.description)
+    except Exception:  # noqa: BLE001
+        return Identity(None, "unknown", None)
+
+
+def own_variant_missing(ident: Identity) -> bool:
+    """The missing part is what defines the variant ("DeWalt DCD796 solo" is priced from
+    other solo tools), so it is no reason to discount."""
+    return ident.key is not None and "solo" in ident.key.variant
+
+
+# Minor components a used-market price includes, per identity category (major ones make the ad
+# a "part" anyway). Phones, GPUs, watches are resold without a power brick; a laptop, console,
+# tool or e-scooter without its charger / controller is worth less. Unknown category: all count.
+_PRICE_INCLUDES_MINOR: dict[str, frozenset[str]] = {
+    "phone": frozenset(),
+    "tablet": frozenset(),
+    "watch": frozenset(),
+    "gpu": frozenset(),
+    "audio": frozenset(),
+    "desktop": frozenset(),
+    "laptop": frozenset({"netzteil", "akku"}),
+    "console": frozenset({"controller", "netzteil"}),
+    "handheld": frozenset({"netzteil"}),
+    "vacuum": frozenset({"netzteil", "ladestation"}),
+    "drone": frozenset({"netzteil"}),
+}
+
+
+def missing_components(ident: Identity) -> tuple[str, ...]:
+    """Components the ad lacks that the product's used-market price includes (identity.missing
+    filtered by category; a variant's own definition like "solo" doesn't count)."""
+    if own_variant_missing(ident):
+        return ()
+    counted = _PRICE_INCLUDES_MINOR.get(ident.category or "")
+    return tuple(m for m in ident.missing if counted is None or m in counted)
+
+
+def listing_missing(listing: Listing, ident: Identity | None = None,
+                    flags: list[str] | None = None) -> tuple[str, ...]:
+    """What the ad lacks that its product's price includes: identity's parts list, or — when
+    identity saw nothing — our own wording rules ("nur das Grundgerät, Akkus behalte ich")."""
+    ident = ident or listing_identity(listing)
+    missing = missing_components(ident)
+    if missing or ident.missing or own_variant_missing(ident):
+        return missing
+    flags = listing_red_flags(listing) if flags is None else flags
+    return ("см. описание",) if FLAG_MISSING in flags else ()
+
+
+def history_lookup_key(ident: Identity) -> str | None:
+    """Stored-key prefix under which prices comparable to this ad live: the product's coarse
+    key for plain items ("iphone|13" covers every storage size — filter afterwards), the
+    kind-prefixed key for bundles ("bundle:playstation|5"); None when there is no model."""
+    if ident.key is None:
+        return None
+    coarse = ident.key.coarse_key()
+    return coarse if ident.kind == "item" else f"{ident.kind}:{coarse}"
 
 
 def relevant_comparables(query: str, comps: list[Comparable]) -> list[Comparable]:
@@ -287,10 +423,11 @@ def estimate_from_comparables(
 
     if n > COMPS_CAP:  # keep the most typical ones for display
         kept = sorted(kept, key=lambda t: abs(t[0] - market))[:COMPS_CAP]
+    core, _ = _core_band(vals)
     return PriceEstimate(
         market_price=round(market, 2),
-        low=round(_percentile(vals, 0.25), 2),
-        high=round(_percentile(vals, 0.75), 2),
+        low=round(_percentile(core, 0.25), 2),
+        high=round(_percentile(core, 0.75), 2),
         sample_size=n,
         source=source,
         query=query,
@@ -330,18 +467,17 @@ def estimate_from_history(
     days: int | None = None,
     half_life_days: float = HISTORY_HALF_LIFE_DAYS,
     now: datetime | None = None,
+    fits: Callable[[Comparable], bool] | None = None,
 ) -> PriceEstimate | None:
     """Market price from prices we have already seen (search results, earlier comparables) —
     no extra requests. `points` are comparables, optionally with the time they were last seen:
     fresher prices weigh more (half-life `half_life_days`). Sold prices count at face value,
     asking prices get `asking_price_discount`. None unless at least `min_points` of them are
-    the same product as `query`."""
+    the same product as `query` (or pass `fits`, e.g. comparable_fits against the ad's title)."""
     now = now or utcnow()
     dated = [(p, None) if isinstance(p, Comparable) else (p[0], p[1]) for p in points]
-    relevant = [
-        (c, seen) for c, seen in dated
-        if c.price and c.price > 0 and comparable_is_relevant(query, c.title)
-    ]
+    same = fits or (lambda c: comparable_is_relevant(query, c.title))
+    relevant = [(c, seen) for c, seen in dated if c.price and c.price > 0 and same(c)]
     if not query or len(relevant) < max(1, min_points):
         return None
     discount = asking_price_discount if asking_price_discount > 0 else 1.0
@@ -370,10 +506,11 @@ def estimate_from_history(
     shown = kept
     if n > COMPS_CAP:  # keep the most typical ones for display
         shown = sorted(kept, key=lambda t: abs(t[0] - market))[:COMPS_CAP]
+    core, core_w = _core_band(vals, weights)
     return PriceEstimate(
         market_price=round(market, 2),
-        low=round(_weighted_quantile(vals, weights, 0.25), 2),
-        high=round(_weighted_quantile(vals, weights, 0.75), 2),
+        low=round(_weighted_quantile(core, core_w, 0.25), 2),
+        high=round(_weighted_quantile(core, core_w, 0.75), 2),
         sample_size=n,
         source="history",
         query=query,
@@ -512,7 +649,9 @@ def prefilter(listing: Listing, search: SearchConfig) -> tuple[bool, list[str]]:
     text = f"{listing.title}\n{listing.description}"
     if is_wanted_ad(listing.title):
         reasons.append("Это объявление о поиске/покупке, а не продажа")
-    hits = [kw for kw in search.exclude_keywords if kw.strip() and matched_exclude_keyword(text, [kw])]
+    # stop words look at the title only: "immer mit Hülle benutzt" in a description must not kill
+    # an iPhone deal (defects / scams in descriptions are the red flags' job)
+    hits = [kw for kw in search.exclude_keywords if kw.strip() and matched_exclude_keyword(listing.title, [kw])]
     if hits:
         reasons.append("Стоп-слова: " + ", ".join(f"«{kw}»" for kw in hits))
     if search.include_keywords and not matches_keywords(text, search.include_keywords, []):
@@ -547,42 +686,45 @@ def below_min_price(listing: Listing, floor: float | None) -> str | None:
 
 
 def history_worthy(listing: Listing) -> bool:
-    """May this ad's price go into the price history? Only real offers with a real price."""
+    """May this ad's price go into the price history? A real offer with a real price, no
+    severe red flag, nothing missing that the product's price includes."""
     price = listing.price
     if listing.is_free or price is None or not math.isfinite(price) or price <= 1:
         return False
     if _is_auction(listing) or is_wanted_ad(listing.title):
         return False
-    if not is_single_item(listing.title, listing.description):
-        return False
+    if listing_missing(listing):
+        return False  # "Grundgerät, Akkus behalte ich" must not drag down the full kit's price
     return not any(f in SEVERE_FLAGS for f in listing_red_flags(listing))
 
 
-def _identity() -> object | None:
-    """pricing.identity (product identity rules) when it is installed."""
-    try:
-        from . import identity
-    except ImportError:
+def history_key_for(listing: Listing) -> str | None:
+    """Key to remember this ad's price under (identity.Identity.history_key: the product key
+    for plain items, "bundle:…"/"part:…" for other kinds), or None when it is no price signal."""
+    if not history_worthy(listing):
         return None
+    try:
+        return listing_identity(listing).history_key()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _identity() -> object | None:
+    """The pricing.identity module (kept for callers that probe it)."""
+    from . import identity
+
     return identity
 
 
 def is_single_item(title: str, description: str = "") -> bool:
-    """One item of one product — not a bundle, a whole PC, a part or an accessory.
-    Uses pricing.identity.classify_kind when available, else a word list."""
+    """One item of one product — not a bundle, a whole PC, a part or an accessory (a ThinkPad
+    or a Mac mini is an item: identity folds a product's natural kind into "item")."""
     identity = _identity()
-    classify = getattr(identity, "classify_kind", None)
-    if classify is not None:
-        try:
-            natural = getattr(identity, "natural_kind", None)
-            if natural is not None:  # a ThinkPad is a laptop, a Mac mini a PC: that's the item
-                hint = natural(identity.product_key(title), identity.product_category(title))
-                return classify(title, description, query_kind_hint=hint) in ("item", "single")
-            return classify(title, description) in ("item", "single", "laptop")
-        except Exception:  # noqa: BLE001 - a helper bug must not break the monitor
-            pass
-    words = normalize(title).split()
-    return not (set(words) & _LOT_WORDS or _accessory_words(words))
+    try:
+        return identity.identify(title, description).kind == "item"  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        words = normalize(title).split()
+        return not (set(words) & _LOT_WORDS or _accessory_words(words))
 
 
 def market_says_no_deal(ev: Evaluation) -> bool:
@@ -704,6 +846,10 @@ def prefilter_score(
 # ---------------------------------------------------------------------------
 
 TOO_CHEAP_RATIO = 0.4  # buy cost < 40 % of the market: too good to be true
+# "schreib mir auf WhatsApp" / "neu, Versand nach Zahlungseingang" + a third below market = the usual
+# scam (0.65 rather than 0.6: our market estimate may itself be a few percent low)
+BAIT_WHATSAPP_RATIO = 0.65
+BAIT_PREPAY_RATIO = 0.65
 WEAK_SCORE_CAP = 65.0  # thin / scattered market data or unchecked photos: no confident alert
 AI_ONLY_SCORE_CAP = 55.0  # market price only guessed by the AI
 _SAMPLE_SOURCES = frozenset({"ebay_sold", "mixed", "kleinanzeigen", "history"})
@@ -713,8 +859,7 @@ FLAG_AI_PC = "ИИ: это целый компьютер, а не комплек
 FLAG_AI_LAPTOP = "ИИ: это ноутбук, а не комплектующая"
 FLAG_AI_PART = "ИИ: это запчасть, а не товар целиком"
 FLAG_AI_ACCESSORY = "ИИ: это аксессуар, а не сам товар"
-_AI_ITEM_FLAGS = {
-    "bundle": FLAG_AI_BUNDLE,
+_AI_ITEM_FLAGS = {  # a bundle ("PS5 + 2 Controller") is a fine resale item: priced from bundles only
     "complete_pc": FLAG_AI_PC,
     "laptop": FLAG_AI_LAPTOP,
     "part": FLAG_AI_PART,
@@ -871,10 +1016,12 @@ def evaluate(
     *,
     now: datetime | None = None,
     ai_expected: bool = False,
+    vague: bool = False,
 ) -> Evaluation:
     """Profit/ROI (resale) or savings (personal), verdict, action, 0..100 score and Russian
     reasons. `ai_expected`: the AI is enabled for this ad — if it gave no answer, the photos
-    were not checked and the ad can't be a "buy"."""
+    were not checked and the ad can't be a "buy". `vague`: the title names no identifiable
+    product and no better query was found — the market price can't be trusted."""
     now = now or utcnow()
     purpose = search.purpose
     reasons: list[str] = []
@@ -947,6 +1094,13 @@ def evaluate(
     if too_cheap:
         # far below market and the seller won't meet: the classic "Nur Versand" scam
         flags.append(FLAG_TOO_GOOD if is_remote_only(_listing_text(listing)) else FLAG_TOO_CHEAP)
+    if market is not None and buy_cost is not None and not listing.is_free and not auction:
+        ratio = buy_cost / market
+        text = _listing_text(listing)
+        whatsapp_bait = ratio < BAIT_WHATSAPP_RATIO and FLAG_WHATSAPP in flags
+        prepay_bait = ratio < BAIT_PREPAY_RATIO and is_prepay_shipping(text) and says_new(text)
+        if (whatsapp_bait or prepay_bait) and FLAG_TOO_GOOD not in flags:
+            flags.append(FLAG_BAIT)
     severe = [f for f in flags if _is_severe(f)]
     soft = [f for f in flags if not _is_severe(f) and f != FLAG_TOO_CHEAP]
     conf = _confidence(est, ai)
@@ -1090,6 +1244,15 @@ def evaluate(
                 o_save = market - offer_cost
                 strength = _personal_strength(o_save / market, bool(target and offer_cost <= target), mr_eff)
                 reasons.append(f"Торгуйся: предложи {fmt_money(offer)} — экономия ≈ {fmt_money(o_save)}")
+        elif (
+            verdict == "skip" and negotiable and max_buy is not None and max_buy > 0
+            and item_price is not None and item_price > max_buy >= item_price * (1 - 2 * pricing.vb_expected_discount)
+        ):
+            # a bigger haggle than usual would still make it a deal: worth an offer, not an alert
+            offer = _round_offer(max_buy)
+            verdict, action = "maybe", "haggle"
+            strength = min(strength, 55.0)
+            reasons.append(f"Торгуйся: выгодно до {fmt_money(max_buy)} — предложи {fmt_money(offer)}")
         score = strength * factor
 
         basis = _basis_reason(est)
@@ -1102,8 +1265,11 @@ def evaluate(
     if max_buy is not None and max_buy > 0 and not auction and action != "haggle":
         if negotiable or buy_cost is None:
             reasons.append(f"Торгуйся: выгодно до {fmt_money(max_buy)}")
-            if verdict == "maybe" and item_price is not None and item_price > max_buy:
-                action, offer = "haggle", _round_offer(max_buy)
+            # a negotiable price is an invitation: always suggest a concrete offer
+            action, offer = "haggle", _round_offer(max_buy)
+            if item_price is not None and item_price <= max_buy:
+                offer = _round_offer(min(max_buy, item_price * (1 - pricing.vb_expected_discount)))
+                reasons.append(f"Предложи {fmt_money(offer)} — цена и так выгодная, но это VB")
         elif verdict != "buy" and item_price is not None and item_price > max_buy:
             reasons.append(f"Выгодно только при цене до {fmt_money(max_buy)}")
 
@@ -1130,6 +1296,17 @@ def evaluate(
             reasons.append("Аукцион уже завершился")
         elif not ends_soon:
             reasons.append("Аукцион ещё идёт — итоговая цена будет выше")
+
+    missing = listing_missing(listing, flags=flags)
+    if missing and verdict != "skip" and not listing.is_free:
+        reasons.append(f"Некомплект: {', '.join(missing)} — рыночная цена ниже")
+        if purpose == "resale":
+            verdict = _cap_verdict(verdict, "maybe")
+            cap = min(cap, WEAK_SCORE_CAP)
+    if vague and est.source != "reference":
+        verdict = _cap_verdict(verdict, "maybe")
+        cap = min(cap, WEAK_SCORE_CAP)
+        reasons.append("Непонятно, что за товар — уточни")
 
     weak = _weak_evidence(est, pricing) if buy_cost is not None else None
     if weak and verdict != "skip":
@@ -1194,6 +1371,10 @@ def evaluate(
 
     if verdict == "skip":
         action = "skip"
+        if max_buy is not None and max_buy > 0 and not auction:  # no haggle hint next to a "skip"
+            hint = f"Торгуйся: выгодно до {fmt_money(max_buy)}"
+            reasons = [f"Выгодно только при цене до {fmt_money(max_buy)}" if r == hint else r for r in reasons
+                       if not r.startswith("Предложи ")]
     elif auction:
         action = "bid" if action == "bid" else "watch"
     elif not action:

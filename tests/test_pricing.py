@@ -383,7 +383,8 @@ def test_evaluate_no_price():
     assert ev.expected_profit is None and ev.roi is None
     assert "Цена не указана — уточни у продавца" in ev.reasons
     assert ev.max_buy_price == 432
-    assert "Торгуйся: выгодно до 432 €" in ev.reasons
+    # v0.2 fix round: a "skip" never carries a haggle hint (action and reasons must agree)
+    assert "Выгодно только при цене до 432 €" in ev.reasons and ev.action == "skip"
     ev_ai = evaluate(listing, sold_estimate(600), AI_BUY, RESALE, PRICING)
     assert ev_ai.verdict == "maybe"
     assert ev_ai.score <= 40
@@ -573,7 +574,10 @@ def test_prefilter_keeps_kein_umtausch_ads():
     listing = Listing(ad_id="1", url="u", title="ZOTAC RTX 3080 Trinity OC LHR 10GB", price=320,
                       description="Läuft einwandfrei, nie für Mining. Privatverkauf, kein Umtausch.")
     assert prefilter(listing, search) == (True, [])
-    keep, reasons = prefilter(listing.model_copy(update={"description": "Nur Tausch"}), search)
+    # v0.2: stop words look at the title only ("immer mit Hülle benutzt" in a description killed
+    # real deals); a swap-only description is caught by the red flags instead
+    assert prefilter(listing.model_copy(update={"description": "Nur Tausch"}), search) == (True, [])
+    keep, reasons = prefilter(listing.model_copy(update={"title": "RTX 3080 – nur Tausch"}), search)
     assert not keep and reasons == ["Стоп-слова: «tausch»"]
 
 

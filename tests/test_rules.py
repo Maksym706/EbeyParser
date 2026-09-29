@@ -7,14 +7,15 @@ from datetime import timedelta
 import pytest
 
 from ebeyparser.config import PricingConfig, SearchConfig
-from ebeyparser.models import AIVerdict, Evaluation, Listing, PriceEstimate, utcnow
+from ebeyparser.models import AIVerdict, Comparable, Evaluation, Listing, PriceEstimate, utcnow
 from ebeyparser.pricing.estimator import (
+    estimate_from_comparables,
     evaluate,
     market_says_no_deal,
     no_deal_reasons,
     prefilter_score,
 )
-from ebeyparser.pricing.text import detect_red_flags, is_remote_only
+from ebeyparser.pricing.text import FLAG_BAIT, SEVERE_FLAGS, detect_red_flags, is_remote_only, is_wanted_ad
 
 RESALE = SearchConfig(name="gpu")
 PRICING = PricingConfig()
@@ -156,12 +157,18 @@ def test_condition_is_part_of_the_red_flag_text():
 # 7 — AI structured vetoes -----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("item_type", ["bundle", "complete_pc", "part", "accessory", "box_only", "wanted"])
+@pytest.mark.parametrize("item_type", ["complete_pc", "part", "accessory", "box_only", "wanted"])
 def test_ai_item_type_vetoes(item_type):
     ai = SURE_AI.model_copy(update={"item_type": item_type})
     assert evaluate(listing(price=250), market(600), ai, RESALE, PRICING).verdict == "skip"
     unsure = ai.model_copy(update={"confidence": 0.4})
     assert evaluate(listing(price=250), market(600), unsure, RESALE, PRICING).verdict != "skip"
+
+
+def test_bundle_is_no_veto():
+    # v0.2 fix round: "PS5 + 2 Controller" is a fine resale item (priced from bundles only)
+    ai = SURE_AI.model_copy(update={"item_type": "bundle"})
+    assert evaluate(listing(price=250), market(600), ai, RESALE, PRICING).verdict == "buy"
 
 
 def test_laptop_is_only_wrong_when_pricing_a_component():
@@ -244,3 +251,157 @@ def test_private_sale_disclaimer_is_not_a_defect(text):
 
 def test_real_defects_still_detected_next_to_a_disclaimer():
     assert "Дефект / для мастера" in detect_red_flags("Display defekt, keine Rücknahme")
+
+
+# ---------------------------------------------------------------------------- fix round (benchmark)
+
+LOCKED = "Заблокировано (iCloud/аккаунт)"
+DEFECT = "Дефект / для мастера"
+SWAP = "Только обмен"
+WANTED = "Это не продажа, а поиск"
+SCAM = "Признаки мошенничества"
+
+
+@pytest.mark.parametrize(("text", "flag"), [
+    ("Apple-ID vom Vorbesitzer ist noch angemeldet, sonst top.", LOCKED),
+    ("Hängt in der Aktivierung fest, Apple-ID unbekannt.", LOCKED),
+    ("Hängt in der Aktivierungssperre fest", LOCKED),
+    ("Icloud gespert, kann man bestimmt entsperren lassen.", LOCKED),
+    ("I-Cloud ist noch aktiv", LOCKED),
+    ("Aktivierungsperre drin", LOCKED),
+    ("Google-Konto gesperrt (FRP)", LOCKED),
+    ("Samsung Konto ist noch drauf", LOCKED),
+    ("Ist mit einem Code gesichert, den ich leider nicht mehr weiß.", LOCKED),
+    ("Ist noch mit dem Konto meines Bruders verbunden.", LOCKED),
+    ("Ich bin gerade auf Montage in Polen, Versand über DHL.", SCAM),
+    ("Vorrauskasse, Versand versichert.", SCAM),
+    ("Nur Vorauskasse", SCAM),
+    ("Tausch gg. PS5, kein Geld.", SWAP),
+    ("Tausche gg Xbox", SWAP),
+    ("Hätte lieber eine Xbox dafür, Geld interessiert mich eher nicht.", SWAP),
+    ("Nur gegen Switch, Verkauf nicht gewünscht.", SWAP),
+    ("Brauche dringend ein iPhone 13, melde dich!", WANTED),
+    ("Suche dringend eine PS5", WANTED),
+    ("Zahle gut, bitte alles anbieten", WANTED),
+    ("Wir kaufen dein iPhone – sofort Bargeld.", WANTED),
+    ("Lädt nicht mehr, Ladebuchse vermutlich hinüber.", DEFECT),
+    ("Geht nicht mehr an.", DEFECT),
+    ("Startet nicht.", DEFECT),
+    ("Das Display hat einen Sprung quer über den ganzen Bildschirm.", DEFECT),
+    ("Display hat einen Riss", DEFECT),
+    ("Leider Wasserschaden, schaltet sich nicht mehr ein.", DEFECT),
+    ("Hatte Wasserkontakt, geht seitdem nicht mehr.", DEFECT),
+    ("Ist mir runtergefallen, seitdem bleibt der Bildschirm schwarz.", DEFECT),
+    ("Akku ist leicht aufgebläht", DEFECT),
+    ("Ist leider defeckt, geht nicht an.", DEFECT),
+    ("Face ID geht nicht, ansonsten top.", DEFECT),
+])
+def test_natural_phrasings_and_typos_are_flagged(text, flag):
+    assert flag in detect_red_flags("Apple iPhone 13\n" + text)
+
+
+@pytest.mark.parametrize("text", [
+    "Keine Garantie, keine Rücknahme. Für eventuelle Defekte wird nicht gehaftet.",
+    "Privatverkauf, keine Garantie oder Rücknahme bei Defekten.",
+    "Da Privatverkauf: keine Gewährleistung, keine Rücknahme, auch nicht bei Defekten.",
+    "Privatverkauf unter Ausschluss jeglicher Gewährleistung – keine Haftung für Defekte.",
+    "Privatverkauf. Keine Garantie, kein Umtausch, keine Rücknahme bei späteren Defekten.",
+    "Nicht gesperrt, iCloud ist abgemeldet.", "Apple-ID abgemeldet, zurückgesetzt.",
+    "Google-Konto abgemeldet, auf Werkseinstellungen zurückgesetzt.",
+    "Keine Defekte, kein Wasserschaden.", "Display ohne Risse, nie gebrochen.", "Kein Tausch, nur Verkauf.",
+    "Keine Vorkasse, nur Abholung oder PayPal.", "Nie für Mining genutzt, keine Bildfehler.",
+    "Kein Verkauf an Händler.", "Brauche dringend ein neues Handy, deshalb günstig.", "Nicht original verpackt.",
+])
+def test_legit_wordings_stay_clean(text):
+    assert not [f for f in detect_red_flags("Apple iPhone 13\n" + text) if f in SEVERE_FLAGS]
+
+
+def test_wanted_titles():
+    for title in ("iPhone 13 – zahle gut", "Brauche dringend PS5", "Wer verkauft Switch OLED?",
+                  "Kaufe iPhones aller Art an", "Suche dringend RTX 3080"):
+        assert is_wanted_ad(title), title
+    for title in ("Verkaufe iPhone 13", "PS5 abzugeben", "Verkaufe PS5, suche Xbox"):
+        assert not is_wanted_ad(title), title
+
+
+def test_free_defective_item_is_never_a_buy():
+    ad = listing(price=None, is_free=True, description="Lädt nicht mehr, Ladebuchse vermutlich hinüber.")
+    ev = evaluate(ad, market(600), None, RESALE, PRICING)
+    assert ev.verdict == "skip" and ev.score <= 20
+
+
+def test_whatsapp_or_prepay_bait_is_severe_only_when_cheap():
+    wa = "Schreib mir gern direkt auf WhatsApp, hier bin ich selten online."
+    assert evaluate(listing(price=300, description=wa), market(600), None, RESALE, PRICING).verdict == "skip"
+    assert FLAG_BAIT in evaluate(listing(price=300, description=wa), market(600), None, RESALE, PRICING).red_flags
+    assert evaluate(listing(price=420, description=wa), market(600), None, RESALE, PRICING).verdict != "skip"
+    new = "Neu und unbenutzt, Versand erfolgt direkt nach Zahlungseingang."
+    assert evaluate(listing(price=280, description=new), market(600), None, RESALE, PRICING).verdict == "skip"
+    fair = evaluate(listing(price=420, description=new), market(600), None, RESALE, PRICING)
+    assert FLAG_BAIT not in fair.red_flags
+
+
+# B — missing parts --------------------------------------------------------------------------
+
+
+def test_missing_parts_cap_resale_at_maybe():
+    tool = Listing(ad_id="1", url="u", title="DeWalt DCD796", price=60.0,
+                   description="Verkaufe nur das Grundgerät, Akkus und Lader behalte ich.")
+    ev = evaluate(tool, market(160), None, SearchConfig(name="tools"), PRICING)
+    assert ev.verdict == "maybe" and any(r.startswith("Некомплект:") and "рыночная цена ниже" in r
+                                          for r in ev.reasons)
+    laptop = Listing(ad_id="2", url="u", title="Apple MacBook Air M2 8GB 256GB", price=400.0,
+                     description="Ohne Netzteil.")
+    ev = evaluate(laptop, market(760), None, SearchConfig(name="macs"), PRICING)
+    assert ev.verdict == "maybe" and "Некомплект: netzteil — рыночная цена ниже" in ev.reasons
+    personal = evaluate(laptop, market(760), None, SearchConfig(name="p", purpose="personal"), PRICING)
+    assert personal.verdict == "buy"  # for yourself a missing charger is no reason to pass
+
+
+def test_no_missing_parts_cap_for_phones_without_brick_or_solo_tools():
+    phone = Listing(ad_id="1", url="u", title="Apple iPhone 13 128GB", price=250.0,
+                    description="Mit Ladekabel, ohne Netzteil.")
+    assert evaluate(phone, market(450), None, RESALE, PRICING).verdict == "buy"
+    solo = Listing(ad_id="2", url="u", title="DeWalt DCD796 solo", price=50.0)
+    ev = evaluate(solo, market(110), None, SearchConfig(name="tools"), PRICING)  # priced from solo tools
+    assert ev.verdict == "buy" and not any(r.startswith("Некомплект") for r in ev.reasons)
+
+
+# E — haggle consistency ---------------------------------------------------------------------
+
+
+def test_negotiation_hint_always_comes_with_a_haggle_offer():
+    vb = listing(price=170, negotiable=True, price_text="170 € VB")
+    ev = evaluate(vb, market(300), None, RESALE, PRICING)
+    assert ev.verdict == "buy" and ev.action == "haggle"
+    assert ev.offer_price is not None and ev.offer_price <= 170 * 0.95
+    assert any(r.startswith("Торгуйся: выгодно до") for r in ev.reasons)
+    for price in (170, 220, 250, 300):
+        e = evaluate(listing(price=price, negotiable=True), market(300), None, RESALE, PRICING)
+        if any(r.startswith("Торгуйся: выгодно до") for r in e.reasons) and e.verdict != "skip":
+            assert e.action == "haggle" and e.offer_price, price
+
+
+# G — spread after robust outlier removal ------------------------------------------------------
+
+
+def test_a_few_trap_prices_do_not_make_the_market_unclear():
+    prices = [780, 790, 800, 770, 810, 795, 785, 391, 420]  # two traps among nine
+    comps = [Comparable(title="Thermomix TM6", price=p, sold=True, source="ebay_sold") for p in prices]
+    est = estimate_from_comparables(comps)
+    assert (est.high - est.low) / est.market_price < 0.1
+    ev = evaluate(Listing(ad_id="1", url="u", title="Thermomix TM6", price=510.0), est, None, RESALE, PRICING)
+    assert not any("разбросаны" in r for r in ev.reasons)
+
+
+def test_bundle_titles_never_stand_in_for_the_bare_product():
+    from ebeyparser.pricing.estimator import comparable_fits, comparable_is_relevant, looks_like_bundle
+
+    assert looks_like_bundle("Lenovo ThinkPad T480 mit Monitor, Tastatur und Maus")
+    assert looks_like_bundle("Sony PS5 Disc + 2 Controller + 5 Spiele")
+    assert not looks_like_bundle("iPhone 13 mit Hülle und Panzerglas")  # cheap extras: still the phone
+    assert not looks_like_bundle("Steam Deck OLED Controller")
+    assert not comparable_is_relevant("lenovo thinkpad t480", "Lenovo ThinkPad T480 mit Monitor, Tastatur und Maus")
+    bundle = Comparable(title="PS5 Disc + 2 Controller + Spiele", price=550)
+    assert not comparable_fits("Sony PS5 Disc Edition", bundle)
+    assert comparable_fits("Sony PS5 Disc + 2 Controller + 5 Spiele", bundle)

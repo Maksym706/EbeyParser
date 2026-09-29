@@ -38,19 +38,21 @@ from .models import AIVerdict, Comparable, DealView, Evaluation, Listing, PriceE
 from .notify.base import build_notifiers
 from .pricing.estimator import (
     below_min_price,
+    comparable_fits,
     estimate_from_comparables,
     estimate_from_history,
     evaluate,
     find_reference_price,
-    history_worthy,
+    history_key_for,
+    history_lookup_key,
+    listing_identity,
     market_says_no_deal,
     no_deal_reasons,
     prefilter,
     prefilter_score,
-    product_query,
-    relevant_comparables,
 )
-from .pricing.text import is_model_key, normalize
+from .pricing.identity import Identity, ProductKey, identify
+from .pricing.text import SEVERE_FLAGS, detect_red_flags, is_model_key, make_search_query, normalize
 from .scraper.ebay_api import EbayAPIError, EbayBrowseClient
 from .scraper.ebay_sold import EbaySoldScraper
 from .scraper.http import BlockedError, PoliteClient, RateBudgetExceeded
@@ -106,6 +108,45 @@ class _Candidate:
         if listing.price is None or listing.price <= 1 or est is None or not est.market_price:
             return UNKNOWN_DISCOUNT
         return (listing.price + (listing.shipping_cost or 0.0)) / est.market_price
+
+
+@dataclass(frozen=True)
+class _Target:
+    """What is being priced and how comparables must match it."""
+
+    query: str  # search phrase for comparables ("iphone 13 128gb")
+    ref: str | ProductKey  # comparable_fits() reference: the ad's title (its kind counts) or a key
+    history_key: str | None  # stored-key prefix in the price history ("iphone|13", "bundle:playstation|5")
+    kind: str = "item"
+
+    @property
+    def cache_key(self) -> str:
+        """Same search phrase + same product/kind being matched. "DeWalt DCD796 solo" and the kit
+        share the phrase "dewalt dcd796" but must never share an estimate."""
+        if isinstance(self.ref, ProductKey):
+            match = self.ref.key()
+        else:
+            try:
+                key = identify(self.ref).key
+            except Exception:  # noqa: BLE001
+                key = None
+            match = key.key() if key is not None else normalize(self.ref)
+        return f"{normalize(self.query)}|{self.kind}|{match}"
+
+
+# kinds of offer that are not the product itself (identity.classify_kind)
+_KIND_SKIP_RU = {
+    "wanted": "Это объявление о поиске/покупке, а не продажа",
+    "swap": "Только обмен, не продажа",
+    "service": "Это услуга, а не товар",
+    "box_only": "Только коробка, без самого товара",
+    "defect": "Неисправный товар — не для перепродажи",
+    "part": "Запчасть или некомплект — не целый товар",
+    "accessory": "Аксессуар, а не сам товар",
+    "complete_pc": "Целый компьютер, а не отдельный товар",
+    "laptop": "Это ноутбук, а не отдельная комплектующая",
+}
+_ADDON_KINDS = frozenset({"part", "accessory"})
 
 
 class _Deferred(Exception):
@@ -551,11 +592,13 @@ class Monitor:
             return []
 
     def _remember_prices(self, search: SearchConfig, listings: list[Listing]) -> None:
-        """Feed the price history with this page of results: single items with a real price
-        only. Not from price-filtered searches — a list cut at max_price drags medians down."""
+        """Feed the price history with this page of results, each ad under its identity key
+        (plain items under the product, bundles/parts/... under a kind prefix; wanted, swap,
+        box-only, model-less ads and ads missing parts not at all). Not from price-filtered
+        searches — a list cut at max_price drags medians down."""
         if _price_filtered(search):
             return
-        rows = [(key, l) for l in listings if history_worthy(l) and (key := product_query(l.title))]
+        rows = [(key, l) for l in listings if (key := history_key_for(l))]
         if not rows:
             return
         try:
@@ -597,6 +640,11 @@ class Monitor:
             too_cheap = below_min_price(listing, floor)
             if too_cheap:
                 keep, reasons = False, [too_cheap]
+        ident = listing_identity(listing)
+        if keep:
+            veto = self._kind_veto(ident, search)
+            if veto:
+                keep, reasons = False, [veto]
         if not keep:
             if counted:
                 budget.summary.prefiltered += 1
@@ -604,12 +652,13 @@ class Monitor:
 
         known = self._reference_estimate(listing, search)
         if known is None:
-            known = self._history_estimate(listing, product_query(listing.title))
+            target = self._listing_target(listing, ident)
+            known = self._history_estimate(listing, target) if target is not None else None
         hint = known
         if known is not None:
             best = evaluate(listing, known, None, search, self.config.pricing)
             if market_says_no_deal(best):
-                if not self._may_skip_early(known):
+                if not self._may_skip_early(known, ident):
                     known = None  # thin/unclear history says "no deal": check comparables first
                 else:
                     if counted:
@@ -620,8 +669,9 @@ class Monitor:
                 budget.summary.history_hits += 1
         return _Candidate(listing, known, hint)
 
-    def _may_skip_early(self, est: PriceEstimate) -> bool:
-        """Is this market price solid enough to drop an ad without looking at it?"""
+    def _may_skip_early(self, est: PriceEstimate, ident: Identity) -> bool:
+        """Is this market price solid enough to drop an ad without looking at it? A reference
+        price, or a history of ≥8 close prices of an exactly identified product."""
         if est.source == "reference":
             return True
         if est.source != "history" or est.sample_size < EARLY_SKIP_MIN_POINTS:
@@ -630,7 +680,55 @@ class Monitor:
             return False
         if (est.high - est.low) / est.market_price > EARLY_SKIP_MAX_SPREAD:
             return False
-        return _is_model_key(est.query)
+        return ident.priceable
+
+    def _kind_veto(self, ident: Identity, search: SearchConfig) -> str | None:
+        """Skip ads that aren't the product itself (identity kinds). Bundles stay (priced from
+        bundles only). Defects/parts/accessories/PCs stay when the search itself asks for such
+        things ("rtx 3080 kühler", "gaming pc"): they are then priced from their own kind."""
+        kind = ident.kind
+        if kind not in _KIND_SKIP_RU:
+            return None
+        if kind not in ("wanted", "swap", "service", "box_only") and search.query.strip():
+            try:
+                wanted_kind = identify(search.query).kind
+            except Exception:  # noqa: BLE001
+                wanted_kind = None
+            if wanted_kind == kind or (kind in _ADDON_KINDS and wanted_kind in _ADDON_KINDS):
+                return None
+        reason = _KIND_SKIP_RU[kind]
+        if kind == "part" and ident.missing:
+            reason += f" (нет: {', '.join(ident.missing)})"
+        return reason
+
+    @staticmethod
+    def _listing_target(listing: Listing, ident: Identity | None = None) -> _Target | None:
+        """Price the ad as what identity says it is; None = the title names no product."""
+        ident = ident or listing_identity(listing)
+        if ident.key is None:
+            return None
+        return _Target(ident.key.query() or listing.title, listing.title, history_lookup_key(ident), ident.kind)
+
+    @staticmethod
+    def _query_target(query: str, listing: Listing) -> _Target:
+        """Price the ad by the AI's own search phrase (vague title / no market data). Searching
+        uses the AI's wording ("Apple iPad 10 64GB" finds what sellers write). Matching stays the
+        ad's own product when identity agrees on family and model (a "solo" tool never takes the
+        kit's price, a bundle only bundles); when the two differ, the title was probably misread
+        ("MacBookAir", "iPadAir(5. Gen)") and the AI's product decides."""
+        phrase = " ".join(query.split())
+        try:
+            key = identify(query).key
+        except Exception:  # noqa: BLE001
+            key = None
+        own = listing_identity(listing)
+        same_line = (key is not None and own.key is not None
+                     and (key.family, key.model) == (own.key.family, own.key.model))
+        if own.key is not None and (own.kind == "bundle" or same_line or key is None):
+            return _Target(phrase, listing.title, history_lookup_key(own), own.kind)
+        if key is None:
+            return _Target(phrase, phrase, None)
+        return _Target(phrase, key, key.coarse_key())
 
     async def _finish(self, cand: _Candidate, search: SearchConfig, budget: _Budget) -> Evaluation:
         """Paid part of the funnel: ad page → prefilter on the full text → comparables (only
@@ -674,9 +772,12 @@ class Monitor:
     ) -> Evaluation:
         """AI verdict (if asked) → final evaluation → second opinion → store."""
         verdict = None
+        from_ai_query = False
         if ask_ai:
-            verdict, estimate = await self._ask_ai(listing, search, estimate, source, budget)
-        evaluation = evaluate(listing, estimate, verdict, search, self.config.pricing, ai_expected=ask_ai)
+            verdict, estimate, from_ai_query = await self._ask_ai(listing, search, estimate, source, budget)
+        vague = not from_ai_query and self._listing_target(listing) is None
+        evaluation = evaluate(listing, estimate, verdict, search, self.config.pricing, ai_expected=ask_ai,
+                              vague=vague)
         evaluation = await self._maybe_second_opinion(listing, search, estimate, evaluation, source)
         return self._save(evaluation.model_copy(update={"stage": "full"}))
 
@@ -735,9 +836,10 @@ class Monitor:
     async def _ask_ai(
         self, listing: Listing, search: SearchConfig, estimate: PriceEstimate, source: Any,
         budget: _Budget | None,
-    ) -> tuple[AIVerdict, PriceEstimate]:
+    ) -> tuple[AIVerdict, PriceEstimate, bool]:
         """Local AI verdict. The model sees a few comparables (never our market price — it
-        guesses its own blind) and says which of them are the same variant."""
+        guesses its own blind) and says which of them are the same variant. The third value:
+        the market price now comes from the AI's own search query."""
         assert self._evaluator is not None
         images = await self._images(listing, source, self.config.ai.max_images)
         shown = prompt_comparables(None, _comparables_for_ai(estimate))
@@ -749,13 +851,14 @@ class Monitor:
         )
         estimate = self._variant_checked(estimate, same_variant_comparables(verdict, shown) if shown else None)
         # The model often identifies the product better than the raw title does.
+        from_query = False
         if estimate.market_price is None and verdict.search_query:
             ai_estimate = await self._market_estimate(
                 listing, search, budget, query=verdict.search_query, defer=False
             )
             if ai_estimate.market_price is not None:
-                estimate = ai_estimate
-        return verdict, _cross_check(estimate, verdict)
+                estimate, from_query = ai_estimate, True
+        return verdict, _cross_check(estimate, verdict), from_query
 
     async def _images(self, listing: Listing, source: Any, max_images: int) -> list[bytes]:
         if not listing.image_urls or max_images <= 0:
@@ -850,20 +953,24 @@ class Monitor:
     ) -> PriceEstimate:
         """Reference price, then our own price history (both free), then comparables from the
         network (cached; counts against the pass budget — `defer=False` returns "no estimate"
-        instead of deferring when it is used up)."""
+        instead of deferring when it is used up). `query`: price by the AI's search phrase
+        instead of the ad's identity. A title that names no product gets no estimate at all —
+        comparables for "Tablet zu verkaufen" would be any tablet."""
         if query is None:
             ref = self._reference_estimate(listing, search)
             if ref is not None:
                 return ref
-        q = (query or product_query(listing.title)).strip()
-        if not q:
-            return PriceEstimate(notes="Не удалось составить запрос для поиска аналогов")
-        history = self._history_estimate(listing, q) if use_history else None
+            target = self._listing_target(listing)
+            if target is None:
+                return PriceEstimate(notes="Непонятно, что за товар — аналоги по названию не ищу")
+        else:
+            target = self._query_target(query, listing)
+        history = self._history_estimate(listing, target) if use_history else None
         if history is not None:
             if budget is not None:
                 budget.summary.history_hits += 1
             return history
-        cached = self._cached_comps(q)
+        cached = self._cached_comps(target)
         if cached is not None:
             return cached
         if budget is not None:
@@ -872,17 +979,47 @@ class Monitor:
             except _Deferred:
                 if defer:
                     raise
-                return PriceEstimate(query=q, notes="Лимит поиска аналогов на эту проверку исчерпан")
+                return PriceEstimate(query=target.query, notes="Лимит поиска аналогов на эту проверку исчерпан")
             if not allowed:
-                return PriceEstimate(query=q, notes="Поиск аналогов выключен (general.max_comps_lookups_per_run: 0)")
+                return PriceEstimate(query=target.query,
+                                     notes="Поиск аналогов выключен (general.max_comps_lookups_per_run: 0)")
         try:
-            return await self._comps_estimate(listing, q)
+            estimate = await self._comps_estimate(listing, target)
         except RateBudgetExceeded as exc:  # hourly page cap: no request was sent
             if budget is not None:
                 budget.summary.comps_lookups -= 1
                 if defer:
                     raise
-            return PriceEstimate(query=q, notes=f"Аналоги не искал: {exc}")
+            return PriceEstimate(query=target.query, notes=f"Аналоги не искал: {exc}")
+        if estimate.market_price is None and query is None:
+            estimate = await self._retry_with_title_words(listing, target, budget) or estimate
+        return estimate
+
+    async def _retry_with_title_words(
+        self, listing: Listing, target: _Target, budget: _Budget | None
+    ) -> PriceEstimate | None:
+        """Identity's canonical query found nothing ("ipad 2022 64gb" while sellers write
+        "iPad 10"): one more lookup with the title's own words, same strict matching."""
+        words = make_search_query(listing.title)
+        if not words or normalize(words) == normalize(target.query):
+            return None
+        alt = _Target(words, target.ref, target.history_key, target.kind)
+        cached = self._cached_comps(alt)
+        if cached is not None:
+            return cached if cached.market_price is not None else None
+        if budget is not None:
+            try:
+                if not budget.spend("comps_lookups"):
+                    return None
+            except _Deferred:
+                return None  # the first lookup already counted: no deferral for the bonus one
+        try:
+            estimate = await self._comps_estimate(listing, alt)
+        except RateBudgetExceeded:
+            if budget is not None:
+                budget.summary.comps_lookups -= 1
+            return None
+        return estimate if estimate.market_price is not None else None
 
     def _reference_estimate(self, listing: Listing, search: SearchConfig) -> PriceEstimate | None:
         if search.reference_price is not None:
@@ -899,33 +1036,38 @@ class Monitor:
             )
         return None
 
-    def _history_estimate(self, listing: Listing, query: str) -> PriceEstimate | None:
-        """Market price from prices seen before (search results, comparables) — no requests."""
+    def _history_estimate(self, listing: Listing, target: _Target) -> PriceEstimate | None:
+        """Market price from prices seen before (search results, comparables) — no requests.
+        Fetched by the product's coarse key, kept only if identity calls them the same product
+        and kind of offer as this ad."""
         pricing = self.config.pricing
-        if not pricing.use_price_history:
+        if not pricing.use_price_history or not target.history_key:
             return None
         days = max(1, pricing.history_days)
         try:
-            points = self.db.price_history_dated(
-                normalize(query), utcnow() - timedelta(days=days), exclude_ad_id=listing.ad_id
+            points = self.db.price_history_prefix(
+                target.history_key, utcnow() - timedelta(days=days), exclude_ad_id=listing.ad_id
             )
         except sqlite3.Error as exc:
-            log.warning("Price history lookup for %r failed: %s", query, exc)
+            log.warning("Price history lookup for %r failed: %s", target.history_key, exc)
             return None
         return estimate_from_history(
-            query, points, asking_price_discount=pricing.asking_price_discount,
-            min_points=pricing.history_min_points, days=days,
+            target.query, points, asking_price_discount=pricing.asking_price_discount,
+            min_points=pricing.history_min_points, days=days, fits=lambda c: comparable_fits(target.ref, c),
         )
 
-    def _cached_comps(self, query: str) -> PriceEstimate | None:
-        cached = self._comps_cache.get(normalize(query))
+    def _cached_comps(self, target: _Target | str) -> PriceEstimate | None:
+        key = target.cache_key if isinstance(target, _Target) else f"{normalize(target)}|item"
+        cached = self._comps_cache.get(key)
         if cached and time.monotonic() - cached[0] < COMPS_CACHE_TTL:
             return cached[1]
         return None
 
-    async def _comps_estimate(self, listing: Listing, query: str) -> PriceEstimate:
-        """Look up comparables (eBay sold, eBay API, Kleinanzeigen), remember their prices."""
+    async def _comps_estimate(self, listing: Listing, target: _Target) -> PriceEstimate:
+        """Look up comparables (eBay sold, eBay API, Kleinanzeigen), keep the ones identity
+        calls the same product and kind of offer, remember every price in the history."""
         pricing = self.config.pricing
+        query = target.query
         comps: list[Comparable] = []
         limited: RateBudgetExceeded | None = None  # a source skipped by the hourly page cap
         if pricing.use_ebay_sold_comps and not self._ebay_blocked and self._ebay is not None:
@@ -966,21 +1108,38 @@ class Monitor:
         if limited is not None and not comps:
             raise limited  # nothing to go on: defer, retry next pass
 
-        relevant = relevant_comparables(query, comps)
+        relevant = [c for c in comps if comparable_fits(target.ref, c)]
         if len(relevant) < len(comps):
-            log.debug("Comparables for %r: kept %d of %d (dropped PCs, parts, other models...)",
+            log.debug("Comparables for %r: kept %d of %d (other variants, bundles, parts...)",
                       query, len(relevant), len(comps))
-        if relevant:
-            try:
-                self.db.add_price_points(normalize(query), relevant)
-            except sqlite3.Error as exc:
-                log.warning("Price history: can't store comparables of %r: %s", query, exc)
+        self._remember_comparables(comps)
         estimate = estimate_from_comparables(
             relevant, asking_price_discount=pricing.asking_price_discount, query=query
         )
         if limited is None:  # a partial lookup is used once but not cached
-            self._comps_cache[normalize(query)] = (time.monotonic(), estimate)
+            self._comps_cache[target.cache_key] = (time.monotonic(), estimate)
         return estimate
+
+    def _remember_comparables(self, comps: list[Comparable]) -> None:
+        """Every comparable is a price of *some* product: store each under its own identity key
+        (the Pro found while looking for the plain model helps the next Pro ad)."""
+        rows: list[tuple[str, Comparable]] = []
+        for comp in comps:
+            if not comp.price or comp.price <= 1:
+                continue
+            try:
+                ident = identify(comp.title)
+            except Exception:  # noqa: BLE001
+                continue
+            key = ident.history_key()
+            if key and not ident.missing and not _severe_title(comp.title):
+                rows.append((key, comp))
+        if not rows:
+            return
+        try:
+            self.db.record_price_points(rows)
+        except sqlite3.Error as exc:
+            log.warning("Price history: can't store comparables: %s", exc)
 
     # --------------------------------------------------------- notifications
     def _should_notify(self, evaluation: Evaluation) -> bool:
@@ -1103,6 +1262,10 @@ def _price_filtered(search: SearchConfig) -> bool:
         or search.max_price is not None
         or bool(search.url and _URL_PRICE_FILTER_RE.search(search.url))
     )
+
+
+def _severe_title(title: str) -> bool:
+    return any(f in SEVERE_FLAGS for f in detect_red_flags(title))
 
 
 def _is_model_key(key: str) -> bool:

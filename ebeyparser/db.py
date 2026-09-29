@@ -6,7 +6,6 @@ calls are quick, so the async code calls these methods directly.
 
 from __future__ import annotations
 
-import json
 import math
 import re
 import sqlite3
@@ -469,7 +468,7 @@ class Database:
         when = _ts(seen_at or utcnow())
         prepared: list[tuple[Any, ...]] = []
         for key, item in rows:
-            key = " ".join(normalize(key).split())
+            key = (key or "").strip()  # stored verbatim: identity keys look like "iphone|13||128gb"
             price = item.price
             if not key or price is None or not math.isfinite(price) or price <= 0:
                 continue
@@ -565,6 +564,41 @@ class Database:
             ))
         return out
 
+    def price_history_prefix(
+        self,
+        key: str,
+        since: datetime | None = None,
+        *,
+        exclude_ad_id: str | None = None,
+        limit: int = 400,
+    ) -> list[tuple[Comparable, datetime]]:
+        """Prices stored under `key` or any finer key below it ("iphone|13" also returns
+        "iphone|13|pro|256gb" — filter with identity.comparable_matches), newest first.
+        Prefixed kinds ("bundle:iphone|13") only match a prefixed `key`."""
+        key = (key or "").strip()
+        if not key:
+            return []
+        # '}' sorts right after '|': the range is exactly the keys starting with "key|"
+        sql = ("SELECT * FROM price_points WHERE (product_key = ? OR (product_key >= ? AND product_key < ?))")
+        params: list[Any] = [key, key + "|", key + "}"]
+        if since is not None:
+            sql += " AND seen_at >= ?"
+            params.append(_ts(since))
+        if exclude_ad_id:
+            sql += " AND ad_id != ?"
+            params.append(exclude_ad_id)
+        sql += " ORDER BY seen_at DESC LIMIT ?"
+        params.append(max(0, int(limit)))
+        out: list[tuple[Comparable, datetime]] = []
+        for r in self._query(sql, params):
+            seen = datetime.fromisoformat(r["seen_at"])
+            out.append((
+                Comparable(title=r["title"], price=r["price"], url=r["url"], source=r["source"],
+                           sold=bool(r["sold"]), date_text=seen.strftime("%d.%m.%Y")),
+                seen,
+            ))
+        return out
+
     def prune_price_points(self, days: float | None = None, *, before: datetime | None = None) -> int:
         """Delete price points not seen for `days` days (or since `before`). Returns the count."""
         if before is None:
@@ -576,8 +610,8 @@ class Database:
     def count_price_points(self, product_key: str | None = None) -> int:
         if product_key is None:
             return int(self._query("SELECT COUNT(*) FROM price_points")[0][0])
-        key = " ".join(normalize(product_key).split())
-        return int(self._query("SELECT COUNT(*) FROM price_points WHERE product_key = ?", (key,))[0][0])
+        return int(self._query("SELECT COUNT(*) FROM price_points WHERE product_key = ?",
+                               (product_key.strip(),))[0][0])
 
     # ------------------------------------------------------------- search state
     def search_has_run(self, name: str) -> bool:

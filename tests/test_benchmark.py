@@ -174,8 +174,8 @@ def test_run_cli_prints_report(capsys: pytest.CaptureFixture[str]):
 # ------------------------------------------------------- quality targets (xfail)
 
 
-@pytest.mark.xfail(strict=False, reason="quality target")
 def test_quality_targets(oracle: bm.BenchmarkResult):
+    # met since the v0.2 fix round (buy/notification precision 100 %, recall ~90 %): now a regression test
     assert oracle.precision is not None and oracle.precision >= bm.TARGET_PRECISION
     assert oracle.recall is not None and oracle.recall >= bm.TARGET_RECALL
     assert oracle.est_median_error is not None and oracle.est_median_error <= bm.TARGET_MEDIAN_ERROR
