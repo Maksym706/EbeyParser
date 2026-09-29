@@ -2,8 +2,8 @@
 compatibility checks → personal searches for every part → the best current offer per slot,
 alerts when an offer beats its target or the whole build fits the budget, purchases.
 
-Mounted by web/api/__init__.py; alerts: install_project_alerts() listens to the event hub
-(deal_found / deal_updated / run_finished, which the Monitor's on_event feeds)."""
+Mounted by web/api/__init__.py; alerts: install_project_alerts() hooks projects.hooks.attach() into
+Monitor.on_event (the same wiring the headless CLI modes use) plus the API's own deal_updated."""
 
 from __future__ import annotations
 
@@ -825,19 +825,38 @@ def _notifiers(ctx: ApiContext) -> list[Any]:
 
 
 def install_project_alerts(ctx: ApiContext) -> ProjectAlerter:
-    """Alerts of build projects: listens to the event hub, which carries the Monitor's on_event
-    (deal_found, run_finished) and the API's own deal_updated."""
+    """Alerts of build projects. With a monitor: projects.hooks.attach() hooks them straight into
+    Monitor.on_event (the same helper the headless CLI modes use; attaching twice only updates the
+    wiring) and the hub adds just the API's own deal_updated (e.g. a manual re-check). Without a
+    monitor: the hub carries everything."""
+    from ...projects import hooks
 
     def announce(data: dict[str, Any]) -> None:
         project = data.pop("project", None)
         state = data.pop("state", None)
         publish(ctx, project, str(data.pop("reason", "offer")), state=state, **data)
 
-    alerter = ProjectAlerter(
-        ctx.db, config=lambda: ctx.config, notifiers=lambda: _notifiers(ctx), publish=announce,
-        project_url=lambda pid: f"{ctx.web_base_url().rstrip('/')}/projects/{pid}", market=market_of(ctx))
+    wiring: dict[str, Any] = {
+        "config": lambda: ctx.config, "notifiers": lambda: _notifiers(ctx), "publish": announce,
+        "project_url": lambda pid: f"{ctx.web_base_url().rstrip('/')}/projects/{pid}", "market": market_of(ctx),
+    }
+    monitor = ctx.monitor
+    if isinstance(getattr(monitor, "on_event", None), list):
+        alerter = hooks.attach(monitor, ctx.db, **wiring)
+
+        def api_events(event: Any) -> None:
+            # the monitor's own events reach the alerter directly; its deal_updated carries search_name
+            if event.type == "deal_updated" and "search_name" not in (event.data or {}):
+                alerter.on_event(event.type, event.data)
+
+        ctx.hub.add_listener(api_events)
+    else:
+        from ...notify import extras
+
+        alerter = ProjectAlerter(ctx.db, **wiring)
+        extras.register(hooks.EXTRAS_NAME, alerter.context_lines)
+        ctx.hub.add_listener(lambda event: alerter.on_event(event.type, event.data))
     ctx.project_alerts = alerter  # type: ignore[attr-defined]
-    ctx.hub.add_listener(lambda event: alerter.on_event(event.type, event.data))
     return alerter
 
 

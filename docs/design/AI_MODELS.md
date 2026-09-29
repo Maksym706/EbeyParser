@@ -17,7 +17,7 @@ other speeds are extrapolated from memory bandwidth and published GPU numbers (�
 
 | Tier | Hardware | Triage (every ad) | Vision (top candidates) | Embeddings (always on the server) | Second opinion (1–2 deals/day) |
 |---|---|---|---|---|---|
-| **T0** | CPU 2–4 cores, 4–8 GB (N100, old laptop, Pi 5 8 GB) | **Qwen3.5 2B** Q4_K_M. Needs ~3 GB RAM. **~6 s/ad → ~600 ads/h** (measured). With less than 5 GB RAM: nothing usable, run the scout elsewhere | Same model plus its vision projector, loaded on demand. **~40–60 s/photo** (measured, §4.3). Better: the PC | **Qwen3-Embedding 0.6B** Q8_0 (~1 GB). With 4–5 GB RAM: EmbeddingGemma 300M | None locally. Use the PC, or Claude (already supported as `ai.second_opinion`) |
+| **T0** | CPU 2–4 cores, 4–8 GB (N100, old laptop, Pi 5 8 GB) | **Qwen3.5 2B** Q4_K_M, **batch 5**. Needs ~2.5–3 GB RAM. **~6 s/ad → ~600 ads/h** (measured). No model under 2B is usable for triage | Same model plus its vision projector (+0.7 GB), loaded on demand. **~38 s/photo** (measured, §4.3). With 4–5 GB RAM: Qwen3.5 0.8B + projector, 16 s/photo, good at reading text only. Better: the PC | **Qwen3-Embedding 0.6B** Q8_0 (~1 GB). With 4–5 GB RAM: EmbeddingGemma 300M | None locally. Use the PC, or Claude (already supported as `ai.second_opinion`) |
 | **T1** | CPU 8 cores, 16–32 GB | **Qwen3.5 4B** Q4_K_M. Needs ~5 GB. ~6 s/ad → ~600 ads/h (est.; 15.5 s/ad measured on T0) | Qwen3.5 4B + projector (same download) | Qwen3-Embedding 0.6B | Qwen3.5 9B, thinking on. Minutes per deal, which is fine for 1–2 a day |
 | **T2** | GPU 8–12 GB (RTX 3060 12 GB / 4060 8 GB) | **Qwen3.5 9B** Q4_K_M (5.7 GB + 0.9 GB projector). ~1.5 s/ad → ~2,400 ads/h | Same model, one load for text and photos | Qwen3-Embedding 0.6B (server CPU) | Same 9B with thinking on. No model swap |
 | **T3** | GPU 24 GB (RTX 3090 / 4090) | **Qwen3.6 35B-A3B** MoE UD-Q4_K_M (~22 GB). ~0.5 s/ad, >100 tok/s on a 3090 | Same model (native vision) | Qwen3-Embedding 0.6B (server CPU) | **Qwen3.8 27B** Q4_K_M (17 GB), loaded on demand |
@@ -27,6 +27,7 @@ other speeds are extrapolated from memory bandwidth and published GPU numbers (�
 
 | Model | Ollama | LM Studio (`lms get …`) | llama.cpp (`llama-server -hf …`) | File at quant | RAM on CPU* | VRAM |
 |---|---|---|---|---|---|---|
+| Qwen3.5 0.8B (photos only) | `qwen3.5:0.8b-q4_K_M` | `qwen/qwen3.5-0.8b` | `unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M` + `mmproj-F16.gguf` | 0.53 GB + 0.2 GB | 2.0 GB with projector (measured) | 1.5 GB |
 | Qwen3.5 2B | `qwen3.5:2b-q4_K_M` (1.9 GB incl. vision) | `qwen/qwen3.5-2b` | `unsloth/Qwen3.5-2B-GGUF:Q4_K_M` (+ `mmproj-F16.gguf` for photos) | 1.28 GB + 0.67 GB projector | 3.1 GB measured | 2.5 GB |
 | Qwen3.5 4B | `qwen3.5:4b-q4_K_M` | `qwen/qwen3.5-4b` | `unsloth/Qwen3.5-4B-GGUF:Q4_K_M` | 2.74 GB + 0.67 GB | 4.8 GB (6.6 GB peak RSS measured, incl. mmap page cache) | 4 GB |
 | Qwen3.5 9B | `qwen3.5:9b-q4_K_M` (6.6 GB) | `qwen/qwen3.5-9b` | `unsloth/Qwen3.5-9B-GGUF:Q4_K_M` | 5.68 GB + 0.92 GB | ~9 GB | 8 GB |
@@ -189,7 +190,7 @@ LM Studio ids are catalog ids. The quant is chosen in the app (Q4_K_M is the def
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | Qwen3.5 2B | v1 naive (pretty JSON, long keys) | 10 | 67 % | 57 % | **10 %** | 63 % | 50 % | 37 % | 0.44 | 120 | 9.4 | **14.1** | 3.1 GB |
 | Qwen3.5 2B | v2 compact | 10 | **100 %** | 60 % | 63 % | 87 % | 80 % | 63 % | 0.43 | 46 | 9.0 | **5.9** | 3.1 GB |
-| Qwen3.5 2B | v2 compact | 5 | BS5_JSON | BS5_PROD | BS5_KIND | BS5_SCAM | BS5_BUNDLE | BS5_RU | BS5_AUC | BS5_OUT | BS5_TG | **BS5_S** | 3.1 GB |
+| Qwen3.5 2B | v2 compact | 5 | **100 %** | 72 % | **80 %** | 88 % | 76 % | 60 % | 0.41 | 51 | 8.6‡ | **5.7‡** | 3.1 GB |
 | **Qwen3.5 4B** | v2 compact | 10 | **100 %** | **97 %** | **87 %** | **100 %** | 80 % | **100 %** | 0.63 | 55 | 3.9 | **15.5** | 6.6 GB† |
 | Qwen3.5 0.8B | v2 compact | 10 | 33 % | 30 % | 20 % | 30 % | 27 % | 3 % | 0.43 | 59 | 15.8 | 4.5 | 1.7 GB |
 | Granite 4.2 3B | v2 compact | 10 | aborted: returned 1 of 10 items and echoed the example reason; then 0.2–0.5 tok/s under CPU contention | | | | | | | | | | 5.0 GB |
@@ -197,6 +198,11 @@ LM Studio ids are catalog ids. The quant is chosen in the app (Q4_K_M is the def
 
 † Peak RSS counts the mmap'd file pages and llama.cpp's repacked CPU copy of the weights. `--no-mmap` lowers it to
 about the file size plus 1–2 GB.
+
+‡ Batch 5 was scored on the first 25 ads (5 of 6 batches). The last batch hit a period of heavy CPU steal on the
+shared VM (0.4–1 tok/s) and was stopped. Its s/ad is from the uncontended batch (1.9 s prompt + 26.8 s generation for
+5 ads). With the system prompt cached, **batch 5 costs about the same per ad as batch 10** (51 vs 46 output tokens/ad)
+**but the 2B is clearly more accurate at 5**: kind 80 % vs 63 %, product 72 % vs 60 %.
 
 What the errors look like:
 
@@ -236,11 +242,17 @@ Score = correct booleans + expected text found (15 checks).
 
 | Model | Score | s/photo (4 threads) | Peak RSS | Notes |
 |---|---|---|---|---|
-| Qwen3.5 0.8B + mmproj F16 (205 MB) | VIS08_SCORE | VIS08_S | VIS08_RSS | VIS08_NOTE |
-| Qwen3.5 2B + mmproj F16 (668 MB) | VIS2_SCORE | VIS2_S | VIS2_RSS | VIS2_NOTE |
+| Qwen3.5 0.8B + mmproj F16 (205 MB) | 11/15 | **15.8** (3 threads) | 2.0 GB | Perfect OCR: the whole German lock-screen text, the full GPU label with S/N. Judgement is weak: it called the cracked-phone photo a lock screen, and the catalogue render a real photo |
+| Qwen3.5 2B + mmproj F16 (668 MB) | **13/15** | **37.9** (3 threads) | 4.0 GB | Lock screen, crack and catalogue render all right, perfect OCR. Its two misses were `stock_photo=true` on the synthetic crack and label images. Those *are* renders, so the gold label is debatable |
 
-Image encoding dominates on CPU: a 1024 px photo is ~1k image tokens for Qwen3.5. **Send at most 2–3 photos at
-≤768 px per ad on CPU** and keep the 1024 px path for the GPU.
+Image encoding dominates on CPU: a 768×1024 photo is ~750–1,100 prompt tokens for Qwen3.5, processed at 32–40 tok/s
+by the 2B and ~100 tok/s by the 0.8B on this VM.
+
+* **Send at most 2–3 photos at ≤768 px per ad on CPU**, and keep the 1024 px path for the GPU.
+* The CPU vision budget is ~1–2 min per ad, fine for the top 5–20 candidates a day. The iCloud lock screen and a GPU
+  sticker with its serial were read verbatim, which is the most valuable CPU-side check.
+* Subtle damage (scratches, dead pixels, bent corners) on real photos needs the 9B+ model on the GPU. Synthetic images
+  cannot prove that; treat a small model's `screen_damage=false` as "not seen", never as "no damage".
 
 ### 4.4 Normalising and extrapolating
 
@@ -287,8 +299,10 @@ Measured, not folklore. The v1 → v2 change in §4.2 did all of this except one
    in Qwen's tokenizer. If budget is tight, make `reason_ru` optional or generate it only for promoted ads.
 4. **Match by id, never by order.** The 0.8B renumbered items (id 7 for ad 30), and Granite returned 1 of 10. The
    scout's `parse_triage` already drops these and retries in halves, which is correct.
-5. **Batch size: 8–10 for ≥2B, and ≤5 or no batching for anything smaller.** See the 2B batch-5 vs batch-10 row. The
-   system prompt must stay byte-identical across calls so `cache_prompt` makes it free. Put the variable ads last.
+5. **Batch size: 5 for the 2B, 8–10 for the 4B and larger.** With a cached system prompt, per-ad cost barely depends
+   on batch size (51 vs 46 output tokens/ad). The 2B loses accuracy in long batches: kind 80 % at batch 5 vs 63 % at
+   batch 10. The system prompt must stay byte-identical across calls so `cache_prompt` makes it free. Put the variable
+   ads last. Nothing under 2B is usable for triage at any batch size.
 6. **Thinking off** for triage: `chat_template_kwargs: {"enable_thinking": false}` for llama.cpp and LM Studio;
    Ollama's `think: false`. Qwen3.5 small models default to off, but set it anyway. Some llama.cpp builds ignored the
    flag (issue #20182). [S23] Turn thinking on only for the second opinion.

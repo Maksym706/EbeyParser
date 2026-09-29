@@ -10,6 +10,9 @@ import { Icon, IconButton, Button, Tooltip } from "../ui/index.js";
 import { MonitorCard, MonitorPill } from "./monitor.js";
 import { CheckLinkModal, looksLikeAdUrl } from "./checklink.js";
 import { topbarStore } from "./topbar.js";
+import { startProjectsLive } from "../features/projects-live.js";
+
+startProjectsLive(); // «Сборки»: project_updated toasts + nav badge
 
 export function Logo({ size = 32, withText = true }) {
   return html`<span class="logo">
@@ -72,10 +75,13 @@ function Sidebar({ nav, collapsed, onToggle }) {
 
 function TabBar({ nav }) {
   const badges = useNavBadges();
+  // a destination without its own tab lights up its parent («Сборки» live inside «Мои сделки»)
+  const parent = (NAV.find((n) => n.id === nav) || {}).parent;
+  const on = (item) => nav === item.id || parent === item.id;
   return html`<nav class="tabbar" aria-label="Разделы">
-    ${NAV.map(
-      (item) => html`<a key=${item.id} href=${item.href} class=${cx("tab", nav === item.id && "is-active")} aria-current=${nav === item.id ? "page" : undefined}>
-        <span class="tab__icon"><${Icon} name=${item.icon} size=${24} stroke=${nav === item.id ? 2.2 : 1.9} /><${NavBadge} value=${badges[item.id]} /></span>
+    ${NAV.filter((item) => item.tab !== false).map(
+      (item) => html`<a key=${item.id} href=${item.href} class=${cx("tab", on(item) && "is-active")} aria-current=${on(item) ? "page" : undefined}>
+        <span class="tab__icon"><${Icon} name=${item.icon} size=${24} stroke=${on(item) ? 2.2 : 1.9} /><${NavBadge} value=${badges[item.id]} /></span>
         <span class="tab__label">${item.short || item.label}</span>
       </a>`,
     )}

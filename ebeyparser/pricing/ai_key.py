@@ -218,6 +218,27 @@ _VARIANT_WORDS = frozenset("pro max ultra plus mini lite ti super xt xtx fe oled
 _CAPACITY_RE = re.compile(r"^\d+(?:\.\d+)?(?:gb|tb)$")
 
 
+# a size right before one of these is the machine's memory/disk, not the product's own capacity
+_MEMORY_WORDS = frozenset("ram arbeitsspeicher speicher ddr ddr3 ddr4 ddr5 ssd hdd nvme festplatte".split())
+
+
+def _capacity_conflict(cap: str, ptoks: list[str], clauses: list[tuple[str, ...]]) -> bool:
+    """The product's size ("256gb") is missing while a clause naming the product states another
+    one ("iPhone 13 128GB"). A size of other hardware ("RTX 3080, 16GB RAM") is no conflict, and
+    an unstated size is none either: the ad simply didn't say."""
+    if _present(cap, clauses):
+        return False
+    names = [t for t in ptoks if not _CAPACITY_RE.fullmatch(t) and t not in _VARIANT_WORDS]
+    for toks in clauses:
+        if not any(_fuzzy_in(n, toks) for n in names):
+            continue
+        for i, tok in enumerate(toks):
+            if (_CAPACITY_RE.fullmatch(tok) and tok != cap
+                    and not (i + 1 < len(toks) and toks[i + 1] in _MEMORY_WORDS)):
+                return True
+    return False
+
+
 def _weak_model(tok: str) -> bool:
     """'7', '13', '5', 'i7', 'r5': a short token names nothing without its product line
     (and "i7" is only the series of an "8700k")."""
@@ -241,8 +262,8 @@ def grounded(product: str, text: str) -> bool:
              and not _ATTR_RE.fullmatch(t) and t not in _VARIANT_WORDS]
     if not all(_present(v, clauses) for v in ptoks if v in _VARIANT_WORDS):
         return False  # "Pro", "Ti", "OLED" the ad doesn't say
-    if not all(_present(c, clauses) for c in ptoks if _CAPACITY_RE.fullmatch(c)):
-        return False  # a storage size the ad doesn't say
+    if any(_capacity_conflict(c, ptoks, clauses) for c in ptoks if _CAPACITY_RE.fullmatch(c)):
+        return False  # the ad states another storage size for this product
     if models:
         strong = [t for t in models if not _weak_model(t)]
         if not all(_present(tok, clauses) for tok in strong or models):

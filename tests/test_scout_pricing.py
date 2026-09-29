@@ -67,6 +67,9 @@ def test_split_quantity():
     ("Google Pixel 7", "iPhone 7 32GB", False),  # a bare "7" needs its product line
     ("Apple iPhone 13 Pro", "iPhone 13 128GB", False),  # an edition the ad doesn't state
     ("Apple iPhone 13 256GB", "iPhone 13 128GB", False),  # a storage size the ad doesn't state
+    ("NVIDIA RTX 3080 10GB", "RTX 3080 12GB", False),  # another size of the same product
+    ("NVIDIA RTX 3080 10GB", "PC mit RTX 3080 und 32GB DDR4", True),  # that size is the PC's RAM
+    ("Apple iPhone 13 128GB", "iPhone 13, sehr gut", True),  # no size stated at all
     ("NVIDIA RTX 3080", "Gaming PC ohne Grafikkarte (war RTX 3080 drin)", False),
     ("NVIDIA RTX 3080", "RTX 3080 schon verkauft, Rest da", False),
     ("NVIDIA RTX 3080", "Gaming PC, GTX 1060, suche eigentlich was mit RTX 3080", False),

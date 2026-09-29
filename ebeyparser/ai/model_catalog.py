@@ -14,8 +14,10 @@ while a T2/T3 gaming PC (LM Studio / Ollama over LAN or Tailscale, sometimes off
 photo check and the second opinion. `recommend()` answers for ONE machine; `recommend_split()`
 combines an always-on server with an optional PC.
 
-Seconds per ad are wall-clock for batched triage (10 ads per call, ~70 output tokens per ad,
-strict JSON schema). Output tokens dominate on CPU, so they scale with generation speed.
+Seconds per ad are wall-clock for batched triage (5-10 ads per call, ~50 output tokens per ad,
+compact prompt, strict JSON schema). Output tokens dominate on CPU, so they scale with generation
+speed. Models under 2B are not listed for triage: in our benchmark Qwen3.5 0.8B renumbered ads and
+copied their text (20 % kind accuracy); it only appears as a photo reader (OCR is fine).
 """
 
 from __future__ import annotations
@@ -77,15 +79,6 @@ class ModelChoice:
 MODELS: dict[str, ModelChoice] = {m.key: m for m in (
     # --- triage (text; the Qwen3.5 small models are also natively multimodal) ---
     ModelChoice(
-        key="qwen3.5-0.8b", task="triage", name="Qwen3.5 0.8B", params_b=0.8, active_b=None,
-        quant="Q4_K_M", ollama="qwen3.5:0.8b-q4_K_M", lmstudio="qwen/qwen3.5-0.8b",
-        llamacpp="unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M", file_gb=0.5, min_ram_gb=1.8, min_vram_gb=0,
-        vision=True, arm_ok=True, context_k=262, license="Apache-2.0",
-        sec_per_ad={"T0": 6.0, "T1": 3.0, "T2": 0.4, "T3": 0.3},
-        label_ru="Минимальная",
-        desc_ru="Для совсем слабого железа (≤4 ГБ RAM): быстро, но часто путает модель товара.",
-    ),
-    ModelChoice(
         key="qwen3.5-2b", task="triage", name="Qwen3.5 2B", params_b=1.9, active_b=None,
         quant="Q4_K_M", ollama="qwen3.5:2b-q4_K_M", lmstudio="qwen/qwen3.5-2b",
         llamacpp="unsloth/Qwen3.5-2B-GGUF:Q4_K_M", file_gb=1.3, min_ram_gb=3.1, min_vram_gb=0,
@@ -128,7 +121,15 @@ MODELS: dict[str, ModelChoice] = {m.key: m for m in (
         llamacpp="unsloth/Qwen3.5-2B-GGUF:Q4_K_M", file_gb=1.9, min_ram_gb=4.0, min_vram_gb=0,
         vision=True, arm_ok=True, context_k=262, license="Apache-2.0",
         label_ru="Фото на процессоре",
-        desc_ru="Проверка фото без видеокарты: читает экран блокировки и наклейки, ~1 мин на фото.",
+        desc_ru="Проверка фото без видеокарты: читает экран блокировки, наклейки и серийники, ~40 с на фото.",
+    ),
+    ModelChoice(
+        key="qwen3.5-0.8b-vision", task="vision", name="Qwen3.5 0.8B + mmproj", params_b=1.0, active_b=None,
+        quant="Q4_K_M + F16 mmproj", ollama="qwen3.5:0.8b-q4_K_M", lmstudio="qwen/qwen3.5-0.8b",
+        llamacpp="unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M", file_gb=0.75, min_ram_gb=2.0, min_vram_gb=0,
+        vision=True, arm_ok=True, context_k=262, license="Apache-2.0",
+        label_ru="Фото, минимальная",
+        desc_ru="Для 4–5 ГБ RAM: хорошо читает текст на фото (блокировка, наклейки), но о дефектах судит слабо.",
     ),
     ModelChoice(
         key="qwen3.5-4b-vision", task="vision", name="Qwen3.5 4B + mmproj", params_b=4.6, active_b=None,
@@ -226,10 +227,10 @@ PICKS: dict[str, dict[str, str | None]] = {
 # The runner-up per task when the pick does not fit (smaller RAM, ARM board, missing runtime).
 FALLBACKS: dict[str, str] = {
     "qwen3.5-4b": "qwen3.5-2b",
-    "qwen3.5-2b": "qwen3.5-0.8b",
     "qwen3.5-9b": "qwen3.5-4b",
     "qwen3.6-35b-a3b": "qwen3.5-9b",
     "qwen3.5-4b-vision": "qwen3.5-2b-vision",
+    "qwen3.5-2b-vision": "qwen3.5-0.8b-vision",
     "qwen3.5-9b-vision": "qwen3.5-4b-vision",
     "qwen3.6-35b-a3b-vision": "qwen3.5-9b-vision",
     "qwen3-embedding-0.6b": "embeddinggemma-300m",

@@ -349,7 +349,13 @@ The same page, with offers added. Decision first: the **totals bar** leads, then
     «Сборку удалили».
   - `alert` → toast (green, `boxes` icon): `alert.text_ru` («Сборка «LLM-сервер»: AMD Instinct MI50 32 ГБ за 175 € —
     ниже цели»), action «Открыть» → `/projects/:id`. Bump the nav badge.
-- **Telegram / e-mail** (sent by the backend through the normal channels, once per ad):
+- **One ad → one message.** When the monitor's normal deal alert covers an ad that is also a project part (a
+  «Покупай» for a personal search), that message gets a project line instead of a second message:
+  «📦 Для сборки «LLM-сервер»: RTX 3090 24 ГБ за 580 € → итог 1 240 € из 1 500 € · ниже цели 600 € ✓ в бюджете».
+  The project sends its own message only for offers that are no normal deal (below the project target but not a
+  «Покупай», a tracked variant, or «вся сборка укладывается в бюджет»). Alerts work in every mode (web app, headless
+  monitoring, a single pass). In the app, such an alert shows in «Уведомления» as «… (в уведомлении о сделке)».
+- **Telegram / e-mail**, the project's own message (sent through the normal channels, once per ad):
   ```
   🧩 Сборка «LLM-сервер: 70B Q4_K_M»: AMD Instinct MI50 32 ГБ за 175 €
   Ниже твоей цели 190 € · рынок ~220 € (экономия ~45 €)

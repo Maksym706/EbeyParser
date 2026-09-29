@@ -88,6 +88,25 @@ def _print_deals(deals: list[DealView]) -> None:
 
 
 # ------------------------------------------------------------------ commands
+
+def attach_projects(monitor: Any, db: Database) -> None:
+    """«Сборки»: alerts of build projects hooked into the monitor's events (never breaks startup)."""
+    try:
+        from .projects.hooks import attach
+
+        attach(monitor, db)
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).exception("build-project alerts not attached")
+
+
+async def drain_projects(monitor: Any) -> None:
+    try:
+        from .projects.hooks import drain
+
+        await drain(monitor)
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).exception("build-project alerts did not finish")
+
 def cmd_init(args: argparse.Namespace) -> int:
     target = Path(args.config)
     if target.exists():
@@ -282,6 +301,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             base_url = _web_base_url(config)
             token = None if is_loopback(host) else ensure_token(config.data_path)
             monitor = Monitor(config, db, web_base_url=base_url)
+            attach_projects(monitor, db)  # build-project alerts (the web app only updates this wiring)
             app = create_app(
                 config, db,
                 config_path=config_path,
@@ -336,6 +356,7 @@ async def _monitor_loop(config: AppConfig, db: Database) -> None:
     from .monitor import Monitor
 
     monitor = Monitor(config, db, web_base_url=_web_base_url(config))
+    attach_projects(monitor, db)  # build-project alerts work without the web app too
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -346,6 +367,7 @@ async def _monitor_loop(config: AppConfig, db: Database) -> None:
     try:
         await monitor.run_forever(stop)
     finally:
+        await drain_projects(monitor)
         await monitor.aclose()
 
 
@@ -374,9 +396,11 @@ def cmd_once(args: argparse.Namespace) -> int:
 
     async def go():
         monitor = Monitor(config, db, web_base_url=_web_base_url(config))
+        attach_projects(monitor, db)
         try:
             return await monitor.run_once()
         finally:
+            await drain_projects(monitor)  # the pass's run_finished sweep must finish before we exit
             await monitor.aclose()
 
     print("⏳ Проверяю поиски. Каждое новое объявление: страница, цены аналогов, фото и нейросеть —"

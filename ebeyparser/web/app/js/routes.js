@@ -12,6 +12,8 @@ export const routes = [
   // focus: on phones the deal is a full-screen page — its own top bar and action bar, no app bar / tab bar
   { path: "/deal/:id", nav: "feed", title: "Сделка", focus: true, load: () => import("./screens/deal.js") },
   { path: "/deals/:column?", nav: "deals", title: "Мои сделки", load: () => import("./screens/pipeline.js") },
+  // «Сборки» (docs/design/PROJECTS.md): list, /projects/new, /projects/:id, /projects/:id/slot/:slot
+  { path: "/projects/*", nav: "projects", title: "Сборки", load: () => import("./screens/projects/index.js") },
   { path: "/searches/*", nav: "searches", title: "Поиски", load: () => import("./screens/searches.js") },
   { path: "/health/*", nav: "health", title: "Состояние", load: () => import("./screens/health.js") },
   { path: "/settings/:section?", nav: "settings", title: "Настройки", load: () => import("./screens/settings/index.js") },
@@ -28,10 +30,14 @@ export const redirects = {
   "/status": "/health",
 };
 
-/** Main navigation (sidebar on desktop, icon rail on tablets, bottom tab bar on phones). */
+/**
+ * Main navigation (sidebar on desktop, icon rail on tablets, bottom tab bar on phones).
+ * `tab: false` = not in the phone tab bar (max 5); `parent` = the tab that is active instead.
+ */
 export const NAV = [
   { id: "feed", href: "/", label: "Лента", icon: "zap" },
   { id: "deals", href: "/deals", label: "Мои сделки", short: "Сделки", icon: "wallet" },
+  { id: "projects", href: "/projects", label: "Сборки", icon: "boxes", tab: false, parent: "deals" },
   { id: "searches", href: "/searches", label: "Поиски", icon: "radar" },
   { id: "health", href: "/health", label: "Состояние", icon: "activity" },
   { id: "settings", href: "/settings", label: "Настройки", icon: "settings" },

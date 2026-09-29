@@ -308,6 +308,7 @@ class _DealInfo:
     offer_money: str = ""  # "400 €"
     offer_profit: float | None = None  # profit / savings at the suggested offer
     unchecked: bool = False  # AI was down: photos NOT checked
+    extras: list[str] = field(default_factory=list)  # lines other features add (notify.extras), e.g. a build project
 
     @property
     def market_str(self) -> str:
@@ -514,6 +515,9 @@ def _collect(deal: DealView, web_base_url: str | None = None) -> _DealInfo:
             fb += f" ({_group(n)} " + plural_ru(n, "оценка", "оценки", "оценок") + ")"
         seller = f"{seller}, {fb}" if seller else f"продавец: {fb}"
     info.seller = seller
+    from .extras import lines_for
+
+    info.extras = lines_for(lst, ev)
     info.condition = _squash(lst.condition) or _squash(lst.attributes.get("Zustand", ""))
 
     if ai is not None:
@@ -622,6 +626,7 @@ def _text_block(index: int, info: _DealInfo) -> list[str]:
         lines.append(f"{pad}{info.profit_label}: {_profit_line(info)}{extra}")
     if info.max_buy:
         lines.append(f"{pad}🎯 {info.max_buy}")
+    lines += [f"{pad}{x}" for x in info.extras]
     where = " · ".join(x for x in (info.location, info.posted, info.shipping) if x)
     if where:
         lines.append(f"{pad}Где: {where}")
@@ -831,6 +836,9 @@ def _email_card(info: _DealInfo) -> str:
         )
     if badges:
         out.append(f'<tr><td style="{pad}padding-top:10px;">{"".join(badges)}</td></tr>')
+    for extra in info.extras:
+        out.append(f'<tr><td style="{pad}padding-top:4px;font-family:{_FONT};font-size:14px;color:#1f2937;">'
+                   f"{_e(extra)}</td></tr>")
     # Details table
     price_val = _eh(info.price_full) + (f" + {_eh(info.shipping_cost)}" if info.shipping_cost else "")
     rows = [_row(info.price_label, price_val)]
@@ -1039,6 +1047,7 @@ def _tg_build(info: _DealInfo, level: tuple, with_url: bool) -> str:
         lines.append(line)
     if info.max_buy:
         lines.append(f"🎯 {_tg(info.max_buy)}")
+    lines += [_tg_clip(x, 200) for x in info.extras]
     if details and info.location:
         lines.append(f"📍 {_tg_clip(info.location, 80)}")
     if details and info.ai:

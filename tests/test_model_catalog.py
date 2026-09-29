@@ -61,16 +61,18 @@ def test_recommend_weak_cpu_server():
 
 
 def test_recommend_tiny_ram_falls_back_to_smaller_models():
-    rec = mc.recommend(ram_gb=4, vram_gb=0)
-    assert rec["tier"] == "T0"
-    assert rec["triage"]["key"] == "qwen3.5-0.8b"
-    assert rec["triage"]["min_ram_gb"] + rec["embed"]["min_ram_gb"] + mc.APP_RAM_GB <= 4
+    four = mc.recommend(ram_gb=4.5, vram_gb=0)
+    assert four["tier"] == "T0"
+    assert four["triage"]["key"] == "qwen3.5-2b"
+    assert four["triage"]["min_ram_gb"] + four["embed"]["min_ram_gb"] + mc.APP_RAM_GB <= 4.5
+    assert four["vision"]["key"] == "qwen3.5-0.8b-vision"  # 2B + projector does not fit next to the embedder
     five = mc.recommend(ram_gb=5, vram_gb=0)
     assert five["triage"]["key"] == "qwen3.5-2b"
     assert five["embed"]["key"] == "embeddinggemma-300m"  # the embedding model steps down first
-    nothing = mc.recommend(ram_gb=1.8, vram_gb=0)
+    nothing = mc.recommend(ram_gb=3, vram_gb=0)  # no triage model under 2B is good enough
     assert nothing["triage"] is None and nothing["notes_ru"]
-    assert nothing["embed"]["key"] == "embeddinggemma-300m"
+    assert nothing["embed"]["key"] == "qwen3-embedding-0.6b"
+    assert mc.recommend(ram_gb=1.8, vram_gb=0)["embed"]["key"] == "embeddinggemma-300m"
 
 
 def test_recommend_cpu_t1_and_gpu_tiers():
@@ -117,6 +119,7 @@ def test_recommend_split_server_and_pc():
     "reported, key",
     [("qwen/qwen3.5-2b", "qwen3.5-2b"), ("qwen3.5:2b-q4_K_M", "qwen3.5-2b"),
      ("Qwen3.5-2B-Q4_K_M.gguf", "qwen3.5-2b"), ("qwen3.5:9b", "qwen3.5-9b"),
+     ("qwen3.5:0.8b", "qwen3.5-0.8b-vision"),
      ("qwen3-embedding:0.6b", "qwen3-embedding-0.6b"), ("qwen3.8:27b", "qwen3.8-27b"),
      ("text-embedding-qwen3-embedding-0.6b", "qwen3-embedding-0.6b"), ("llama3.2:3b", None)],
 )
@@ -131,6 +134,8 @@ def test_best_installed_prefers_stronger_model_that_fits():
     assert mc.best_installed(available, "triage", ram_gb=5) == "qwen/qwen3.5-2b"
     assert mc.best_installed(available, "vision") == "qwen/qwen3.5-4b"
     assert mc.best_installed(["llama3.2:3b"], "triage") is None
+    assert mc.best_installed(["qwen3.5:0.8b"], "triage") is None  # too weak to read ads
+    assert mc.best_installed(["qwen3.5:0.8b"], "vision") == "qwen3.5:0.8b"
     assert mc.best_installed(["qwen3-embedding:0.6b"], "embed") == "qwen3-embedding:0.6b"
 
 

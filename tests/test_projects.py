@@ -634,3 +634,24 @@ def test_market_uses_the_comparables_of_project_offers() -> None:
     price = state.slots["gpu"].price
     assert price.source == "history" and price.sample_size == 6  # 5 sold comparables + the offer, not the 16 GB one
     assert 240 <= price.typical <= 250
+
+
+def test_monitor_covers_mirrors_the_deal_alert_rules() -> None:
+    from ebeyparser.config import parse_config
+    from ebeyparser.projects.tracker import monitor_covers
+
+    db = Database()
+    cfg = parse_config({"notifications": {"min_score": 70, "verdicts": ["buy"]}})
+    _ad(db, "a", "AMD Instinct MI50 32GB", 150, "S")
+    buy = Evaluation(ad_id="a", verdict="buy", score=80)
+    assert monitor_covers(cfg, db, "a", buy)
+    assert not monitor_covers(cfg, db, "a", buy.model_copy(update={"score": 60}))
+    assert not monitor_covers(cfg, db, "a", buy.model_copy(update={"verdict": "maybe"}))
+    assert not monitor_covers(cfg, db, "a", buy.model_copy(update={"no_alert": True}))
+    unchecked = Evaluation(ad_id="a", verdict="maybe", score=40, would_buy=True, ai_checked=False)
+    assert monitor_covers(cfg, db, "a", unchecked)  # AI down: sent marked «фото не проверены»
+    assert not monitor_covers(None, db, "a", buy)  # no config (tests, scripts): never assume
+    db.set_status("a", "ignored")
+    assert not monitor_covers(cfg, db, "a", buy)
+    db.mark_notified("a", "telegram")
+    assert monitor_covers(cfg, db, "a", None)  # already delivered

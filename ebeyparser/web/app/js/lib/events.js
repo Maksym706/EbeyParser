@@ -7,7 +7,8 @@
 // Event types (see ebeyparser/web/api/events.py): ready, run_started, run_progress, run_finished,
 // deal_found {ad_id, verdict, action, score, card}, deal_updated {ad_id, card},
 // health_alert {kind, text, at}, settings_changed, searches_changed, data_changed,
-// monitor_paused, monitor_resumed, job_progress, job_finished (a Job).
+// monitor_paused, monitor_resumed, job_progress, job_finished (a Job),
+// project_updated {id, reason, card, ad_id?, slot?, alert?} («Сборки», features/projects-live.js).
 // Plus the local pseudo-event "connected". EventSource only delivers named events that have a
 // listener — every name in KNOWN gets one; add new server event names here.
 // Reconnects with backoff; handlers get (data, type).
@@ -29,6 +30,7 @@ const KNOWN = [
   "monitor_resumed",
   "job_progress",
   "job_finished",
+  "project_updated",
 ];
 
 const handlers = new Map(); // type -> Set(fn)
