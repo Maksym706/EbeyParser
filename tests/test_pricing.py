@@ -369,11 +369,15 @@ def test_evaluate_ai_defective_condition_is_severe():
 
 def test_evaluate_free_item():
     listing = make_listing(title="Stuhl Vitra", price=None, is_free=True)
-    ev = evaluate(listing, sold_estimate(200), None, RESALE, PRICING)
+    ev = evaluate(listing, sold_estimate(100), None, RESALE, PRICING)
     assert ev.buy_price == 0.0
-    assert ev.expected_profit == pytest.approx(180.0)
+    assert ev.expected_profit == pytest.approx(90.0)
     assert ev.verdict == "buy"
     assert any("бесплатно" in r for r in ev.reasons)
+    # v0.2 final round (N11): something worth 150 €+ given away is usually a lure
+    dear = evaluate(listing, sold_estimate(200), None, RESALE, PRICING)
+    assert dear.verdict == "maybe" and dear.action == "watch"
+    assert "Бесплатно дорогая вещь — часто приманка" in dear.reasons
 
 
 def test_evaluate_no_price():
@@ -458,13 +462,16 @@ def test_evaluate_photo_mismatch_caps():
     assert "⚠ Фото не совпадает с описанием" in ev.reasons
 
 
-def test_evaluate_ai_skip_overrides():
+def test_evaluate_ai_verdict_no_longer_overrides_the_math():
+    # v0.2 final round (N4): the AI's own buy/skip opinion doesn't veto; only its structured
+    # findings do (stock photos -> at most "maybe", a sure broken screen -> skip)
     ai = AI_BUY.model_copy(update={"verdict": "skip", "confidence": 0.8, "reasoning": "Стоковые фото"})
     ev = evaluate(make_listing(price=250), sold_estimate(600), ai, RESALE, PRICING)
-    assert ev.verdict == "skip"
-    assert ev.score <= 25
-    weak = ai.model_copy(update={"confidence": 0.4})
-    assert evaluate(make_listing(price=250), sold_estimate(600), weak, RESALE, PRICING).verdict == "buy"
+    assert ev.verdict == "buy"
+    stock = ai.model_copy(update={"stock_photos": True})
+    assert evaluate(make_listing(price=250), sold_estimate(600), stock, RESALE, PRICING).verdict == "maybe"
+    broken = ai.model_copy(update={"defects": ["screen_broken"]})
+    assert evaluate(make_listing(price=250), sold_estimate(600), broken, RESALE, PRICING).verdict == "skip"
 
 
 def test_evaluate_ai_never_upgrades_maybe_to_buy():

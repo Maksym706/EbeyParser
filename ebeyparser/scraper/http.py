@@ -477,6 +477,7 @@ class PoliteClient:
         now = self._clock()
         if not force and now - self._last_save < STATE_SAVE_INTERVAL:
             return
+        self._merge_disk_state(now)
         hosts: dict[str, Any] = {}
         for host in sorted(set(self._hosts) | set(self._pages)):
             state = self._hosts.get(host, _HostState())
@@ -501,6 +502,46 @@ class PoliteClient:
             return
         self._last_save = now
         self._dirty = False
+
+    def _merge_disk_state(self, now: float) -> None:
+        """Another process (a one-off CLI command next to the running monitor) may have written
+        the file since we read it: never let our write erase its cooldown or its requests. Per
+        host keep the later cooldown / block, the higher strike count and every request of the
+        last hour."""
+        if self.state_path is None or not self.state_path.is_file():
+            return
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            hosts = data.get("hosts", {}) if isinstance(data, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            return
+        for host, raw in hosts.items():
+            if not isinstance(raw, dict):
+                continue
+            try:
+                theirs = _HostState(
+                    strikes=int(raw.get("strikes", 0) or 0),
+                    cooldown_until=float(raw.get("cooldown_until", 0) or 0),
+                    last_block_at=float(raw.get("last_block_at", 0) or 0),
+                    last_reason=str(raw.get("last_reason", "") or ""),
+                )
+                their_requests = [float(t) for t in raw.get("requests", []) or []]
+            except (TypeError, ValueError):
+                continue
+            ours = self._hosts.get(host, _HostState())
+            merged = _HostState(
+                strikes=max(ours.strikes, theirs.strikes),
+                cooldown_until=max(ours.cooldown_until, theirs.cooldown_until),
+                last_block_at=max(ours.last_block_at, theirs.last_block_at),
+                last_reason=ours.last_reason if ours.last_block_at >= theirs.last_block_at else theirs.last_reason,
+            )
+            if merged != ours:
+                self._hosts[host] = merged
+            mine = list(self._pages.get(host, ()))
+            known = {round(t, 3) for t in mine}
+            extra = [t for t in their_requests if now - t < HOUR and round(t, 3) not in known]
+            if extra:
+                self._pages[host] = deque(sorted(mine + extra))
 
     # -- internals ----------------------------------------------------------
 

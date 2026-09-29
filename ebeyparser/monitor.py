@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections import OrderedDict
 import logging
 import random
 import re
@@ -61,14 +62,24 @@ from .scraper.kleinanzeigen import KleinanzeigenScraper, PageLayoutError
 log = logging.getLogger(__name__)
 
 COMPS_CACHE_TTL = 6 * 3600  # seconds
+COMPS_CACHE_MAX = 2000  # estimates kept in memory (least recently used ones go first)
+LISTING_RETENTION_DAYS = 60  # skipped listings not seen for this long are forgotten ...
+RUN_RETENTION_DAYS = 90  # ... and so are old run summaries
 PRICE_DROP_RATIO = 0.9  # re-evaluate a known ad when its price falls by 10 %+
 PENDING_MAX_AGE = timedelta(days=2)  # older deferred ads are probably gone: not worth a request
 PENDING_MIN_BATCH = 50  # stored-but-unevaluated ads pulled back per search and pass (at least)
+REFERENCE_CHECK_MIN_POINTS = 8  # history this big may contradict a configured reference price ...
+REFERENCE_CHECK_TOLERANCE = 0.3  # ... when it is more than 30 % away
 RECHECK_AFTER = timedelta(hours=6)  # an ad skipped by market data is re-checked when seen again
 # early "no deal" from our own price history needs a solid sample of a concrete model
 EARLY_SKIP_MIN_POINTS = 8
 EARLY_SKIP_MAX_SPREAD = 0.35
 UNKNOWN_DISCOUNT = 0.75  # candidates with an unknown market rank after clear bargains
+HEALTH_ALERT_EVERY = timedelta(hours=6)  # the same service alert at most this often
+MAX_DELIVERY_ATTEMPTS = 5  # a channel that fails gets the deal again on later passes ...
+DELIVERY_RETRY_WINDOW = timedelta(hours=24)  # ... within this time
+REPOST_WINDOW = timedelta(days=14)  # same seller + product + price already sent: no second alert
+REPOST_PRICE_TOLERANCE = 0.05
 CATEGORY_MIN_PAGES = 3  # category scans page on until the first already-known ad
 _COMPS_SOURCES = frozenset({"ebay_sold", "mixed", "kleinanzeigen", "history"})  # estimates from offers
 
@@ -241,7 +252,10 @@ class Monitor:
         self._second_calls = 0
         self._rate_limited: dict[str, datetime] = {}  # host -> retry_at, this pass
         self._budget: _Budget | None = None
-        self._comps_cache: dict[str, tuple[float, PriceEstimate]] = {}
+        self._comps_cache: OrderedDict[str, tuple[float, PriceEstimate]] = OrderedDict()
+        self._ai_answered = 0  # AI calls of this pass that got a real answer ...
+        self._ai_failed = 0  # ... and that failed (LM Studio down)
+        self._upkeep_done = False
         self._ebay_blocked = False
         self._running = False
         self.last_summary: RunSummary | None = None
@@ -254,8 +268,15 @@ class Monitor:
 
     def update_config(self, config: AppConfig) -> None:
         """Apply a new config; network/AI components are rebuilt lazily."""
+        old_general = self.config.general
         self.config = config
         self._comps_cache.clear()
+        if self._client is not None and _request_settings(old_general) != _request_settings(config.general):
+            self._client = _close_soon(self._client)  # new delays / limits / user agent
+            if not self._injected["scraper"]:
+                self._scraper = None
+            if not self._injected["ebay"]:
+                self._ebay = None
         if not self._injected["notifiers"]:
             self._notifiers = None
         if not self._injected["evaluator"]:
@@ -362,13 +383,17 @@ class Monitor:
         self._ebay_blocked = False
         self._rate_limited = {}
         self._second_calls = 0
+        self._ai_answered = self._ai_failed = 0
         summary = self.db.start_run()
         digest: list[DealView] = []
         try:
             self._ensure_components()
+            self._upkeep()
             self._prune_history()
+            await self._retry_deliveries(summary)
             for search in searches:
                 summary.searches += 1
+                seen_before = summary.listings_seen
                 try:
                     deals = await self._process_search(search, summary)
                 except BlockedError as exc:
@@ -381,11 +406,18 @@ class Monitor:
                             "увеличь general.interval_minutes и request_delay_seconds."
                         )
                         log.warning("Blocked by Kleinanzeigen: %s", exc)
+                        await self._health("blocked", f"⚠ Kleinanzeigen ограничил запросы, пауза{_until_text(exc)}."
+                                           " Проверки продолжатся сами.", summary)
                     break
                 except RateBudgetExceeded as exc:  # our own hourly cap: not a block, try next pass
                     self._note_rate_limit(exc, summary)
                     continue
-                except (EbayAPIError, PageLayoutError) as exc:
+                except PageLayoutError as exc:
+                    log.warning("Search %r: %s", search.name, exc)
+                    summary.errors.append(f"{search.name}: {exc}")
+                    await self._check_search_health(search, 0, summary, error=str(exc))
+                    continue
+                except EbayAPIError as exc:
                     log.warning("Search %r: %s", search.name, exc)
                     summary.errors.append(f"{search.name}: {exc}")
                     continue
@@ -397,9 +429,12 @@ class Monitor:
                     log.exception("Search %r failed", search.name)
                     summary.errors.append(f"{search.name}: {exc}")
                     continue
+                await self._check_search_health(search, summary.listings_seen - seen_before, summary)
                 digest.extend(deals)  # instant mode: already sent while evaluating
+            digest = [d for d in digest if not self._is_repost(d.listing)]
             if digest:
                 summary.notified += await self._notify(digest, summary)
+            await self._after_run(summary)
         finally:
             summary.finished_at = utcnow()
             self.db.finish_run(summary)
@@ -464,13 +499,18 @@ class Monitor:
                 todo.append(stored)  # skipped by market data earlier: the history may know better now
                 rechecks.add(listing.ad_id)
         summary.new_listings += new_here
-        self._remember_prices(search, listings)
+        remembered = self._remember_prices(search, listings)
 
         if baseline:
             self.db.mark_search_run(search.name, baseline=True)
-            log.info("🎓 %s: обучение — собрал цены %d объявлений; оценивать и присылать сделки начну"
-                     " со следующей проверки", search.name, len(listings))
+            if _price_filtered(search):
+                learned = "цены не запоминаю — поиск с фильтром цены на сайте"
+            else:
+                learned = f"запомнил цены {remembered} из {len(listings)} объявлений"
+            log.info("🎓 %s: первая проверка — %s; оценивать и присылать сделки начну со следующей проверки",
+                     search.name, learned)
             return []
+        self._expire_backlog(search, baseline_at, summary)
         self.db.mark_search_run(search.name)
 
         # deferred ads that have dropped off the result pages since
@@ -535,17 +575,15 @@ class Monitor:
                 if deal is None:
                     continue
                 if instant:  # a good deal is gone in minutes: don't wait for the rest of the search
-                    summary.notified += await self._notify([deal], summary)
+                    await self._alert(deal, summary)
                 else:
                     to_notify.append(deal)
 
         evaluated_here = summary.evaluated - evaluated_before
         if evaluated_here >= 6 and summary_buy_share(self.db, todo) >= 0.7:
-            fix = ("задай reference_price для этого поиска" if search.query.strip()
-                   else "задай pricing.reference_prices для таких товаров")
             warning = (
                 f"{search.name}: «покупать» у большинства объявлений — похоже, оценка рынка завышена."
-                f" Проверь цены вручную или {fix}."
+                " Проверь цены вручную."
             )
             log.warning(warning)
             summary.errors.append(warning)
@@ -557,8 +595,12 @@ class Monitor:
         scans (no query) get a few pages since many new ads arrive between passes."""
         source = self._source_for(search)
         max_pages = search.max_pages or self.config.general.max_pages
-        if search.category_id is not None and not search.query.strip() and not search.url:
+        if _is_category_scan(search):
             max_pages = max(max_pages, CATEGORY_MIN_PAGES)
+            if search.min_price is not None or search.max_price is not None:
+                # ask the site for the whole category: every price feeds the history; the price
+                # range is applied here for free (prefilter)
+                search = search.model_copy(update={"min_price": None, "max_price": None})
         kwargs: dict[str, Any] = {}
         if _accepts(source.search, "seen"):
             kwargs["seen"] = lambda ad_id: self.db.get_listing(ad_id) is not None
@@ -572,6 +614,55 @@ class Monitor:
         self._rate_limited[host] = getattr(exc, "retry_at", None) or utcnow()
         log.info("Hourly request budget: %s", exc)
         summary.errors.append(f"Отложено до следующей проверки: {exc}")
+
+    def _expire_backlog(self, search: SearchConfig, baseline_at: datetime | None, summary: RunSummary) -> None:
+        """Deferred ads the budgets never reached within PENDING_MAX_AGE: give up on them
+        visibly (stored as "expired", counted, logged) instead of letting them rot silently."""
+        try:
+            stale = self.db.stale_pending(search.name, before=utcnow() - PENDING_MAX_AGE, after=baseline_at)
+        except sqlite3.Error as exc:
+            log.warning("Backlog of %r: %s", search.name, exc)
+            return
+        for listing in stale:
+            self._save(Evaluation(
+                ad_id=listing.ad_id, purpose=search.purpose, buy_price=listing.price, verdict="skip",
+                action="skip", stage="expired",
+                reasons=[f"Не успел проверить за {PENDING_MAX_AGE.days} дня (лимиты запросов) — объявление могло уйти"],
+            ))
+        if stale:
+            summary.expired += len(stale)
+            log.warning("⌛ %s: %d объявлений ждали проверки дольше %d дней — пропущены (подними лимиты"
+                        " general.max_*_per_run или interval_minutes)", search.name, len(stale), PENDING_MAX_AGE.days)
+
+    def backlog_status(self) -> dict[str, int]:
+        """For the status page: ads waiting in the deferred backlog, and ads given up on in 24 h."""
+        names = [s.name for s in self.config.searches if s.enabled]
+        try:
+            return {
+                "pending": self.db.pending_count(names, since=utcnow() - PENDING_MAX_AGE),
+                "expired_24h": self.db.expired_since(utcnow() - timedelta(days=1)),
+            }
+        except sqlite3.Error:
+            return {"pending": 0, "expired_24h": 0}
+
+    def _upkeep(self) -> None:
+        """Once per process: drop v0.1 verdicts. Once per day: forget old skipped listings/runs."""
+        try:
+            if not self._upkeep_done:
+                self._upkeep_done = True
+                removed = self.db.migrate_v01_evaluations()
+                if removed:
+                    log.info("Обновление: удалил %d старых оценок версии 0.1 — объявления оценю заново", removed)
+            today = utcnow().date().isoformat()
+            state = self.db.get_state("upkeep:retention")
+            if state is None or state[0] != today:
+                gone = self.db.apply_retention(listing_days=LISTING_RETENTION_DAYS, run_days=RUN_RETENTION_DAYS)
+                self.db.set_state("upkeep:retention", today)
+                if gone["listings"] or gone["runs"]:
+                    log.info("Уборка: забыл %d пропущенных объявлений старше %d дней и %d старых проверок",
+                             gone["listings"], LISTING_RETENTION_DAYS, gone["runs"])
+        except sqlite3.Error as exc:
+            log.warning("Upkeep failed: %s", exc)
 
     def _budget_for(self, summary: RunSummary) -> _Budget:
         if self._budget is None or self._budget.summary is not summary:
@@ -591,20 +682,21 @@ class Monitor:
             log.warning("Pending listings of %r: %s", search.name, exc)
             return []
 
-    def _remember_prices(self, search: SearchConfig, listings: list[Listing]) -> None:
+    def _remember_prices(self, search: SearchConfig, listings: list[Listing]) -> int:
         """Feed the price history with this page of results, each ad under its identity key
         (plain items under the product, bundles/parts/... under a kind prefix; wanted, swap,
         box-only, model-less ads and ads missing parts not at all). Not from price-filtered
         searches — a list cut at max_price drags medians down."""
         if _price_filtered(search):
-            return
+            return 0
         rows = [(key, l) for l in listings if (key := history_key_for(l))]
         if not rows:
-            return
+            return 0
         try:
-            self.db.record_price_points(rows)
+            return self.db.record_price_points(rows)
         except sqlite3.Error as exc:
             log.warning("Price history: can't store prices of %r: %s", search.name, exc)
+            return 0
 
     def _prune_history(self) -> None:
         days = max(1, self.config.pricing.history_days)
@@ -849,6 +941,10 @@ class Monitor:
             target_price=search.target_price,
             **self._comparables_kwarg(self._evaluator, shown),
         )
+        if verdict.confidence > 0:
+            self._ai_answered += 1
+        else:
+            self._ai_failed += 1
         estimate = self._variant_checked(estimate, same_variant_comparables(verdict, shown) if shown else None)
         # The model often identifies the product better than the raw title does.
         from_query = False
@@ -1023,18 +1119,31 @@ class Monitor:
 
     def _reference_estimate(self, listing: Listing, search: SearchConfig) -> PriceEstimate | None:
         if search.reference_price is not None:
-            return PriceEstimate(
+            est = PriceEstimate(
                 market_price=search.reference_price, source="reference",
                 notes="Цена задана в настройках поиска",
             )
-        ref = find_reference_price(
-            f"{listing.title} {listing.description[:300]}", self.config.pricing.reference_prices
-        )
-        if ref is not None:
-            return PriceEstimate(
-                market_price=ref, source="reference", notes="Цена из справочника reference_prices"
+        else:
+            ref = find_reference_price(
+                f"{listing.title} {listing.description[:300]}", self.config.pricing.reference_prices
             )
-        return None
+            if ref is None:
+                return None
+            est = PriceEstimate(market_price=ref, source="reference", notes="Цена из справочника reference_prices")
+        return self._checked_reference(listing, est)
+
+    def _checked_reference(self, listing: Listing, est: PriceEstimate) -> PriceEstimate:
+        """A reference price is trusted — but say so when our own history (≥ 8 prices) says the
+        market is more than 30 % away from it."""
+        target = self._listing_target(listing)
+        history = self._history_estimate(listing, target) if target is not None else None
+        ref = est.market_price or 0.0
+        if (history is None or history.market_price is None or history.sample_size < REFERENCE_CHECK_MIN_POINTS
+                or ref <= 0 or abs(ref - history.market_price) / history.market_price <= REFERENCE_CHECK_TOLERANCE):
+            return est
+        return est.model_copy(update={
+            "warning": f"⚠ reference_price ({ref:.0f} €) расходится с рынком (~{history.market_price:.0f} €)",
+        })
 
     def _history_estimate(self, listing: Listing, target: _Target) -> PriceEstimate | None:
         """Market price from prices seen before (search results, comparables) — no requests.
@@ -1117,8 +1226,14 @@ class Monitor:
             relevant, asking_price_discount=pricing.asking_price_discount, query=query
         )
         if limited is None:  # a partial lookup is used once but not cached
-            self._comps_cache[target.cache_key] = (time.monotonic(), estimate)
+            self._cache_comps(target.cache_key, estimate)
         return estimate
+
+    def _cache_comps(self, key: str, estimate: PriceEstimate) -> None:
+        self._comps_cache[key] = (time.monotonic(), estimate)
+        self._comps_cache.move_to_end(key)
+        while len(self._comps_cache) > COMPS_CACHE_MAX:
+            self._comps_cache.popitem(last=False)
 
     def _remember_comparables(self, comps: list[Comparable]) -> None:
         """Every comparable is a price of *some* product: store each under its own identity key
@@ -1142,16 +1257,86 @@ class Monitor:
             log.warning("Price history: can't store comparables: %s", exc)
 
     # --------------------------------------------------------- notifications
+    def _channels(self) -> list[str]:
+        return [getattr(n, "name", "?") for n in self._notifiers or []]
+
     def _should_notify(self, evaluation: Evaluation) -> bool:
+        """A deal the user should hear about, not yet delivered on every channel. With the AI
+        down, would-be buys go out too (notifications.unchecked_deals), marked by the renderer."""
         cfg = self.config.notifications
-        if evaluation.no_alert or evaluation.verdict not in cfg.verdicts or evaluation.score < cfg.min_score:
+        if evaluation.no_alert:
+            return False
+        unchecked = (evaluation.would_buy and evaluation.ai_checked is False and cfg.unchecked_deals
+                     and "buy" in cfg.verdicts)
+        if not unchecked and (evaluation.verdict not in cfg.verdicts or evaluation.score < cfg.min_score):
             return False
         deal = self.db.get_deal(evaluation.ad_id)
         if deal is None or deal.status == "ignored":
             return False
-        return not self.db.was_notified(evaluation.ad_id)
+        channels = self._channels()
+        if not channels:
+            return not self.db.was_notified(evaluation.ad_id)
+        return any(not self.db.was_notified(evaluation.ad_id, ch) for ch in channels)
 
-    async def _notify(self, deals: list[DealView], summary: RunSummary) -> int:
+    async def _alert(self, deal: DealView, summary: RunSummary) -> None:
+        """Instant alert for one deal: repost check, then the hourly cap (overflow → digest later)."""
+        if self._is_repost(deal.listing):
+            return
+        if self._alert_cap_reached():
+            self.db.queue_alert(deal.listing.ad_id)
+            summary.queued_alerts += 1
+            log.info("Лимит %d уведомлений в час: «%s» пришлю позже одной сводкой",
+                     self.config.notifications.max_alerts_per_hour, deal.listing.title[:50])
+            return
+        delivered = await self._notify([deal], summary)
+        if delivered:
+            self._count_alert_message()
+        summary.notified += delivered
+
+    def _alert_window(self) -> list[datetime]:
+        state = self.db.get_state("alerts:window")
+        stamps: list[datetime] = []
+        for raw in (state[0].split(",") if state and state[0] else []):
+            try:
+                stamps.append(_aware(datetime.fromisoformat(raw)))
+            except ValueError:
+                continue
+        hour_ago = utcnow() - timedelta(hours=1)
+        return [t for t in stamps if t >= hour_ago]
+
+    def _alert_cap_reached(self) -> bool:
+        cap = self.config.notifications.max_alerts_per_hour
+        return cap > 0 and len(self._alert_window()) >= cap
+
+    def _count_alert_message(self) -> None:
+        window = self._alert_window() + [utcnow()]
+        self.db.set_state("alerts:window", ",".join(t.isoformat() for t in window))
+
+    def _is_repost(self, listing: Listing) -> bool:
+        """The same seller re-posting the same thing at ~the same price (±5 %) within 14 days
+        was already sent: don't alert again."""
+        seller = (listing.seller_name or "").strip().lower()
+        if not seller or listing.price is None:
+            return False
+        key = history_key_for(listing) or listing_identity(listing).history_key()
+        if not key:
+            return False
+        for old in self.db.notified_since(utcnow() - REPOST_WINDOW):
+            if old.ad_id == listing.ad_id or (old.seller_name or "").strip().lower() != seller:
+                continue
+            if old.price is None or abs(old.price - listing.price) > REPOST_PRICE_TOLERANCE * old.price:
+                continue
+            if listing_identity(old).history_key() != key:
+                continue
+            log.info("Повтор объявления «%s» (%s, как %s) — уже присылал, не шлю", listing.title[:50],
+                     seller, old.ad_id)
+            self.db.mark_notified(listing.ad_id, "_repost")
+            return True
+        return False
+
+    async def _notify(self, deals: list[DealView], summary: RunSummary, *, title: str | None = None) -> int:
+        """Send `deals` on every channel that hasn't delivered them yet; a failed channel is
+        recorded (retried on later passes) and reported through the other channels."""
         if not self._notifiers:
             return 0
         deals = sorted(
@@ -1159,16 +1344,166 @@ class Monitor:
         )
         delivered: set[str] = set()
         for notifier in self._notifiers:
-            try:
-                await notifier.send(deals)  # notifiers build an informative subject themselves
-            except Exception as exc:
-                log.warning("Notifier %s failed: %s", getattr(notifier, "name", notifier), exc)
-                summary.errors.append(f"Уведомление ({getattr(notifier, 'name', '?')}): {exc}")
+            name = getattr(notifier, "name", "?")
+            todo = [d for d in deals if not self.db.was_notified(d.listing.ad_id, name)]
+            if not todo:
                 continue
-            for deal in deals:
-                self.db.mark_notified(deal.listing.ad_id, notifier.name)
+            try:
+                if title:
+                    await notifier.send(todo, title=title)
+                else:
+                    await notifier.send(todo)  # notifiers build an informative subject themselves
+            except Exception as exc:
+                log.warning("Notifier %s failed: %s", name, exc)
+                summary.errors.append(f"Уведомление ({name}): {exc}")
+                for deal in todo:
+                    self.db.note_delivery_failure(deal.listing.ad_id, name, str(exc))
+                await self._health(f"notify:{name}", f"⚠ Не удалось отправить уведомление через {name}: {exc}."
+                                   " Повторю при следующих проверках.", summary, exclude={name})
+                continue
+            for deal in todo:
+                self.db.mark_notified(deal.listing.ad_id, name)
                 delivered.add(deal.listing.ad_id)
         return len(delivered)
+
+    async def _retry_deliveries(self, summary: RunSummary) -> None:
+        """Channels that failed on earlier passes get the deal again (up to 5 tries in 24 h)."""
+        if not self._notifiers:
+            return
+        by_name = {getattr(n, "name", "?"): n for n in self._notifiers}
+        groups: dict[str, list[DealView]] = {}
+        for ad_id, channel in self.db.retryable_deliveries(
+                max_attempts=MAX_DELIVERY_ATTEMPTS, since=utcnow() - DELIVERY_RETRY_WINDOW):
+            deal = self.db.get_deal(ad_id)
+            if channel in by_name and deal is not None and deal.status != "ignored":
+                groups.setdefault(channel, []).append(deal)
+        for channel, deals in groups.items():
+            notifier = by_name[channel]
+            try:
+                await notifier.send(deals)
+            except Exception as exc:
+                for deal in deals:
+                    tries = self.db.note_delivery_failure(deal.listing.ad_id, channel, str(exc))
+                    if tries >= MAX_DELIVERY_ATTEMPTS:
+                        log.warning("Уведомление о %s через %s так и не ушло (%d попыток)", deal.listing.ad_id,
+                                    channel, tries)
+                continue
+            for deal in deals:
+                self.db.mark_notified(deal.listing.ad_id, channel)
+            summary.notified += len(deals)
+            log.info("Повторная отправка через %s: %d сделок", channel, len(deals))
+
+    async def _flush_alert_queue(self, summary: RunSummary) -> None:
+        """Deals held back by the hourly cap go out as one digest once there is room again."""
+        queued = self.db.queued_alerts()
+        if not queued or self._alert_cap_reached():
+            return
+        deals = []
+        for ad_id in queued:
+            deal = self.db.get_deal(ad_id)
+            if deal is not None and deal.status != "ignored" and deal.evaluation is not None:
+                deals.append(deal)
+        self.db.unqueue_alerts(queued)
+        if not deals:
+            return
+        cap = self.config.notifications.max_alerts_per_hour
+        n = len(deals)
+        delivered = await self._notify(deals, summary, title=f"Ещё {n} {_deals_word(n)} — сверх лимита {cap} в час")
+        if delivered:
+            self._count_alert_message()
+        summary.notified += delivered
+
+    # ------------------------------------------------------------ health
+    async def _health(self, kind: str, text: str, summary: RunSummary, *, exclude: set[str] | None = None,
+                      every: timedelta | None = None) -> bool:
+        """A service message ("AI down", "site blocks us", ...) through every channel that can
+        send one; the same kind at most once per 6 hours (persisted)."""
+        if not self.config.notifications.health_alerts or not self._notifiers:
+            return False
+        key = f"alert:{kind}"
+        state = self.db.get_state(key)
+        if state is not None and utcnow() - _aware(state[1]) < (every or HEALTH_ALERT_EVERY):
+            return False
+        sent = await self._send_text(text, exclude=exclude)
+        if sent:
+            self.db.set_state(key, text)
+            summary.health_alerts += 1
+        return sent
+
+    async def _send_text(self, text: str, *, exclude: set[str] | None = None) -> bool:
+        sent = False
+        for notifier in self._notifiers or []:
+            name = getattr(notifier, "name", "?")
+            send_text = getattr(notifier, "send_text", None)
+            if send_text is None or name in (exclude or set()):
+                continue
+            try:
+                await send_text(text)
+                sent = True
+            except Exception as exc:  # noqa: BLE001 - a service message must never break a pass
+                log.warning("Служебное сообщение через %s не отправлено: %s", name, exc)
+        return sent
+
+    async def _check_search_health(self, search: SearchConfig, found: int, summary: RunSummary,
+                                   error: str = "") -> None:
+        """Two passes in a row without a single ad (or with an unreadable page): say so."""
+        key = f"streak:{search.name}"
+        state = self.db.get_state(key)
+        if found and not error:
+            if state is not None and state[0] != "0":
+                self.db.set_state(key, "0")
+            return
+        streak = (int(state[0]) if state is not None and state[0].isdigit() else 0) + 1
+        self.db.set_state(key, str(streak))
+        if streak < 2:
+            return
+        if error:
+            text = (f"⚠ Поиск «{search.name}»: страница Kleinanzeigen не распознаётся уже {streak} проверки"
+                    f" подряд ({error[:120]}). Возможно, сайт изменился.")
+        else:
+            text = (f"⚠ Поиск «{search.name}» уже {streak} проверки подряд не находит ни одного объявления —"
+                    " проверь ссылку и фильтры.")
+        await self._health(f"search:{search.name}", text, summary)
+
+    async def _after_run(self, summary: RunSummary) -> None:
+        """End of a pass: the AI health check, held-back alerts, the daily heartbeat."""
+        if self._evaluator is not None and self._ai_failed and not self._ai_answered:
+            tail = (" Выгодные по цене объявления присылаю с пометкой «фото не проверены»."
+                    if self.config.notifications.unchecked_deals else "")
+            await self._health("ai_down", "⚠ Нейросеть недоступна — сделки не проверяются. Запущен ли LM Studio?"
+                               + tail, summary)
+        await self._flush_alert_queue(summary)
+        await self._maybe_heartbeat(summary)
+
+    async def _maybe_heartbeat(self, summary: RunSummary) -> None:
+        """Once a day at notifications.heartbeat_hour (local time): "still alive" + 24 h stats."""
+        hour = self.config.notifications.heartbeat_hour
+        if hour is None or not self._notifiers:
+            return
+        local = datetime.now().astimezone()
+        today = local.date().isoformat()
+        state = self.db.get_state("heartbeat")
+        if local.hour < hour or (state is not None and state[0] == today):
+            return
+        since = utcnow() - timedelta(days=1)
+        runs = [r for r in self.db.list_runs(limit=2000) if _aware(r.started_at) >= since and r.id != summary.id]
+        runs.append(summary)
+        checked = sum(r.evaluated for r in runs)
+        deals = sum(r.deals_found for r in runs)
+        errors = sum(len(r.errors) for r in runs)
+        text = f"Жив: за сутки проверено {checked} объявлений, {deals} выгодных, ошибок {errors}"
+        if await self._send_text(text):
+            self.db.set_state("heartbeat", today)
+            summary.health_alerts += 1
+
+
+def _deals_word(n: int) -> str:
+    n = abs(n)
+    if n % 10 == 1 and n % 100 != 11:
+        return "сделка"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return "сделки"
+    return "сделок"
 
 
 def summary_buy_share(db: Database, listings: list[Listing]) -> float:
@@ -1255,13 +1590,31 @@ def _aware(dt: datetime) -> datetime:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
+def _is_category_scan(search: SearchConfig) -> bool:
+    """A whole category (no keywords, no pasted URL), e.g. every new ad in "Handy & Telefon"."""
+    return search.category_id is not None and not search.query.strip() and not search.url
+
+
 def _price_filtered(search: SearchConfig) -> bool:
-    """Does the search only return a price range? (Its results are not the whole market.)"""
-    return (
-        (search.min_price or 0) > 0
-        or search.max_price is not None
-        or bool(search.url and _URL_PRICE_FILTER_RE.search(search.url))
-    )
+    """Does the site only return a price range? (Its results are not the whole market.)
+    Category scans ask the site for everything and apply the range locally."""
+    if search.url:
+        return bool(_URL_PRICE_FILTER_RE.search(search.url))
+    if _is_category_scan(search):
+        return False
+    return (search.min_price or 0) > 0 or search.max_price is not None
+
+
+def _request_settings(general: GeneralConfig) -> tuple[Any, ...]:
+    return (tuple(general.request_delay_seconds), general.request_timeout_seconds, general.user_agent,
+            general.max_requests_per_hour, tuple(general.block_cooldown_hours))
+
+
+def _until_text(exc: BaseException) -> str:
+    until = getattr(exc, "cooldown_until", None)
+    if not isinstance(until, datetime):
+        return ""
+    return " до " + _aware(until).astimezone().strftime("%H:%M")
 
 
 def _severe_title(title: str) -> bool:

@@ -221,7 +221,8 @@ async def test_min_listing_price_skips_junk_but_not_free_ads_or_auctions():
     summary = await monitor.run_once()
     ev = db.get_evaluation("1")
     assert ev.stage == "prefilter" and "ниже порога 10 €" in ev.reasons[0]
-    assert db.get_evaluation("2").stage == "full" and db.get_evaluation("2").verdict == "buy"
+    # a free RTX 3080 goes through (v0.2 final round: worth 150 €+, so "maybe"/watch — often a lure)
+    assert db.get_evaluation("2").stage == "full" and db.get_evaluation("2").action == "watch"
     assert db.get_evaluation("3").stage == "full" and db.get_evaluation("3").action == "bid"
     assert summary.prefiltered == 1
 
@@ -298,13 +299,21 @@ async def test_best_deals_first_and_alert_right_away():
     assert summary.notified == 2 and summary.history_hits == 2
 
 
-async def test_ai_unavailable_means_no_buy_and_no_alert():
+async def test_ai_unavailable_means_no_buy_but_a_marked_unchecked_alert():
+    # v0.2 final round: the deal stays "maybe" in the DB but is still sent (unchecked_deals),
+    # flagged would_buy + ai_checked=False so the renderer marks it "ФОТО НЕ ПРОВЕРЕНЫ ИИ"
     down = AIVerdict(verdict="maybe", confidence=0.0, reasoning="LM Studio не отвечает")
     monitor, db, _, _, _, notifier = build([make_listing("1", "RTX 3080", 300.0)], verdict=down)
     await monitor.run_once()
     ev = db.get_evaluation("1")
-    assert ev.ai_checked is False and ev.verdict == "maybe"
+    assert ev.ai_checked is False and ev.verdict == "maybe" and ev.would_buy
     assert "⚠ Фото НЕ проверены ИИ (нейросеть не ответила)" in ev.reasons
+    assert notifier.sent == [["1"]]
+    off = parse_config({"general": {"baseline_first_run": False}, "searches": [{"name": "GPU", "query": "rtx 3080"}],
+                        "notifications": {"unchecked_deals": False}})
+    monitor, db, _, _, _, notifier = build([make_listing("1", "RTX 3080", 300.0)], verdict=down,
+                                           notifications=off.notifications.model_dump())
+    await monitor.run_once()
     assert notifier.sent == []
 
 

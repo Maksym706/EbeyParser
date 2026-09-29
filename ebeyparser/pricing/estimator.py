@@ -16,9 +16,13 @@ from .text import (
     FLAG_BOX_ONLY,
     FLAG_DEFECT,
     FLAG_DELETED,
+    FLAG_FAKE,
     FLAG_LOCKED,
     FLAG_MISSING,
+    FLAG_RENT,
     FLAG_RESERVED,
+    FLAG_SCAM,
+    FLAG_SWAP,
     FLAG_TOO_GOOD,
     FLAG_WANTED,
     FLAG_WHATSAPP,
@@ -437,6 +441,7 @@ def estimate_from_comparables(
 
 
 HISTORY_HALF_LIFE_DAYS = 14.0  # a price seen two weeks ago counts half as much as today's
+STALE_ASKING_AFTER = timedelta(days=14)  # an asking price still listed after this didn't sell
 
 
 def _weighted_quantile(vals: list[float], weights: list[float], q: float) -> float:
@@ -460,7 +465,7 @@ def _weighted_quantile(vals: list[float], weights: list[float], q: float) -> flo
 
 def estimate_from_history(
     query: str,
-    points: Sequence[Comparable | tuple[Comparable, datetime]],
+    points: Sequence[Comparable | tuple[Comparable, datetime] | tuple[Comparable, datetime, datetime]],
     *,
     asking_price_discount: float = 0.85,
     min_points: int = 6,
@@ -475,22 +480,28 @@ def estimate_from_history(
     asking prices get `asking_price_discount`. None unless at least `min_points` of them are
     the same product as `query` (or pass `fits`, e.g. comparable_fits against the ad's title)."""
     now = now or utcnow()
-    dated = [(p, None) if isinstance(p, Comparable) else (p[0], p[1]) for p in points]
+    # (comparable, first_seen, last_seen); older callers pass (comparable, seen) or a bare comparable
+    dated = [(p, None, None) if isinstance(p, Comparable) else (p[0], p[1], p[-1]) for p in points]
     same = fits or (lambda c: comparable_is_relevant(query, c.title))
-    relevant = [(c, seen) for c, seen in dated if c.price and c.price > 0 and same(c)]
+    relevant = [(c, first, last) for c, first, last in dated if c.price and c.price > 0 and same(c)]
     if not query or len(relevant) < max(1, min_points):
         return None
     discount = asking_price_discount if asking_price_discount > 0 else 1.0
-    kept = _clean_pairs([(c.price if _is_sold(c) else c.price * discount, (c, seen)) for c, seen in relevant])
+    kept = _clean_pairs([(c.price if _is_sold(c) else c.price * discount, (c, first, last))
+                         for c, first, last in relevant])
     n = len(kept)
     if n < 3:
         return None
     half_life = max(half_life_days, 0.1)
-    ages = [max(0.0, (now - _aware(seen)).total_seconds() / 86400) if seen else 0.0 for _, (_, seen) in kept]
+    # weight by when the price first appeared, not when it was last seen still hanging there
+    ages = [max(0.0, (now - _aware(first)).total_seconds() / 86400) if first else 0.0 for _, (_, first, _) in kept]
     weights = [0.5 ** (age / half_life) for age in ages]
+    for i, (_, (c, first, last)) in enumerate(kept):
+        if first and last and not _is_sold(c) and (_aware(last) - _aware(first)) > STALE_ASKING_AFTER:
+            weights[i] *= 0.5  # asked for weeks: that price doesn't sell
     vals = [v for v, _ in kept]
     market = _weighted_quantile(vals, weights, 0.5)
-    comps = [c for _, (c, _) in kept]
+    comps = [c for _, (c, _, _) in kept]
     sold_n = sum(1 for c in comps if _is_sold(c))
     notes = f"История: медиана {n} {_plural(n, 'цены', 'цен', 'цен')}"
     if days:
@@ -514,7 +525,7 @@ def estimate_from_history(
         sample_size=n,
         source="history",
         query=query,
-        comparables=sorted((c for _, (c, _) in shown), key=lambda c: c.price),
+        comparables=sorted((c for _, (c, _, _) in shown), key=lambda c: c.price),
         notes=notes,
         history_days=days,
         age_days=round(sum(a * w for a, w in zip(ages, weights)) / sum(weights), 1),
@@ -846,6 +857,7 @@ def prefilter_score(
 # ---------------------------------------------------------------------------
 
 TOO_CHEAP_RATIO = 0.4  # buy cost < 40 % of the market: too good to be true
+FREE_BAIT_MARKET = 150.0  # "zu verschenken" for something worth this much is usually a lure
 # "schreib mir auf WhatsApp" / "neu, Versand nach Zahlungseingang" + a third below market = the usual
 # scam (0.65 rather than 0.6: our market estimate may itself be a few percent low)
 BAIT_WHATSAPP_RATIO = 0.65
@@ -989,21 +1001,80 @@ def _component_search(listing: Listing, search: SearchConfig, est: PriceEstimate
     return bool(_COMPONENT_QUERY_RE.search(query)) and not words & (_BUNDLE_WORDS | _LAPTOP_LINES)
 
 
+AI_SEVERE_CONFIDENCE = 0.6  # the AI's structured findings count as severe only this sure
+_SEVERE_DEFECTS = frozenset({"screen_broken", "water_damage", "not_working"})
+_DEFECT_CODES = ("screen_broken", "water_damage", "not_working", "missing_parts", "battery_bad", "locked", "other")
+_DEFECT_WORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("locked", ("icloud", "gesperrt", "locked", "sperre", "frp", "заблок", "привязан")),
+    ("water_damage", ("water", "wasser", "liquid", "feucht", "вод", "влаг")),
+    ("screen_broken", ("screen", "display", "bildschirm", "riss", "crack", "gebrochen", "sprung", "экран", "дисплей",
+                       "трещин")),
+    ("battery_bad", ("battery", "akku", "batterie", "аккумулятор", "батаре")),
+    ("missing_parts", ("missing", "fehlt", "fehlen", "ohne", "incomplete", "отсутств", "не хватает")),
+    ("not_working", ("not working", "defekt", "kaputt", "broken", "geht nicht", "funktioniert nicht", "startet nicht",
+                     "dead", "не работает", "не включ", "неисправ", "сломан")),
+)
+_SOFT_DEFECT_RU = {
+    "battery_bad": "ИИ: аккумулятор изношен или вздут",
+    "missing_parts": "ИИ: не хватает частей комплекта",
+    "other": "ИИ: мелкие недостатки",
+}
+_AI_UNSURE_DEFECT = "ИИ: возможно, неисправно (не уверен)"
+# The AI's free-text red flags, mapped onto our own flags (severe only when the AI is sure).
+_AI_FLAG_WORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (FLAG_BOX_ONLY, ("только коробк", "пустая коробк", "box only", "empty box", "leerkarton", "nur ovp")),
+    (FLAG_WANTED, ("ищет товар", "покупает, а не", "wanted", "gesucht")),
+    (FLAG_LOCKED, ("привязан", "заблокир", "icloud", "activation lock", "gesperrt", "frp")),
+    (FLAG_SWAP, ("обмен", "tausch", "swap", "trade only")),
+    (FLAG_RENT, ("аренд", "прокат", "rental", "vermiet", "mietkauf")),
+    (FLAG_FAKE, ("копи", "подделк", "реплик", "не оригинал", "fake", "replica", "nachbau", "counterfeit")),
+    (FLAG_SCAM, ("мошенн", "развод", "предоплат", "scam", "betrug", "vorkasse", "мессенджер", "western union")),
+    (FLAG_DEFECT, ("неисправ", "сломан", "не работает", "не включа", "defekt", "broken", "not working")),
+)
+
+
+def _defect_code(text: str) -> str:
+    """"screen_broken" stays as is; free text ("Display hat einen Sprung") gets its code."""
+    compact = "_".join(text.lower().split())
+    if compact in _DEFECT_CODES:
+        return compact
+    low = f" {text.lower()} "
+    return next((code for code, words in _DEFECT_WORDS if any(w in low for w in words)), "other")
+
+
+def _ai_flag_category(text: str) -> str | None:
+    low = text.lower()
+    return next((flag for flag, words in _AI_FLAG_WORDS if any(w in low for w in words)), None)
+
+
 def _ai_structured_flags(
     ai: AIVerdict, listing: Listing, search: SearchConfig, est: PriceEstimate
 ) -> tuple[list[str], list[str]]:
-    """Hard vetoes from the AI's structured extraction: (flags, extra reasons)."""
+    """Flags from the AI's structured extraction: (flags, extra reasons). Severe only for what
+    kills a resale — wrong kind of item, a broken screen, water damage, not working, an account
+    lock — and only when the AI is sure; a tired battery or a missing cable is a soft note."""
     flags: list[str] = []
     reasons: list[str] = []
+    sure = ai.confidence >= AI_SEVERE_CONFIDENCE
     label = _AI_ITEM_FLAGS.get(ai.item_type)
     if label and ai.confidence >= 0.5 and (ai.item_type != "laptop" or _component_search(listing, search, est)):
         flags.append(label)
     if ai.locked:
-        flags.append(FLAG_LOCKED)
+        flags.append(FLAG_LOCKED if sure else "ИИ: возможно, привязано к чужому аккаунту")
     defects = [d.strip() for d in ai.defects if d and d.strip()]
-    if defects:
+    codes = [_defect_code(d) for d in defects]
+    if sure and "locked" in codes and FLAG_LOCKED not in flags:
+        flags.append(FLAG_LOCKED)
+    if sure and any(c in _SEVERE_DEFECTS for c in codes):
         flags.append(FLAG_DEFECT)
         reasons.append("ИИ видит дефекты: " + "; ".join(defects[:4]))
+    for code in codes:
+        if code in _SEVERE_DEFECTS or code == "locked":
+            note = None if sure else _AI_UNSURE_DEFECT
+        else:
+            note = _SOFT_DEFECT_RU.get(code, _SOFT_DEFECT_RU["other"])
+        if note and note not in flags:
+            flags.append(note)
     return flags, reasons
 
 
@@ -1059,12 +1130,19 @@ def evaluate(
     flags = listing_red_flags(listing)
     ai_reasons: list[str] = []
     if ai is not None:
+        sure = ai_answered and ai.confidence >= AI_SEVERE_CONFIDENCE
         for f in ai.red_flags:
             f = f.strip()
-            if f and f not in flags:
-                flags.append(f)
+            if not f:
+                continue
+            # the AI's own words: severe only when they map onto one of our severe flags and the
+            # AI is sure; everything else is a note to look at
+            category = _ai_flag_category(f) if sure else None
+            flag = category if category in SEVERE_FLAGS else f
+            if flag not in flags:
+                flags.append(flag)
         if ai.condition == "defective" and FLAG_DEFECT not in flags:
-            flags.append(FLAG_DEFECT)
+            flags.append(FLAG_DEFECT if sure else _AI_UNSURE_DEFECT)
         if ai_answered:
             extra, ai_reasons = _ai_structured_flags(ai, listing, search, est)
             flags += [f for f in extra if f not in flags]
@@ -1258,6 +1336,8 @@ def evaluate(
         basis = _basis_reason(est)
         if basis:
             reasons.append(basis)
+        if est.warning:
+            reasons.append(est.warning)
         if "осторожную оценку" in (est.notes or ""):
             reasons.append("⚠ " + est.notes.split(". ")[-1])
 
@@ -1351,14 +1431,20 @@ def evaluate(
             reasons.append("⚠ Фото похожи на каталожные / из интернета")
             verdict = _cap_verdict(verdict, "maybe")
             cap = min(cap, 60.0)
-        if ai.verdict == "skip" and ai.confidence >= 0.6:
-            verdict = "skip"
-            cap = min(cap, 25.0)
+        # the AI's own buy/skip opinion no longer overrides the math: it only adds flags above
+
+    if listing.is_free and market is not None and market >= FREE_BAIT_MARKET:
+        verdict = _cap_verdict(verdict, "maybe")
+        cap = min(cap, 60.0)
+        action = "watch"
+        reasons.append("Бесплатно дорогая вещь — часто приманка")
 
     ai_checked: bool | None = True if ai_answered else (False if ai_expected else None)
+    ai_down_capped = False
     if ai_checked is False and verdict == "buy":
         verdict = "maybe"
         cap = min(cap, WEAK_SCORE_CAP)
+        ai_down_capped = True
         reasons.append("⚠ Фото НЕ проверены ИИ (нейросеть не ответила)")
 
     if severe:
@@ -1368,6 +1454,8 @@ def evaluate(
     if soft:
         reasons.append("Обратить внимание: " + ", ".join(soft))
         score -= min(9.0, 3.0 * len(soft))
+    # the renderer marks these "⚠ ФОТО НЕ ПРОВЕРЕНЫ ИИ — проверь сам" (ai_checked False + would_buy)
+    would_buy = ai_down_capped and verdict == "maybe" and not no_alert
 
     if verdict == "skip":
         action = "skip"
@@ -1394,6 +1482,7 @@ def evaluate(
         offer_price=offer,
         ai_checked=ai_checked,
         no_alert=no_alert,
+        would_buy=would_buy,
         fees=round(fees, 2),
         shipping_cost=round(resale_ship, 2),
         expected_profit=None if profit is None else round(profit, 2),

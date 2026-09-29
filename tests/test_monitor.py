@@ -218,7 +218,9 @@ async def test_second_opinion_only_for_top_deals():
     assert second.calls == ["7001"]  # the overpriced one never reaches the paid model
     ev = db.get_evaluation("7001")
     assert ev.ai.model == "fake" and ev.ai_second.model == "claude-opus-5"
-    assert ev.verdict == "skip"  # stronger model vetoed it
+    # v0.2 final round (N4): the second model's photo mismatch caps the deal at "maybe" (no
+    # longer a verdict veto) — and it is still not notified
+    assert ev.verdict == "maybe"
     assert notifier.sent == []
 
 

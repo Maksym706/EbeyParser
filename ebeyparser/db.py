@@ -81,7 +81,9 @@ CREATE TABLE IF NOT EXISTS price_points (
     price        REAL NOT NULL,
     sold         INTEGER NOT NULL DEFAULT 0,
     url          TEXT NOT NULL DEFAULT '',
-    seen_at      TEXT NOT NULL
+    seen_at      TEXT NOT NULL,  -- last time the price was seen (= last_seen; kept for the window)
+    first_seen   TEXT,           -- first time this ad/price was seen (listing age)
+    last_seen    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_price_points_key ON price_points(product_key, seen_at);
 CREATE INDEX IF NOT EXISTS idx_price_points_seen ON price_points(seen_at);
@@ -94,6 +96,30 @@ CREATE TABLE IF NOT EXISTS price_point_words (
     PRIMARY KEY (word, point_id)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_price_point_words_point ON price_point_words(point_id);
+
+-- Small persistent state: alert dedupe, per-search streaks, heartbeat, migration markers.
+CREATE TABLE IF NOT EXISTS kv_state (
+    key          TEXT PRIMARY KEY,
+    value        TEXT NOT NULL DEFAULT '',
+    updated_at   TEXT NOT NULL
+);
+
+-- Failed notification deliveries per channel (retried on later passes).
+CREATE TABLE IF NOT EXISTS notify_attempts (
+    ad_id        TEXT NOT NULL,
+    channel      TEXT NOT NULL,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    first_at     TEXT NOT NULL,
+    last_at      TEXT NOT NULL,
+    last_error   TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (ad_id, channel)
+);
+
+-- Deals held back by notifications.max_alerts_per_hour, sent later as one digest.
+CREATE TABLE IF NOT EXISTS alert_queue (
+    ad_id        TEXT PRIMARY KEY,
+    queued_at    TEXT NOT NULL
+);
 
 -- Searches that have run at least once (baseline_first_run: the first pass only learns prices).
 CREATE TABLE IF NOT EXISTS search_state (
@@ -151,7 +177,19 @@ class Database:
         if self.path != ":memory:":
             self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.executescript(SCHEMA)
+        self._migrate_schema()
         self._conn.commit()
+
+    def _migrate_schema(self) -> None:
+        """Columns added after a table first shipped (CREATE TABLE IF NOT EXISTS won't add them)."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(price_points)")}
+        for col in ("first_seen", "last_seen"):
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE price_points ADD COLUMN {col} TEXT")
+        self._conn.execute(
+            "UPDATE price_points SET first_seen = COALESCE(first_seen, seen_at), last_seen = COALESCE(last_seen, seen_at)"
+            " WHERE first_seen IS NULL OR last_seen IS NULL"
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -487,12 +525,14 @@ class Database:
             try:
                 for ad_id, source, key, title, price, sold, url, ts, words in prepared:
                     cur.execute(
-                        "INSERT INTO price_points (ad_id, source, product_key, title, price, sold, url, seen_at)"
-                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                        "INSERT INTO price_points (ad_id, source, product_key, title, price, sold, url, seen_at,"
+                        " first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                         " ON CONFLICT(ad_id) DO UPDATE SET source = excluded.source,"
                         " product_key = excluded.product_key, title = excluded.title, price = excluded.price,"
-                        " sold = excluded.sold, url = excluded.url, seen_at = excluded.seen_at",
-                        (ad_id, source, key, title, price, sold, url, ts),
+                        " sold = excluded.sold, url = excluded.url, seen_at = excluded.seen_at,"
+                        " last_seen = excluded.last_seen,"
+                        " first_seen = COALESCE(price_points.first_seen, excluded.first_seen)",
+                        (ad_id, source, key, title, price, sold, url, ts, ts, ts),
                     )
                     point_id = cur.execute(
                         "SELECT id FROM price_points WHERE ad_id = ?", (ad_id,)
@@ -599,6 +639,45 @@ class Database:
             ))
         return out
 
+    def price_history_spans(
+        self,
+        key: str,
+        since: datetime | None = None,
+        *,
+        exclude_ad_id: str | None = None,
+        limit: int = 400,
+    ) -> list[tuple[Comparable, datetime, datetime]]:
+        """Like price_history_prefix, with (first_seen, last_seen) per price: how long an ad has
+        been listed matters (a price asked for weeks doesn't sell)."""
+        rows = self._price_rows(key, since, exclude_ad_id, limit)
+        out: list[tuple[Comparable, datetime, datetime]] = []
+        for r in rows:
+            last = datetime.fromisoformat(r["last_seen"] or r["seen_at"])
+            first = datetime.fromisoformat(r["first_seen"] or r["seen_at"])
+            out.append((self._point_comparable(r, last), first, last))
+        return out
+
+    def _price_rows(self, key: str, since: datetime | None, exclude_ad_id: str | None, limit: int) -> list[sqlite3.Row]:
+        key = (key or "").strip()
+        if not key:
+            return []
+        sql = ("SELECT * FROM price_points WHERE (product_key = ? OR (product_key >= ? AND product_key < ?))")
+        params: list[Any] = [key, key + "|", key + "}"]
+        if since is not None:
+            sql += " AND seen_at >= ?"
+            params.append(_ts(since))
+        if exclude_ad_id:
+            sql += " AND ad_id != ?"
+            params.append(exclude_ad_id)
+        sql += " ORDER BY seen_at DESC LIMIT ?"
+        params.append(max(0, int(limit)))
+        return self._query(sql, params)
+
+    @staticmethod
+    def _point_comparable(r: sqlite3.Row, seen: datetime) -> Comparable:
+        return Comparable(title=r["title"], price=r["price"], url=r["url"], source=r["source"],
+                          sold=bool(r["sold"]), date_text=seen.strftime("%d.%m.%Y"))
+
     def prune_price_points(self, days: float | None = None, *, before: datetime | None = None) -> int:
         """Delete price points not seen for `days` days (or since `before`). Returns the count."""
         if before is None:
@@ -637,6 +716,147 @@ class Database:
         if not rows or not rows[0]["baseline_at"]:
             return None
         return datetime.fromisoformat(rows[0]["baseline_at"])
+
+    # ---------------------------------------------------------------- kv state
+    def get_state(self, key: str) -> tuple[str, datetime] | None:
+        """(value, updated_at) of a small persistent flag, or None."""
+        rows = self._query("SELECT value, updated_at FROM kv_state WHERE key = ?", (key,))
+        return (rows[0]["value"], datetime.fromisoformat(rows[0]["updated_at"])) if rows else None
+
+    def set_state(self, key: str, value: str = "", *, at: datetime | None = None) -> None:
+        self._execute(
+            "INSERT INTO kv_state (key, value, updated_at) VALUES (?, ?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            (key, value, _ts(at or utcnow())),
+        )
+
+    # ----------------------------------------------------- delivery bookkeeping
+    def note_delivery_failure(self, ad_id: str, channel: str, error: str) -> int:
+        """Count a failed delivery of `ad_id` on `channel`; returns the attempts so far."""
+        now = _ts(utcnow())
+        self._execute(
+            "INSERT INTO notify_attempts (ad_id, channel, attempts, first_at, last_at, last_error)"
+            " VALUES (?, ?, 1, ?, ?, ?) ON CONFLICT(ad_id, channel) DO UPDATE SET"
+            " attempts = notify_attempts.attempts + 1, last_at = excluded.last_at, last_error = excluded.last_error",
+            (ad_id, channel, now, now, error[:500]),
+        )
+        rows = self._query("SELECT attempts FROM notify_attempts WHERE ad_id = ? AND channel = ?", (ad_id, channel))
+        return int(rows[0]["attempts"]) if rows else 0
+
+    def delivery_failures(self, ad_id: str, channel: str) -> tuple[int, datetime] | None:
+        rows = self._query("SELECT attempts, first_at FROM notify_attempts WHERE ad_id = ? AND channel = ?",
+                           (ad_id, channel))
+        return (int(rows[0]["attempts"]), datetime.fromisoformat(rows[0]["first_at"])) if rows else None
+
+    def retryable_deliveries(self, *, max_attempts: int, since: datetime) -> list[tuple[str, str]]:
+        """(ad_id, channel) whose delivery failed fewer than `max_attempts` times, first after
+        `since`, and that no later attempt delivered."""
+        rows = self._query(
+            "SELECT a.ad_id, a.channel FROM notify_attempts a"
+            " WHERE a.attempts < ? AND a.first_at >= ?"
+            " AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.ad_id = a.ad_id AND n.channel = a.channel)"
+            " ORDER BY a.first_at",
+            (max_attempts, _ts(since)),
+        )
+        return [(r["ad_id"], r["channel"]) for r in rows]
+
+    def alerts_sent_since(self, since: datetime) -> int:
+        """Deals delivered (on any real channel) since `since`."""
+        return int(self._query(
+            "SELECT COUNT(DISTINCT ad_id) FROM notifications WHERE sent_at >= ? AND channel NOT LIKE '\\_%' ESCAPE '\\'",
+            (_ts(since),),
+        )[0][0])
+
+    def notified_since(self, since: datetime) -> list[Listing]:
+        """Listings delivered to the user since `since` (for repost detection)."""
+        rows = self._query(
+            "SELECT l.data FROM listings l WHERE EXISTS (SELECT 1 FROM notifications n WHERE n.ad_id = l.ad_id"
+            " AND n.sent_at >= ? AND n.channel NOT LIKE '\\_%' ESCAPE '\\')", (_ts(since),))
+        return [Listing.model_validate_json(r["data"]) for r in rows]
+
+    def queue_alert(self, ad_id: str) -> None:
+        self._execute("INSERT OR IGNORE INTO alert_queue (ad_id, queued_at) VALUES (?, ?)", (ad_id, _ts(utcnow())))
+
+    def queued_alerts(self) -> list[str]:
+        return [r["ad_id"] for r in self._query("SELECT ad_id FROM alert_queue ORDER BY queued_at")]
+
+    def unqueue_alerts(self, ad_ids: Iterable[str]) -> None:
+        ids = list(ad_ids)
+        if ids:
+            self._execute(f"DELETE FROM alert_queue WHERE ad_id IN ({','.join('?' * len(ids))})", ids)
+
+    # ------------------------------------------------------------------ backlog
+    def pending_count(self, search_names: Iterable[str] | None = None, *, since: datetime | None = None) -> int:
+        """Stored listings still waiting for an evaluation (the deferred backlog)."""
+        sql = ("SELECT COUNT(*) FROM listings l LEFT JOIN evaluations e ON e.ad_id = l.ad_id"
+               " WHERE e.ad_id IS NULL")
+        params: list[Any] = []
+        names = list(search_names) if search_names is not None else None
+        if names is not None:
+            if not names:
+                return 0
+            sql += f" AND l.search_name IN ({','.join('?' * len(names))})"
+            params += names
+        if since is not None:
+            sql += " AND l.first_seen >= ?"
+            params.append(_ts(since))
+        return int(self._query(sql, params)[0][0])
+
+    def stale_pending(self, search_name: str, *, before: datetime, after: datetime | None = None,
+                      limit: int = 500) -> list[Listing]:
+        """Pending listings of a search first seen before `before` (and after `after`, e.g. the
+        end of the learning pass): the backlog gave up on them."""
+        sql = ("SELECT l.data FROM listings l LEFT JOIN evaluations e ON e.ad_id = l.ad_id"
+               " WHERE e.ad_id IS NULL AND l.search_name = ? AND l.first_seen < ?")
+        params: list[Any] = [search_name, _ts(before)]
+        if after is not None:
+            sql += " AND l.first_seen > ?"
+            params.append(_ts(after))
+        sql += " ORDER BY l.first_seen LIMIT ?"
+        params.append(limit)
+        return [Listing.model_validate_json(r["data"]) for r in self._query(sql, params)]
+
+    def expired_since(self, since: datetime) -> int:
+        """Listings given up from the backlog in passes started since `since`."""
+        rows = self._query("SELECT COALESCE(SUM(json_extract(data, '$.expired')), 0) FROM runs WHERE started_at >= ?",
+                           (_ts(since),))
+        return int(rows[0][0] or 0)
+
+    # ------------------------------------------------------- migration / upkeep
+    def migrate_v01_evaluations(self) -> int | None:
+        """Once per database: drop evaluations written by v0.1 (no `stage`; their "buy"s used the
+        old rules). Listings stay and are evaluated again. Returns the count, None if done before."""
+        marker = "migration:v01_evaluations"
+        if self.get_state(marker) is not None:
+            return None
+        removed = self._execute("DELETE FROM evaluations WHERE json_extract(data, '$.stage') IS NULL").rowcount
+        self.set_state(marker, str(removed))
+        return removed
+
+    def apply_retention(self, *, listing_days: int = 60, run_days: int = 90) -> dict[str, int]:
+        """Forget old noise: skipped listings (+ their evaluations, statuses, delivery records)
+        not seen for `listing_days` — unless the user starred/contacted/bought them — and runs
+        older than `run_days`. Price points are kept (they have their own window)."""
+        cutoff = _ts(utcnow() - timedelta(days=listing_days))
+        ids = [r["ad_id"] for r in self._query(
+            "SELECT l.ad_id FROM listings l JOIN evaluations e ON e.ad_id = l.ad_id"
+            " LEFT JOIN deal_state s ON s.ad_id = l.ad_id"
+            " WHERE e.verdict = 'skip' AND l.last_seen < ?"
+            " AND COALESCE(s.status, 'new') NOT IN ('starred', 'contacted', 'bought')", (cutoff,))]
+        with self._lock:
+            try:
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    marks = ",".join("?" * len(chunk))
+                    for table in ("deal_state", "notifications", "notify_attempts", "alert_queue", "listings"):
+                        self._conn.execute(f"DELETE FROM {table} WHERE ad_id IN ({marks})", chunk)
+                runs = self._conn.execute("DELETE FROM runs WHERE started_at < ?",
+                                          (_ts(utcnow() - timedelta(days=run_days)),)).rowcount
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return {"listings": len(ids), "runs": runs}
 
     # -------------------------------------------------------------------- stats
     def stats(self) -> dict[str, Any]:

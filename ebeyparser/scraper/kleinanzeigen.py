@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
+import httpx
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
 from ..config import SearchConfig
@@ -1012,6 +1013,9 @@ class KleinanzeigenScraper:
     def __init__(self, client: PoliteClient, *, debug_dir: str | Path | None = None) -> None:
         self.client = client
         self.debug_dir = Path(debug_dir) if debug_dir else None
+        # search-form URL -> the pretty result URL the site redirected it to: page 1 of a
+        # repeated search is then one request instead of two (form + redirect)
+        self._resolved: dict[str, str] = {}
 
     def save_debug_page(self, html: str, name: str) -> Path | None:
         """Dump a page for layout debugging: one file per search per day (a failing search
@@ -1034,9 +1038,11 @@ class KleinanzeigenScraper:
         max_pages: int,
         search_name: str,
         seen: Callable[[str], bool] | None = None,
+        resolve: str | None = None,
     ) -> list[Listing]:
         """Follow result pages; stop at max_pages, the last page, a page without new ads,
-        or (with `seen`) the first page that shows an ad we already know."""
+        or (with `seen`) the first page that shows an ad we already know. `resolve`: remember
+        where this search-form URL redirected to (see search())."""
         found: dict[str, Listing] = {}
         visited: set[str] = set()
         url: str | None = start_url
@@ -1052,6 +1058,8 @@ class KleinanzeigenScraper:
                     raise
                 log.info("%s: page %d deferred (%s), keeping %d ads", search_name or start_url, page, exc, len(found))
                 break
+            if page == 1 and resolve and "s-suchanfrage" in resolve:
+                self._remember_resolved(resolve)
             soup = _soup(html)
             if page == 1 and is_empty_results_page(html):
                 log.info("%s: no results for this search/radius (ignoring 'similar' ads)", search_name or start_url)
@@ -1092,7 +1100,22 @@ class KleinanzeigenScraper:
         additionally stops after the first page that contains an already-known regular
         (non-top) ad — so pass a generous max_pages and only new ads cost requests.
         A RateBudgetExceeded on page 2+ ends the crawl with the pages fetched so far."""
-        return await self._crawl(build_search_url(search, 1), max_pages, search.name, seen)
+        start = build_search_url(search, 1)
+        cached = self._resolved.get(start)
+        if cached:
+            try:
+                return await self._crawl(cached, max_pages, search.name, seen)
+            except (PageLayoutError, httpx.HTTPStatusError) as exc:  # the site changed its URLs
+                log.info("%s: cached result URL failed (%s) — using the search form again", search.name, exc)
+                self._resolved.pop(start, None)
+        listings = await self._crawl(start, max_pages, search.name, seen, resolve=start)
+        return listings
+
+    def _remember_resolved(self, form_url: str) -> None:
+        final = getattr(self.client, "last_url", None)
+        if (isinstance(final, str) and final.startswith(BASE_URL) and "s-suchanfrage" not in final
+                and final != form_url):
+            self._resolved[form_url] = final
 
     async def fetch_detail(self, listing: Listing) -> Listing:
         html = await self.client.get_text(listing.url, referer=BASE_URL + "/")

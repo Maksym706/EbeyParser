@@ -85,6 +85,7 @@ class PriceEstimate(BaseModel):
     # how many of the comparables shown to the AI it called the same product variant
     # (None = not asked / no answer; 0 = none: the market price may belong to another variant)
     ai_variant_matches: int | None = None
+    warning: str = ""  # shown as a reason, e.g. a reference price that disagrees with the market
 
 
 class AIVerdict(BaseModel):
@@ -127,7 +128,10 @@ class Evaluation(BaseModel):
     no_alert: bool = False  # never notify (reserved, market known only from the AI)
     # how far the funnel went: "prefilter" (free checks), "market" (no deal by market data,
     # no ad page / AI; re-checked when seen again), "full"; "" = evaluated by an older version
-    stage: Literal["", "prefilter", "market", "full"] = ""
+    stage: Literal["", "prefilter", "market", "full", "expired"] = ""
+    # AI enabled but unavailable, and the math alone says "buy": stored as "maybe", still sent
+    # (notifications.unchecked_deals) marked "⚠ ФОТО НЕ ПРОВЕРЕНЫ ИИ — проверь сам"
+    would_buy: bool = False
     fees: float = 0.0  # selling fees when reselling
     shipping_cost: float = 0.0
     expected_profit: float | None = None  # resale: net profit; personal: savings vs market
@@ -170,3 +174,6 @@ class RunSummary(BaseModel):
     details_fetched: int = 0  # ad pages opened
     ai_calls: int = 0  # local AI evaluations
     deferred: int = 0  # left for the next pass because a budget was used up
+    expired: int = 0  # deferred too long (general PENDING_MAX_AGE): given up, marked as expired
+    queued_alerts: int = 0  # deals held back by notifications.max_alerts_per_hour (sent later as a digest)
+    health_alerts: int = 0  # "AI down" / "site blocked" / heartbeat messages sent

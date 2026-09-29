@@ -93,6 +93,28 @@ class EmailNotifier:
         await asyncio.to_thread(self._send_sync, msg)
         log.info("E-mail отправлен: %s (%d шт.)", msg["To"], len(deals))
 
+    async def send_text(self, text: str) -> None:
+        """A plain service message (health alert, heartbeat); the first line is the subject."""
+        text = text.strip()
+        if not text:
+            return
+        cfg = self.cfg
+        sender = (cfg.from_addr or cfg.username).strip()
+        name, addr = parseaddr(sender)
+        recipients = [a.strip() for a in cfg.to_addrs if a.strip()]
+        if not addr or "@" not in addr or not recipients:
+            raise NotifyError("E-mail: не указан отправитель или получатели.")
+        first = " ".join(text.splitlines()[0].split())
+        msg = EmailMessage()
+        msg["Subject"] = "EbeyParser: " + (first[:90] + "…" if len(first) > 90 else first)
+        msg["From"] = formataddr((name or "EbeyParser", addr))
+        msg["To"] = ", ".join(recipients)
+        msg["Date"] = formatdate(localtime=True)
+        msg["Message-ID"] = make_msgid(domain=addr.rsplit("@", 1)[-1] or "ebeyparser.local")
+        msg.set_content(text)
+        await asyncio.to_thread(self._send_sync, msg)
+        log.info("E-mail (служебное) отправлен: %s", msg["Subject"])
+
     def _send_sync(self, msg: EmailMessage) -> None:
         cfg = self.cfg
         host, port = cfg.smtp_host.strip(), cfg.smtp_port

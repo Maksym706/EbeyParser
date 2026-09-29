@@ -90,6 +90,17 @@ class TelegramNotifier:
                 await self._call(client, "sendMessage", self._text_payload(self._more_text(rest), preview=False))
         log.info("Telegram: отправлено %d сообщ. в чат %s", len(shown), self.cfg.chat_id)
 
+    async def send_text(self, text: str) -> None:
+        """A plain service message (health alert, heartbeat)."""
+        text = text.strip()
+        if not text:
+            return
+        if not self._token or not str(self.cfg.chat_id).strip():
+            raise NotifyError("Telegram: не указан bot_token или chat_id.")
+        async with httpx.AsyncClient(transport=self._transport, timeout=self.timeout) as client:
+            await self._call(client, "sendMessage", self._text_payload(_esc(text[:4000]), preview=False))
+        log.info("Telegram: служебное сообщение отправлено в чат %s", self.cfg.chat_id)
+
     # -- internals -----------------------------------------------------------
 
     def _text_payload(self, text: str, *, preview: bool, markup: dict | None = None) -> dict[str, Any]:
