@@ -208,6 +208,10 @@ class NotificationsConfig(BaseModel):
     min_score: float = 70.0
     verdicts: list[Literal["buy", "maybe", "skip"]] = Field(default_factory=lambda: ["buy"])
     mode: Literal["instant", "digest"] = "instant"  # digest = one message per run
+    max_alerts_per_hour: int = 10  # more deals than this in an hour -> the rest go into one digest
+    health_alerts: bool = True  # tell me when the AI is down, the site blocks us or parsing breaks
+    heartbeat_hour: int | None = 9  # daily "I'm alive: checked N ads, M deals" at this local hour; None = off
+    unchecked_deals: bool = True  # AI down: still send would-be deals, marked "фото НЕ проверены"
     email: EmailConfig = Field(default_factory=EmailConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
 
