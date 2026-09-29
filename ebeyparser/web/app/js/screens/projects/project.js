@@ -334,6 +334,7 @@ export default function ProjectPage({ id, slotKey, query = {} }) {
         open=${sheet === "delete"}
         p=${p}
         onClose=${() => setSheet(null)}
+        onStart=${(on) => (deleting.current = on)}
         onDeleted=${(res) => {
           deleting.current = true;
           setSheet(null);

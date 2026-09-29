@@ -340,9 +340,17 @@ export function BoughtDialog({ open, p, slot, offer, onClose, onView }) {
           onClick: async () => {
             try {
               const back = await projectsApi.unbought(p.id, slot.key);
-              if (back && back.project) {
-                cacheView(back.project);
-                onView(back.project);
+              let view = back && back.project;
+              // the purchase moved the deal to «Купил»; the undo of the build does not move it back
+              // (API gap) — put the deal where it was, so the offer shows up in the build again
+              if (offer && offer.ad_id) {
+                const prev = offer.status && offer.status !== "bought" ? offer.status : "new";
+                await api.patch(`/deals/${encodeURIComponent(offer.ad_id)}`, { status: prev }).catch(() => null);
+                view = (await projectsApi.get(p.id).catch(() => null)) || view;
+              }
+              if (view) {
+                cacheView(view);
+                onView(view);
               }
               toast.info(ru(back && back.message_ru) || "Покупка отменена");
             } catch (e) {
@@ -693,7 +701,7 @@ export function AltSheet({ open, p, slot, alt, onClose, onDeal, onPick }) {
 }
 
 // ================================================================== delete
-export function DeleteDialog({ open, p, onClose, onDeleted }) {
+export function DeleteDialog({ open, p, onClose, onDeleted, onStart }) {
   const [keep, setKeep] = useState(false);
   const [busy, setBusy] = useState(false);
   useEffect(() => open && setKeep(false), [open]);
@@ -709,10 +717,12 @@ export function DeleteDialog({ open, p, onClose, onDeleted }) {
         loading=${busy}
         onClick=${async () => {
           setBusy(true);
+          onStart && onStart(true); // the `deleted` event may arrive before the answer
           try {
             const res = await projectsApi.remove(p.id, keep);
             onDeleted(res);
           } catch (e) {
+            onStart && onStart(false);
             toast.error(e);
           } finally {
             setBusy(false);
@@ -726,7 +736,7 @@ export function DeleteDialog({ open, p, onClose, onDeleted }) {
       <h2 class="confirm__title">Удалить сборку «${p.name}»?</h2>
       <p class="confirm__message">
         ${n
-          ? `Её поиски (${count(n, "поиск", "поиска", "поисков")}) тоже удалятся, найденные объявления останутся в ленте.`
+          ? `${n === 1 ? "Её поиск тоже удалится" : `Её ${count(n, "поиск", "поиска", "поисков")} тоже удалятся`}, найденные объявления останутся в ленте.`
           : "Найденные объявления останутся в ленте."}
       </p>
       ${n > 0 && html`<div class="pj-keep"><${Checkbox} checked=${keep} onChange=${setKeep} label="Оставить поиски" description="Они продолжат искать как обычные поиски «для себя»" /></div>`}
