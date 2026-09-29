@@ -34,6 +34,7 @@ from .. import __version__
 from ..config import AppConfig, ConfigError, SearchConfig, load_config
 from ..db import Database
 from ..models import DEAL_STATUSES, AIVerdict, DealView, RunSummary, utcnow
+from ..notify.render import haggle_phrase, offer_terms
 from ..scraper.categories import (
     DEFAULT_BUDGET,
     RADIUS_CHOICES,
@@ -43,15 +44,14 @@ from ..scraper.categories import (
     answers_from_searches,
     builtin_by_id,
     builtin_categories,
+    RESULT_PAGES_SHARE,
     describe_error,
-    estimate_requests,
     load_cached_categories,
     merge_searches,
     request_budgets,
     save_cached_categories,
     searches_from_answers,
     snap_radius,
-    suggest_interval,
 )
 from .configfile import (
     read_env_file,
@@ -117,10 +117,12 @@ COMP_SOURCE_LABELS = {
     "ebay": "eBay · цена",
     "kleinanzeigen": "Kleinanzeigen",
     "reference": "Справочная",
+    "history": "История цен",
     "other": "Другое",
 }
 PRICE_SOURCE_LABELS = {
     "reference": "справочная цена из конфига",
+    "history": "история цен",
     "kleinanzeigen": "объявления Kleinanzeigen",
     "ebay_sold": "реальные продажи eBay",
     "mixed": "продажи eBay + объявления",
@@ -530,6 +532,8 @@ class DealCard:
     seller_rating: str
     search_name: str
     buying_options: list[str] = field(default_factory=list)
+    haggle: str = ""  # "Торгуйся: предложи 400 € → прибыль ≈ 120 €"
+    unchecked: bool = False  # the AI was down when this ad was evaluated: photos NOT checked
 
     @property
     def image(self) -> str:
@@ -603,6 +607,15 @@ def present_deal(deal: DealView) -> DealCard:
             else:
                 extra = ""
             profit = ProfitInfo("profit", p, fmt_money(round(p), sign=True), extra, p > 0)
+    terms = offer_terms(ev, listing)
+    if terms is not None and terms[1] is not None:  # haggle: show the profit at the suggested offer
+        offer, at_offer, _ = terms
+        if ev is not None and ev.purpose == "personal":
+            text = f"предложи {fmt_money(offer)} → экономия {fmt_money(round(at_offer))}"
+            profit = ProfitInfo("savings", at_offer, text, "", at_offer > 0)
+        else:
+            text = f"предложи {fmt_money(offer)} → {fmt_money(round(at_offer), sign=True)}"
+            profit = ProfitInfo("profit", at_offer, text, "", at_offer > 0)  # short: must fit the card
     max_buy = getattr(ev, "max_buy_price", None) if ev else None
     if max_buy is not None and max_buy > 0 and not listing.is_free:
         max_buy_label = "Макс. ставка" if is_auction else "Выгодно до"
@@ -685,6 +698,8 @@ def present_deal(deal: DealView) -> DealCard:
         seller_rating=seller_rating,
         search_name=listing.search_name,
         buying_options=buying,
+        haggle=haggle_phrase(ev, listing),
+        unchecked=getattr(ev, "ai_checked", None) is False,
     )
 
 
@@ -874,6 +889,57 @@ async def http_limits(app: FastAPI) -> list[dict[str, Any]]:
             "note": str(info.get("note") or ""),
         })
     return rows
+
+
+def keyword_only(config: AppConfig) -> bool:
+    """Kleinanzeigen searches exist, but none scans a category (the v0.1 setup)."""
+    from ..scraper.categories import category_id_from_url
+
+    enabled = [s for s in config.searches if s.enabled and s.source == "kleinanzeigen"]
+    return bool(enabled) and not any(s.category_id or (s.url and category_id_from_url(s.url)) for s in enabled)
+
+
+_QUEUE_KEYS = ("pending", "queue", "queued", "backlog", "waiting")
+_EXPIRED_KEYS = ("expired_24h", "overdue_24h", "expired_day", "expired", "overdue")
+
+
+def _first_int(data: Mapping[str, Any], keys: tuple[str, ...]) -> int | None:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    return None
+
+
+async def backlog_info(app: FastAPI) -> dict[str, int | None] | None:
+    """Evaluation queue for the status page: monitor.backlog_status() if it exists, else the
+    database counts. {"queue": N, "expired_24h": M}; None when nothing is known."""
+    data: Any = None
+    fn = getattr(app.state.monitor, "backlog_status", None)
+    if callable(fn):
+        try:
+            data = fn()
+            if inspect.isawaitable(data):
+                data = await data
+        except Exception:
+            log.exception("monitor.backlog_status failed")
+            data = None
+    queue = expired = None
+    if isinstance(data, Mapping):
+        queue, expired = _first_int(data, _QUEUE_KEYS), _first_int(data, _EXPIRED_KEYS)
+    elif isinstance(data, (tuple, list)) and len(data) >= 2:
+        queue, expired = (int(v) if isinstance(v, (int, float)) else None for v in data[:2])
+    db = app.state.db
+    try:
+        if queue is None and callable(getattr(db, "pending_count", None)):
+            queue = int(db.pending_count())
+        if expired is None and callable(getattr(db, "expired_since", None)):
+            expired = int(db.expired_since(utcnow() - timedelta(days=1)))
+    except Exception:
+        log.exception("backlog counts failed")
+    if queue is None and expired is None:
+        return None
+    return {"queue": queue, "expired_24h": expired}
 
 
 async def _guarded(coro: Any, label: str) -> Any:
@@ -1440,6 +1506,7 @@ def create_app(
             "stats": stats,
             "last_run": runs[0] if runs else None,
             "has_searches": bool(app.state.config.searches),
+            "keyword_only": keyword_only(app.state.config),
             "editable": app.state.config_path is not None,
         })
 
@@ -1533,6 +1600,7 @@ def create_app(
             "stats": db.stats(),
             "searches_enabled": sum(1 for s in cfg.searches if s.enabled),
             "http": await http_limits(app),
+            "backlog": await backlog_info(app),
             "cooldown_steps": list(getattr(cfg.general, "block_cooldown_hours", []) or []),
             "hourly_cap": getattr(cfg.general, "max_requests_per_hour", None),
             "db_path": getattr(db, "path", ""),
@@ -1597,11 +1665,10 @@ def create_app(
         cfg: AppConfig = app.state.config
         rows = list(values["wishlist"])
         rows += [("", "")] * max(1, SETUP_MIN_WISH_ROWS - len(rows))
-        n_searches = answers.search_count
-        suggested = suggest_interval(n_searches, cfg.general)
+        suggested = answers.suggested_interval(cfg.general)
         interval = _to_float(values.get("interval_minutes")) or float(suggested)
-        estimate = estimate_requests(n_searches, interval, cfg.general)
-        pages, extra, cap = request_budgets(cfg.general)
+        estimate = answers.estimate(interval, cfg.general)
+        scan_pages, keyword_pages, extra, cap = request_budgets(cfg.general)
         return render(request, "setup.html", {
             "nav": "setup",
             "form": values,
@@ -1619,7 +1686,8 @@ def create_app(
             "suggested_interval": suggested,
             "current_interval": cfg.general.interval_minutes,
             "estimate": estimate,
-            "budget": {"pages": pages, "extra": extra, "cap": cap},
+            "budget": {"scan_pages": scan_pages, "keyword_pages": keyword_pages, "extra": extra, "cap": cap,
+                       "share": RESULT_PAGES_SHARE},
         }, status_code)
 
     @app.get("/setup", response_class=HTMLResponse)
@@ -1635,7 +1703,7 @@ def create_app(
             values = setup_form_values(answers, replace=True)
             if cfg.searches:  # keep the user's interval unless it is too aggressive
                 values["interval_minutes"] = _num_text(max(cfg.general.interval_minutes,
-                                                           suggest_interval(answers.search_count, cfg.general)))
+                                                           answers.suggested_interval(cfg.general)))
         live = bool(params.get("refresh"))
         categories = await _categories_for(answers.location, answers.radius_km, live=live)
         return _render_setup(request, answers, values, categories, refreshed=live)
@@ -1667,7 +1735,7 @@ def create_app(
                 shutil.copyfile(path, path.with_name(path.name + ".bak"))
             except OSError as exc:
                 log.warning("backup of %s failed: %s", path, exc)
-        interval = answers.interval_minutes or float(suggest_interval(len(generated), cfg.general))
+        interval = answers.interval_minutes or float(answers.suggested_interval(cfg.general))
         if interval != cfg.general.interval_minutes:
             _write_settings({"general.interval_minutes": interval})
         _persist(merged)

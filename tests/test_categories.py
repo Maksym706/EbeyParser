@@ -294,12 +294,20 @@ def test_answers_roundtrip_and_merge() -> None:
 
 def test_radius_interval_and_request_estimate() -> None:
     assert [snap_radius(r) for r in (0, 3, 15, 25, 30, 40, 75, 500)] == [0, 5, 20, 30, 30, 50, 100, 200]
-    general = GeneralConfig()
-    assert suggest_interval(1, general) == 10 and suggest_interval(7, general) == 15
-    assert suggest_interval(8, general) == 20 and suggest_interval(30, general) == 60
-    est = estimate_requests(8, 20, general)
-    assert est.pages_per_hour == 24 and est.per_hour == general.max_requests_per_hour and not est.tight
-    assert "24 стр. выдачи в час" in est.describe() and "лимит программы — 150" in est.describe()
-    busy = estimate_requests(20, 5, general)
-    assert busy.tight and busy.pages_per_hour == 240 and "увеличь интервал" in busy.describe()
+    general = GeneralConfig()  # 150 pages/hour, 40 ad pages + 40 comparables lookups per run
+    # a category scan: up to 3 result pages + the search-form redirect; a keyword search: 1 + redirect
+    assert suggest_interval(7, general) == 30 and suggest_interval(7, general, keyword_searches=1) == 30
+    assert suggest_interval(3, general) == 15 and suggest_interval(0, general, keyword_searches=1) == 10
+    assert suggest_interval(12, general) == 60
+    est = estimate_requests(7, 30, general, keyword_searches=1)
+    assert est.pages_per_run == 7 * 4 + 2 and est.pages_per_hour == 60
+    assert est.extra_per_run == 40 + 100  # ad pages + comparables (≈ 2.5 pages per lookup)
+    assert est.per_hour == 150 and est.evaluation_per_hour == 90 and not est.tight
+    text = est.describe()
+    assert "до 60 стр. выдачи в час" in text and "7 категорий × до 3 стр." in text and "остаётся ~90" in text
+    busy = estimate_requests(7, 15, general, keyword_searches=1)
+    assert busy.tight and busy.evaluation_per_hour == 30 and "поставь раз в 30 мин" in busy.describe()
     assert estimate_requests(0, 15, general).per_hour == 0
+    answers = SetupAnswers(category_ids=[173, 278], wishlist=[("RTX 3090", 550), ("", None)])
+    assert answers.keyword_count == 1 and answers.suggested_interval(general) == 10
+    assert answers.estimate(15, general).pages_per_run == 10

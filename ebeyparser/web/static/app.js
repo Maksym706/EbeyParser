@@ -350,6 +350,14 @@
     });
   });
 
+  // ------------------------------------------------ dismissible hint banner
+  $$("[data-dismiss-hint]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      try { localStorage.setItem("ebp-hide-cat-hint", "1"); } catch (e) { /* private mode */ }
+      document.documentElement.classList.add("hide-cat-hint");
+    });
+  });
+
   // ---------------------------------------------------------- setup wizard
   var setupForm = $("[data-setup]");
   if (setupForm) {
@@ -366,22 +374,33 @@
             (wishes ? " и " + wishes + " «для себя»" : "")
           : "Выбери хотя бы одну категорию или добавь вещь «для себя»";
       }
-      if (estimateEl) {  // same formula as RequestEstimate in scraper/categories.py
+      if (estimateEl) {  // same formula as RequestEstimate / suggest_interval in scraper/categories.py
         var d = estimateEl.dataset;
-        var n = cats + wishes;
         var cap = parseFloat(d.cap) || 0;
-        var interval = Math.max(1, num($('[name="interval_minutes"]', setupForm)) || parseFloat(d.interval) || 15);
-        var pagesHour = Math.round(n * parseFloat(d.pages) * 60 / interval);
-        var raw = Math.round((n * parseFloat(d.pages) + (n ? parseFloat(d.extra) : 0)) * 60 / interval);
+        var pagesRun = cats * parseFloat(d.scanPages) + wishes * parseFloat(d.kwPages);
+        var steps = [10, 15, 20, 30, 45, 60, 90, 120];
+        var wanted = Math.max(10, cap ? pagesRun * 60 / (cap * parseFloat(d.share)) : 2 * (cats + wishes));
+        var suggested = steps.filter(function (s) { return s >= wanted - 1e-9; })[0] || Math.ceil(wanted / 30) * 30;
+        var interval = Math.max(1, num($('[name="interval_minutes"]', setupForm)) || suggested);
+        var pagesHour = Math.round(pagesRun * 60 / interval);
+        var raw = Math.round((pagesRun + (pagesRun ? parseFloat(d.extra) : 0)) * 60 / interval);
         var perHour = cap ? Math.max(pagesHour, Math.min(raw, cap)) : raw;
         var tight = cap && pagesHour > cap / 2;
-        var text = $("[data-estimate-text]", estimateEl);
-        if (text) {
-          text.textContent = "Проверка раз в " + interval + " мин: " + pagesHour + " стр. выдачи в час (~" + pagesHour * 24 +
-            " в сутки) + страницы и цены аналогов только для перспективных объявлений — всего не больше " + perHour +
-            " запросов в час (~" + perHour * 24 + " в сутки)" + (cap ? "; лимит программы — " + cap + " в час." : ".") +
-            (tight ? " Слишком часто для такого числа поисков — увеличь интервал." : "");
+        var parts = [];
+        if (cats) parts.push(cats + " " + plural(cats, "категория", "категории", "категорий") + " × до 3 стр.");
+        if (wishes) parts.push(wishes + " " + plural(wishes, "поиск", "поиска", "поисков") + " по словам");
+        var text = "Раз в " + interval + " мин: до " + pagesHour + " стр. выдачи в час" +
+          (parts.length ? " (" + parts.join(", ") + ")" : "") + ", всего с оценкой объявлений — не больше " + perHour +
+          " запросов в час (~" + perHour * 24 + " в сутки).";
+        if (cap) {
+          text += " На оценку объявлений (страница объявления + 2–3 стр. цен аналогов) остаётся ~" +
+            Math.max(0, cap - pagesHour) + " в час из лимита " + cap + ".";
         }
+        if (tight) text += " ⚠ Слишком часто: на оценку объявлений почти не останется запросов — поставь раз в " + suggested + " мин.";
+        var textEl = $("[data-estimate-text]", estimateEl);
+        if (textEl) textEl.textContent = text;
+        var sugEl = $("[data-suggested]", setupForm);
+        if (sugEl) sugEl.textContent = suggested;
         estimateEl.classList.toggle("warn", !!tight);
       }
     };

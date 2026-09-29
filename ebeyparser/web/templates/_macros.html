@@ -66,6 +66,7 @@
     </div>
     {% endif %}
     {% if c.summary %}<p class="summary" title="{{ c.summary }}">{{ icon('sparkles') }}{{ c.summary }}</p>{% endif %}
+    {% if c.unchecked %}<div class="flags"><span class="flag" title="Нейросеть была недоступна — посмотри фото сам">{{ icon('alert') }}<span>Фото не проверены ИИ</span></span></div>{% endif %}
     {% if c.flags %}
     <div class="flags">
       {% for f in c.flags[:2] %}<span class="flag" title="{{ f }}">{{ icon('alert') }}<span>{{ f }}</span></span>{% endfor %}

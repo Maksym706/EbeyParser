@@ -604,6 +604,8 @@ legend { padding: 0 6px; font-weight: 700; font-size: 13.5px; color: var(--text-
 .setup-banner-icon .icon { width: 24px; height: 24px; }
 .setup-banner .grow { flex: 1; min-width: 0; }
 .setup-banner p { color: var(--text-2); margin-top: 4px; font-size: 14px; max-width: 720px; }
+.hide-cat-hint [data-cat-hint] { display: none; }
+.setup-banner [data-dismiss-hint] { align-self: flex-start; flex: none; }
 .subnav { display: inline-flex; gap: 2px; padding: 4px; border-radius: 13px; background: var(--surface); border: 1px solid var(--border); margin-bottom: 18px; max-width: 100%; overflow-x: auto; }
 .subnav a { display: inline-flex; align-items: center; gap: 8px; height: 34px; padding: 0 14px; border-radius: 9px; font-weight: 600; font-size: 14px; color: var(--text-2); white-space: nowrap; }
 .subnav a:hover { background: var(--surface-2); color: var(--text); }

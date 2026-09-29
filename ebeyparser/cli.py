@@ -95,6 +95,24 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+KEYWORD_ONLY_HINT = ("💡 Сейчас только поиски по словам. Чтобы сканировать категории в своём районе:"
+                     " python -m ebeyparser setup")
+
+
+def _startup_notes(config: AppConfig) -> None:
+    """Warnings worth seeing when monitoring starts (printed and logged)."""
+    from .runtime import PILLOW_WARNING, once, pillow_missing
+    from .scraper.categories import category_id_from_url
+
+    if config.ai.enabled and pillow_missing():
+        print(f"⚠ {PILLOW_WARNING}")
+        logging.getLogger(__name__).warning(PILLOW_WARNING)
+    enabled = [s for s in config.searches if s.enabled and s.source == "kleinanzeigen"]
+    scans = [s for s in enabled if s.category_id or (s.url and category_id_from_url(s.url))]
+    if enabled and not scans and once(config.data_path, "keyword-only-searches"):
+        print(KEYWORD_ONLY_HINT)
+
+
 @contextmanager
 def _long_running(config: AppConfig) -> Iterator[bool]:
     """24/7 modes: log file in data/logs, one instance at a time, no sleep (Windows).
@@ -102,11 +120,13 @@ def _long_running(config: AppConfig) -> Iterator[bool]:
     from .runtime import (
         AlreadyRunningError,
         InstanceLock,
+        disable_quick_edit,
         file_logging,
         keep_awake,
         onedrive_warning,
     )
 
+    disable_quick_edit()  # a stray click in the console window must not freeze monitoring
     warning = onedrive_warning(config.data_path)
     if warning:
         print(warning)
@@ -123,6 +143,7 @@ def _long_running(config: AppConfig) -> Iterator[bool]:
         with file_logging(config.data_path / "logs") as log_path, keep_awake():
             if log_path is not None:
                 logging.getLogger(__name__).info("Log file: %s", log_path)
+            _startup_notes(config)
             yield True
     finally:
         lock.release()
@@ -226,6 +247,7 @@ def cmd_once(args: argparse.Namespace) -> int:
     from .runtime import file_logging
 
     with file_logging(config.data_path / "logs"):
+        _startup_notes(config)
         summary = asyncio.run(go())
     print(f"\nПоисков: {summary.searches} · объявлений: {summary.listings_seen} · новых: "
           f"{summary.new_listings} · оценено: {summary.evaluated} · выгодных: {summary.deals_found}"
@@ -496,6 +518,10 @@ def cmd_ai_check(args: argparse.Namespace) -> int:
     config_path = Path(args.config)
     config = load_config(config_path)
     config.ai.enabled = True  # check even if not switched on yet
+    from .runtime import PILLOW_WARNING, pillow_missing
+
+    if pillow_missing():
+        print(f"⚠ {PILLOW_WARNING}")
     monitor = Monitor(config, Database())
     health = asyncio.run(monitor.ai_health())
     lmstudio = config.ai.provider == "openai"
@@ -680,11 +706,9 @@ def run_setup(
         SetupAnswers,
         answers_from_searches,
         available_categories,
-        estimate_requests,
         merge_searches,
         searches_from_answers,
         snap_radius,
-        suggest_interval,
     )
 
     p = _Prompter(input_fn, print_fn)
@@ -752,6 +776,7 @@ def run_setup(
         purpose = p.ask("\n4/8 Для чего? 1 — перепродажа (считать прибыль), 2 — для себя (считать экономию)",
                         "2" if prev.purpose == "personal" else "1")
         answers.purpose = "personal" if purpose.strip().lower() in ("2", "для себя", "personal") else "resale"
+        say("   Цены вне диапазона не присылаются, но учитываются для оценки рынка.")
         answers.max_price = p.number("   Максимальная цена за одну вещь, €", prev.max_price or 400.0, minimum=1)
         if answers.purpose == "resale":
             answers.min_profit = p.number("   С какой чистой прибыли сообщать о сделке, €", prev.min_profit) or 0.0
@@ -761,13 +786,14 @@ def run_setup(
 
         # 6. interval + request estimate
         n_searches = answers.search_count
-        suggested = suggest_interval(n_searches, config.general)
+        suggested = answers.suggested_interval(config.general)
         default = max(suggested, int(config.general.interval_minutes)) if existed else suggested
         say(f"\n6/8 Как часто проверять? Для {n_searches} {_plural(n_searches, 'поиска', 'поисков', 'поисков')}"
-            f" безопасно — раз в {suggested} мин или реже (чаще — выше риск блокировки на Kleinanzeigen).")
+            f" безопасно — раз в {suggested} мин или реже: каждая категория — до 3 страниц выдачи за проверку,"
+            " и лимит запросов в час должен оставаться на оценку объявлений.")
         interval = p.number("   Интервал, минут", float(default), minimum=5) or float(default)
         answers.interval_minutes = interval
-        estimate = estimate_requests(n_searches, interval, config.general)
+        estimate = answers.estimate(interval, config.general)
         say(f"   {'⚠' if estimate.tight else 'ℹ'} {estimate.describe()}")
 
         # 7. local AI

@@ -114,7 +114,7 @@
       <label class="field">
         <span>Максимальная цена за одну вещь, €</span>
         <input class="input" name="max_price" inputmode="decimal" value="{{ form.max_price }}" placeholder="{{ default_budget | num }}">
-        <small>Дороже — не показывать</small>
+        <small>Дороже и дешевле порога категории — не присылаю, но такие цены учитываются для оценки рынка</small>
       </label>
       <label class="field" data-purpose-only="resale">
         <span>Минимальная прибыль со сделки, €</span>
@@ -147,7 +147,7 @@
   <section class="card step">
     <div class="step-head">
       <span class="step-num">5</span>
-      <div><h2>Как часто проверять</h2><p>Чаще — раньше увидишь выгодное объявление, но выше риск, что Kleinanzeigen временно заблокирует. Для {{ cats_selected + wishes }} {{ plural(cats_selected + wishes, 'поиска', 'поисков', 'поисков') }} безопасно раз в {{ suggested_interval }} мин или реже.</p></div>
+      <div><h2>Как часто проверять</h2><p>Чаще — раньше увидишь выгодное объявление, но выше риск, что Kleinanzeigen временно заблокирует. Каждая категория — до 3 страниц выдачи за проверку, а часть лимита запросов нужна на оценку объявлений. Для {{ cats_selected + wishes }} {{ plural(cats_selected + wishes, 'поиска', 'поисков', 'поисков') }} безопасно раз в <span data-suggested>{{ suggested_interval }}</span> мин или реже.</p></div>
     </div>
     <div class="form-grid">
       <label class="field">
@@ -156,7 +156,7 @@
         <small>Сейчас в конфиге: раз в {{ current_interval | num }} мин</small>
       </label>
     </div>
-    <div class="estimate {{ 'warn' if estimate.tight }}" data-estimate data-pages="{{ budget.pages }}" data-extra="{{ budget.extra }}" data-cap="{{ budget.cap }}" data-interval="{{ suggested_interval }}">
+    <div class="estimate {{ 'warn' if estimate.tight }}" data-estimate data-scan-pages="{{ budget.scan_pages }}" data-kw-pages="{{ budget.keyword_pages }}" data-extra="{{ budget.extra }}" data-cap="{{ budget.cap }}" data-share="{{ budget.share }}" data-interval="{{ suggested_interval }}">
       {{ icon('activity') }}
       <span data-estimate-text>{{ estimate.describe() }}</span>
     </div>

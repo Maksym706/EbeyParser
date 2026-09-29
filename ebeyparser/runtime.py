@@ -177,6 +177,66 @@ def keep_awake() -> Iterator[bool]:
                 pass
 
 
+# ------------------------------------------------------------ console mode
+ENABLE_QUICK_EDIT_MODE = 0x0040
+ENABLE_EXTENDED_FLAGS = 0x0080
+STD_INPUT_HANDLE = -10
+
+
+def disable_quick_edit() -> bool:
+    """Windows console: turn off QuickEdit, so a stray mouse click can't freeze the program
+    (in QuickEdit a click starts "select" mode and blocks all output until Enter/Esc).
+    No-op (False) elsewhere or when stdin is not a console (pythonw, Task Scheduler, pipes)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        mode = wintypes.DWORD()
+        if not handle or not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        new_mode = (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS
+        return new_mode == mode.value or bool(kernel32.SetConsoleMode(handle, new_mode))
+    except Exception:
+        return False
+
+
+# ------------------------------------------------------------- dependencies
+PILLOW_WARNING = ("Pillow не установлен — фото уходят в нейросеть в полном размере, это медленно:"
+                  " pip install -e .")
+
+
+def pillow_missing() -> bool:
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("PIL") is None
+    except (ImportError, ValueError):
+        return True
+
+
+# -------------------------------------------------------------- one-time hints
+def once(data_dir: str | Path, key: str) -> bool:
+    """True the first time `key` is asked for this data folder (remembered in data/.hints)."""
+    path = Path(data_dir) / ".hints"
+    try:
+        seen = set(path.read_text(encoding="utf-8").split()) if path.is_file() else set()
+    except OSError:
+        seen = set()
+    if key in seen:
+        return False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(key + "\n")
+    except OSError:
+        pass  # can't remember: showing a hint again is harmless
+    return True
+
+
 # ------------------------------------------------------------------ OneDrive
 def onedrive_warning(data_dir: Path) -> str | None:
     """SQLite inside a synced OneDrive folder gets locked / corrupted: say so in plain words."""
@@ -198,8 +258,12 @@ def onedrive_warning(data_dir: Path) -> str | None:
 
 
 __all__ = [
+    "PILLOW_WARNING",
     "AlreadyRunningError",
     "InstanceLock",
+    "disable_quick_edit",
+    "once",
+    "pillow_missing",
     "file_logging",
     "force_utf8_console",
     "http_state_path",

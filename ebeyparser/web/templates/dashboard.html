@@ -26,6 +26,17 @@
   <a class="btn btn-primary btn-lg" href="/setup">{{ icon('settings') }}Начать настройку</a>
 </section>
 {% endif %}
+{% if keyword_only %}
+<section class="card setup-banner" data-cat-hint aria-label="Подсказка">
+  <span class="setup-banner-icon">{{ icon('search') }}</span>
+  <div class="grow">
+    <h2>Сейчас только поиски по словам</h2>
+    <p>Программа умеет просматривать целые категории в твоём районе — телефоны, ноутбуки, консоли, комплектующие — и сама находит то, что дешевле рынка. Так выгодных находок намного больше.</p>
+  </div>
+  <a class="btn btn-primary" href="/setup">{{ icon('settings') }}Сканировать категории</a>
+  <button class="icon-btn" type="button" data-dismiss-hint title="Больше не показывать" aria-label="Скрыть подсказку">{{ icon('x') }}</button>
+</section>
+{% endif %}
 {% if last_run %}
 <p class="last-run muted">
   Последняя проверка {{ last_run.started_at | ago }} · новых {{ last_run.new_listings }} · выгодных {{ last_run.deals_found }}

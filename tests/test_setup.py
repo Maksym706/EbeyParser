@@ -92,7 +92,7 @@ def test_setup_wizard_end_to_end_creates_config_and_env(tmp_path: Path) -> None:
     assert phone.max_price == 300 and phone.min_profit == 50 and "ersatzteil" in phone.exclude_keywords
     wish = config.searches[-1]
     assert wish.purpose == "personal" and wish.target_price == 550 and wish.query == "RTX 3090"
-    assert config.general.interval_minutes == 10  # 4 searches -> suggested 10 min
+    assert config.general.interval_minutes == 15  # 3 category scans (≤ 4 pages each) + 1 keyword search
     assert (config.ai.enabled, config.ai.provider, config.ai.base_url, config.ai.model) == (
         True, "openai", "http://localhost:1234/v1", "qwen/qwen2.5-vl-7b")
     assert config.notifications.telegram.enabled
@@ -365,3 +365,33 @@ def test_debug_search_respects_shared_cooldown(tmp_path: Path, capsys) -> None:
     assert cli.main(["-c", str(cfg), "debug-search"]) == 1
     out = capsys.readouterr().out
     assert "на паузе после блокировки" in out and "Запрос не отправлялся" in out
+
+
+def test_startup_notes_pillow_and_keyword_only_hint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    from ebeyparser import runtime
+    from ebeyparser.config import AppConfig
+
+    config = AppConfig(searches=[SearchConfig(name="RTX", query="rtx 3090")])
+    config.general.data_dir = str(tmp_path)
+    config.ai.enabled = True
+    monkeypatch.setattr(runtime, "pillow_missing", lambda: True)
+    cli._startup_notes(config)
+    out = capsys.readouterr().out
+    assert runtime.PILLOW_WARNING in out and "pip install -e ." in out
+    assert cli.KEYWORD_ONLY_HINT in out
+    cli._startup_notes(config)  # the category hint is shown once per data folder
+    assert cli.KEYWORD_ONLY_HINT not in capsys.readouterr().out
+    monkeypatch.setattr(runtime, "pillow_missing", lambda: False)
+    scans = AppConfig(searches=[SearchConfig(name="Handy", category_id=173, location="Berlin")])
+    scans.general.data_dir = str(tmp_path / "other")
+    cli._startup_notes(scans)
+    assert capsys.readouterr().out == ""
+
+
+def test_runtime_small_helpers(tmp_path: Path) -> None:
+    from ebeyparser.runtime import disable_quick_edit, once, pillow_missing
+
+    assert once(tmp_path, "a") and not once(tmp_path, "a") and once(tmp_path, "b")
+    assert isinstance(pillow_missing(), bool)
+    if sys.platform != "win32":
+        assert disable_quick_edit() is False  # no-op off Windows

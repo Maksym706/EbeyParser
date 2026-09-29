@@ -813,3 +813,35 @@ def test_status_page_shows_site_limits_and_cooldown(tmp_path: Path, db: Database
     with TestClient(create_app(config, db, monitor=LimitsMonitor()), base_url=LOCAL) as c:
         html = c.get("/status").text
     assert "150 / 150" in html and "лимит в этот час исчерпан" in html and "всё спокойно" in html
+
+
+def test_status_page_shows_evaluation_backlog(db: Database) -> None:
+    class BacklogMonitor(FakeMonitor):
+        def backlog_status(self) -> dict[str, Any]:
+            return {"pending": 17, "expired_24h": 4}
+
+    with TestClient(create_app(AppConfig(), db, monitor=BacklogMonitor()), base_url=LOCAL) as c:
+        html = c.get("/status").text
+    assert "Очередь на оценку" in html and "17" in html and "просрочено за сутки" in html and "устарела" in html
+
+    class BrokenMonitor(FakeMonitor):
+        def backlog_status(self) -> Any:
+            raise RuntimeError("boom")
+
+    with TestClient(create_app(AppConfig(), db, monitor=BrokenMonitor()), base_url=LOCAL) as c:
+        r = c.get("/status")  # falls back to the database counts (or hides the line)
+    assert r.status_code == 200
+
+
+def test_dashboard_hint_for_keyword_only_searches(db: Database) -> None:
+    keywords = AppConfig(searches=[SearchConfig(name="RTX", query="rtx 3090")])
+    with TestClient(create_app(keywords, db), base_url=LOCAL) as c:
+        html = c.get("/").text
+    assert "Сейчас только поиски по словам" in html and "data-dismiss-hint" in html and "ebp-hide-cat-hint" in html
+    assert "Настрой поиски за 2 минуты" not in html
+    scans = AppConfig(searches=[SearchConfig(name="Handy", category_id=173, location="Berlin"),
+                                SearchConfig(name="RTX", query="rtx 3090")])
+    by_url = AppConfig(searches=[SearchConfig(name="URL", url="https://www.kleinanzeigen.de/s-berlin/c225l3331r20")])
+    for config in (scans, by_url):
+        with TestClient(create_app(config, db), base_url=LOCAL) as c:
+            assert "Сейчас только поиски по словам" not in c.get("/").text

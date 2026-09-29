@@ -25,8 +25,10 @@ FOOTER_TEXT = "EbeyParser · бот-охотник за выгодными об�
 _VERDICT_LABELS = {"buy": "Покупать", "maybe": "Подумать", "skip": "Пропустить"}
 _VERDICT_EMOJI = {"buy": "🟢", "maybe": "🟡", "skip": "⚪"}
 _SOURCE_NAMES = {"kleinanzeigen": "Kleinanzeigen", "ebay": "eBay"}
+UNCHECKED_WARNING = "⚠ ФОТО НЕ ПРОВЕРЕНЫ ИИ — проверь сам"
 _ESTIMATE_SOURCES = {
     "reference": "справочная цена",
+    "history": "история цен",
     "kleinanzeigen": "Kleinanzeigen",
     "ebay_sold": "продажи eBay",
     "mixed": "Kleinanzeigen + eBay",
@@ -299,6 +301,10 @@ class _DealInfo:
     second_reasoning: str = ""
     red_flags: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
+    haggle: str = ""  # "Торгуйся: предложи 400 € → прибыль ≈ 120 €" (replaces the asking-price profit)
+    offer_money: str = ""  # "400 €"
+    offer_profit: float | None = None  # profit / savings at the suggested offer
+    unchecked: bool = False  # AI was down: photos NOT checked
 
     @property
     def market_str(self) -> str:
@@ -390,6 +396,42 @@ def _second_opinion(ai2: AIVerdict) -> str:
     return text
 
 
+def is_unchecked(ev: Evaluation | None) -> bool:
+    """AI was enabled but unavailable, and the deal would be a buy: photos NOT checked."""
+    if ev is None or getattr(ev, "ai_checked", None) is not False:
+        return False
+    return bool(getattr(ev, "would_buy", False)) or ev.verdict == "buy"
+
+
+def offer_terms(ev: Evaluation | None, listing: Listing) -> tuple[float, float | None, float | None] | None:
+    """Haggle deals: (suggested offer, profit or savings at that offer, ROI at that offer).
+
+    `expected_profit` is computed for the asking price; paying the offer instead saves
+    exactly (asking - offer), the rest of the calculation is unchanged."""
+    if ev is None or getattr(ev, "action", "") != "haggle" or getattr(ev, "offer_price", None) is None:
+        return None
+    offer = float(ev.offer_price)
+    if ev.expected_profit is None or listing.price is None:
+        return offer, None, None
+    profit = ev.expected_profit + (listing.price - offer)
+    delivery = (ev.buy_price - listing.price) if ev.buy_price is not None else 0.0
+    cost = offer + max(0.0, delivery)
+    return offer, profit, (profit / cost if cost > 0 else None)
+
+
+def haggle_phrase(ev: Evaluation | None, listing: Listing) -> str:
+    """"Торгуйся: предложи 400 € → прибыль ≈ 120 €" ("" for other deals)."""
+    terms = offer_terms(ev, listing)
+    if terms is None:
+        return ""
+    offer, profit, _ = terms
+    line = f"Торгуйся: предложи {format_money(offer)}"
+    if profit is not None:
+        word = "экономия" if ev is not None and ev.purpose == "personal" else "прибыль"
+        line += f" → {word} ≈ {format_money(profit)}"
+    return line
+
+
 def _collect(deal: DealView, web_base_url: str | None = None) -> _DealInfo:
     lst = deal.listing
     ev = deal.evaluation
@@ -440,7 +482,15 @@ def _collect(deal: DealView, web_base_url: str | None = None) -> _DealInfo:
         score = Decimal(str(ev.score or 0.0)).quantize(Decimal("1"), ROUND_HALF_UP)
         info.score = max(0, min(100, int(score)))
         info.verdict = ev.verdict
-        info.reasons = _dedupe(ev.reasons)[:3]
+        info.unchecked = is_unchecked(ev)
+        terms = offer_terms(ev, lst)
+        if terms is not None:
+            info.haggle = haggle_phrase(ev, lst)
+            info.offer_money = format_money(terms[0])
+            info.offer_profit = terms[1]
+        # the haggle line already says it: drop the engine's own "Торгуйся…/Предложи…" reasons
+        reasons = [r for r in ev.reasons if not (info.haggle and r.startswith(("Торгуйся", "Предложи")))]
+        info.reasons = _dedupe(reasons)[:3]
         if ev.ai_second is not None:
             info.second = _second_opinion(ev.ai_second)
             info.second_reasoning = _squash(ev.ai_second.reasoning)
@@ -493,12 +543,16 @@ def _profit_line(info: _DealInfo) -> str:
 
 
 def deal_headline(deal: DealView) -> str:
-    """One-line summary, e.g. "RTX 3090 — 450 € → прибыль ≈ 160 € · Kleinanzeigen"."""
+    """One-line summary, e.g. "RTX 3090 — 450 € → прибыль ≈ 160 € · Kleinanzeigen";
+    haggle deals: "… — 450 € VB · Торгуйся: предложи 400 € → прибыль ≈ 120 € · …"."""
     info = _collect(deal)
     line = f"{_clip(info.title, 80)} — {info.price_short}"
-    if info.profit is not None:
+    if info.haggle:
+        line += f" · {info.haggle}"
+    elif info.profit is not None:
         line += f" → {info.profit_label.lower()} ≈ {format_money(info.profit)}"
-    return f"{line} · {info.source}"
+    line = f"{line} · {info.source}"
+    return f"{UNCHECKED_WARNING} · {line}" if info.unchecked else line
 
 
 def email_subject(deals: list[DealView]) -> str:
@@ -506,19 +560,23 @@ def email_subject(deals: list[DealView]) -> str:
     n = len(deals)
     if n == 0:
         return "EbeyParser: новых предложений нет"
+    unchecked = any(is_unchecked(d.evaluation) for d in deals)
+    warn = f"{UNCHECKED_WARNING}: " if unchecked else ""
     if n == 1:
         lst = deals[0].listing
         info = _collect(deals[0])
-        head = f"🔥 {deals_count_phrase(1)}: {_clip(info.title, 60)}"
+        head = f"{warn or '🔥 '}{deals_count_phrase(1)}: {_clip(info.title, 60)}"
         if info.is_free:
             return f"{head} — бесплатно"
         if info.auction:
             left = format_time_left(lst.ends_at) if lst.ends_at else ""
             return f"{head} — {info.price_short}" + (f", осталось {left}" if left else "")
         if info.price_main == "цена не указана":
-            return head
+            return head + (f" — предложи {info.offer_money}" if info.offer_money else "")
+        if info.offer_money:
+            return f"{head} за {info.price_short} — предложи {info.offer_money}"
         return f"{head} за {info.price_short}"
-    return f"🔥 {deals_count_phrase(n)} на {_sources_phrase(deals)}"
+    return f"{warn or '🔥 '}{deals_count_phrase(n)} на {_sources_phrase(deals)}"
 
 
 # --------------------------------------------------------------------------- #
@@ -529,6 +587,8 @@ def email_subject(deals: list[DealView]) -> str:
 def _text_block(index: int, info: _DealInfo) -> list[str]:
     pad = "   "
     lines = [f"{index}. [{info.source}] {info.title}"]
+    if info.unchecked:
+        lines.append(f"{pad}{UNCHECKED_WARNING}")
     if info.verdict:
         lines.append(f"{pad}Вердикт: {info.verdict_label} · оценка {info.score}/100")
     price = f"{pad}{info.price_label}: {info.price_full}"
@@ -540,7 +600,9 @@ def _text_block(index: int, info: _DealInfo) -> list[str]:
     if info.market_str:
         extra = f" ({info.market_details})" if info.market_details else ""
         lines.append(f"{pad}Рынок: {info.market_str}{extra}")
-    if info.profit is not None:
+    if info.haggle:
+        lines.append(f"{pad}🤝 {info.haggle}")
+    elif info.profit is not None:
         extra = f" (учтены {info.costs})" if info.costs else ""
         lines.append(f"{pad}{info.profit_label}: {_profit_line(info)}{extra}")
     if info.max_buy:
@@ -687,6 +749,14 @@ def _email_card(info: _DealInfo) -> str:
         chips.append(_chip("🔨 Аукцион", "#ffedd5", "#9a3412"))
     elif info.negotiable_text:
         chips.append(_chip(_e(info.negotiable_text), "#f1f5f9", "#475569"))
+    if info.unchecked:
+        out.append(
+            '<tr><td style="padding:16px 20px 0 20px;">'
+            + _box(f"<b>{_e(UNCHECKED_WARNING)}</b>: нейросеть была недоступна, фото и описание никто не "
+                   "сравнил. Посмотри объявление внимательно, прежде чем писать продавцу.",
+                   "#fef2f2", "#fecaca", "#991b1b")
+            + "</td></tr>"
+        )
     out.append(f'<tr><td style="padding:16px 20px 0 20px;">{"".join(chips)}</td></tr>')
     # Title
     title_html = _e(_clip(info.title, 200))
@@ -721,7 +791,13 @@ def _email_card(info: _DealInfo) -> str:
         )
     # Profit badge + max buy price
     badges = []
-    if info.profit is not None:
+    if info.haggle:
+        badges.append(
+            f'<span style="display:inline-block;margin:0 6px 6px 0;padding:6px 14px;border-radius:16px;'
+            f"background:#16a34a;color:#ffffff;font-family:{_FONT};font-size:15px;font-weight:bold;"
+            f'line-height:20px;">🤝 {_eh(info.haggle)}</span>'
+        )
+    elif info.profit is not None:
         positive = info.profit > 0
         bg, fg = ("#16a34a", "#ffffff") if positive else ("#fee2e2", "#991b1b")
         text = f"{info.profit_label} {'+' if positive else ''}{format_money(info.profit)}"
@@ -908,6 +984,8 @@ _TG_LEVELS = (
 def _tg_build(info: _DealInfo, level: tuple, with_url: bool) -> str:
     title_len, n_reasons, reason_len, n_flags, flag_len, reasoning_cap, details = level
     lines: list[str] = []
+    if info.unchecked:
+        lines.append(f"<b>{_tg(UNCHECKED_WARNING)}</b>")
     head = []
     if info.verdict:
         head.append(f"{_VERDICT_EMOJI.get(info.verdict, '')} <b>{_tg(info.verdict_label)}</b>")
@@ -933,7 +1011,13 @@ def _tg_build(info: _DealInfo, level: tuple, with_url: bool) -> str:
     lines.append(price)
     if info.auction:
         lines.append(f"🔨 {_tg(info.auction_line)}")
-    if info.profit is not None:
+    if info.haggle:
+        line = f"🤝 Торгуйся: предложи <b>{_tg(info.offer_money)}</b>"
+        if info.offer_profit is not None:
+            word = "экономия" if info.purpose == "personal" else "прибыль"
+            line += f" → {word} ≈ <b>{_tg(format_money(info.offer_profit))}</b>"
+        lines.append(line)
+    elif info.profit is not None:
         line = f"📈 {info.profit_label} ≈ <b>{_tg(format_money(info.profit))}</b>"
         if info.profit_extra:
             line += f" · {_tg(info.profit_extra)}"

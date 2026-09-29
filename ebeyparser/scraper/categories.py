@@ -441,15 +441,27 @@ def available_categories(data_dir: str | Path, location: str, radius_km: int) ->
 
 
 # ---------------------------------------------------------- request estimate
+SCAN_RESULT_PAGES = 3  # a category scan reads up to 3 result pages per pass (until it meets known ads)
+REDIRECT_REQUESTS = 1  # the search form answers with a redirect to the real result page
+COMPS_PAGES_PER_LOOKUP = 2.5  # one comparables lookup ≈ 2–3 result pages
+RESULT_PAGES_SHARE = 0.4  # result pages may use at most 40 % of the hourly cap: the rest evaluates ads
+
+
 @dataclass
 class RequestEstimate:
-    """Upper bound of Kleinanzeigen page requests a config makes (the monitor's budgets)."""
+    """Upper bound of Kleinanzeigen page requests a config makes, vs. general.max_requests_per_hour."""
 
-    searches: int
+    category_scans: int
+    keyword_searches: int
     interval_minutes: float
-    pages_per_run: int  # result pages of all searches
-    extra_per_run: int  # ad pages + comparable searches, only for promising ads (budgets)
-    cap_per_hour: int  # general.max_requests_per_hour
+    pages_per_run: int  # result pages (+ redirects) of all searches: always made
+    extra_per_run: int  # ad pages + comparables pages, only for promising ads (per-run budgets)
+    cap_per_hour: int  # general.max_requests_per_hour (0 = no cap)
+    suggested_interval: int = 0
+
+    @property
+    def searches(self) -> int:
+        return self.category_scans + self.keyword_searches
 
     @property
     def per_run(self) -> int:
@@ -461,12 +473,11 @@ class RequestEstimate:
 
     @property
     def pages_per_hour(self) -> int:
-        """Always made: result pages of every search, every run."""
         return int(round(self.pages_per_run * self.runs_per_hour))
 
     @property
     def per_hour(self) -> int:
-        """Upper bound incl. ad pages / comparables of promising ads, capped by the hourly limit."""
+        """Upper bound incl. evaluation of promising ads, capped by the hourly limit."""
         raw = int(round(self.per_run * self.runs_per_hour))
         return max(self.pages_per_hour, min(raw, self.cap_per_hour)) if self.cap_per_hour else raw
 
@@ -475,42 +486,80 @@ class RequestEstimate:
         return self.per_hour * 24
 
     @property
+    def evaluation_per_hour(self) -> int | None:
+        """Requests per hour left for ad pages and comparables (None = no cap)."""
+        return max(0, self.cap_per_hour - self.pages_per_hour) if self.cap_per_hour else None
+
+    @property
     def tight(self) -> bool:
-        """Result pages alone use over half of the hourly cap: little room left to check ads."""
+        """Result pages alone use over half the hourly cap: evaluation of ads would starve."""
         return bool(self.cap_per_hour) and self.pages_per_hour > self.cap_per_hour / 2
 
     def describe(self) -> str:
-        text = (f"Проверка раз в {self.interval_minutes:g} мин: {self.pages_per_hour} стр. выдачи в час"
-                f" (~{self.pages_per_hour * 24} в сутки) + страницы и цены аналогов только для перспективных"
-                f" объявлений — всего не больше {self.per_hour} запросов в час (~{self.per_day} в сутки)")
-        text += f"; лимит программы — {self.cap_per_hour} в час." if self.cap_per_hour else "."
+        parts = []
+        if self.category_scans:
+            parts.append(f"{self.category_scans} {_plural(self.category_scans, 'категория', 'категории', 'категорий')}"
+                         f" × до {SCAN_RESULT_PAGES} стр.")
+        if self.keyword_searches:
+            parts.append(f"{self.keyword_searches} {_plural(self.keyword_searches, 'поиск', 'поиска', 'поисков')}"
+                         " по словам")
+        what = f" ({', '.join(parts)})" if parts else ""
+        text = (f"Раз в {self.interval_minutes:g} мин: до {self.pages_per_hour} стр. выдачи в час{what}, "
+                f"всего с оценкой объявлений — не больше {self.per_hour} запросов в час (~{self.per_day} в сутки).")
+        if self.cap_per_hour:
+            room = self.evaluation_per_hour
+            text += (f" На оценку объявлений (страница объявления + 2–3 стр. цен аналогов) остаётся ~{room}"
+                     f" в час из лимита {self.cap_per_hour}.")
         if self.tight:
-            text += " Слишком часто для такого числа поисков — увеличь интервал."
+            better = f" — поставь раз в {self.suggested_interval} мин" if self.suggested_interval else ""
+            text += f" ⚠ Слишком часто: на оценку объявлений почти не останется запросов{better}."
         return text
 
 
-def request_budgets(general: GeneralConfig | None) -> tuple[int, int, int]:
-    """(pages per search, extra requests per run, hourly cap) from general settings."""
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def request_budgets(general: GeneralConfig | None) -> tuple[int, int, int, int]:
+    """(pages per category scan, pages per keyword search, evaluation requests per run, hourly cap)."""
     general = general or GeneralConfig()
-    pages = max(1, int(getattr(general, "max_pages", 1) or 1))
-    extra = int(getattr(general, "max_details_per_run", 40) or 0) + int(getattr(general, "max_comps_lookups_per_run", 40) or 0)
+    max_pages = max(1, int(getattr(general, "max_pages", 1) or 1))
+    scan_pages = max(SCAN_RESULT_PAGES, max_pages) + REDIRECT_REQUESTS
+    keyword_pages = max_pages + REDIRECT_REQUESTS
+    details = int(getattr(general, "max_details_per_run", 40) or 0)
+    comps = int(getattr(general, "max_comps_lookups_per_run", 40) or 0)
+    extra = details + int(math.ceil(comps * COMPS_PAGES_PER_LOOKUP))
     cap = int(getattr(general, "max_requests_per_hour", DEFAULT_REQUESTS_PER_HOUR) or 0)
-    return pages, extra, cap
+    return scan_pages, keyword_pages, extra, cap
 
 
-def estimate_requests(n_searches: int, interval_minutes: float, general: GeneralConfig | None = None) -> RequestEstimate:
-    pages, extra, cap = request_budgets(general)
-    return RequestEstimate(n_searches, float(interval_minutes), n_searches * pages, extra if n_searches else 0, cap)
-
-
-def suggest_interval(n_searches: int, general: GeneralConfig | None = None) -> int:
-    """Safe check interval: at least 10 min, ~2 min per search, and result pages alone
-    may use at most a third of the hourly request cap."""
-    pages, _, cap = request_budgets(general)
-    wanted = max(10.0, 2.0 * n_searches)
+def suggest_interval(category_scans: int, general: GeneralConfig | None = None, *, keyword_searches: int = 0) -> int:
+    """Safe check interval: result pages (+ redirects) may use at most 40 % of the hourly
+    request cap, never more often than every 10 min. ~7 category scans -> 30 min."""
+    scan_pages, keyword_pages, _, cap = request_budgets(general)
+    pages = category_scans * scan_pages + keyword_searches * keyword_pages
+    wanted = 10.0
     if cap:
-        wanted = max(wanted, n_searches * pages * 60 * 3 / cap)
-    return next((step for step in INTERVAL_STEPS if step >= wanted), int(math.ceil(wanted / 30) * 30))
+        wanted = max(wanted, pages * 60 / (cap * RESULT_PAGES_SHARE))
+    else:
+        wanted = max(wanted, 2.0 * (category_scans + keyword_searches))
+    return next((step for step in INTERVAL_STEPS if step >= wanted - 1e-9), int(math.ceil(wanted / 30) * 30))
+
+
+def estimate_requests(
+    category_scans: int, interval_minutes: float, general: GeneralConfig | None = None, *, keyword_searches: int = 0
+) -> RequestEstimate:
+    scan_pages, keyword_pages, extra, cap = request_budgets(general)
+    pages = category_scans * scan_pages + keyword_searches * keyword_pages
+    return RequestEstimate(
+        category_scans, keyword_searches, float(interval_minutes), pages, extra if pages else 0, cap,
+        suggest_interval(category_scans, general, keyword_searches=keyword_searches),
+    )
 
 
 # ------------------------------------------------------------ search builders
@@ -614,8 +663,19 @@ class SetupAnswers:
     interval_minutes: float | None = None  # general.interval_minutes; None = keep / suggest
 
     @property
+    def keyword_count(self) -> int:
+        return sum(1 for item, _ in self.wishlist if item.strip())
+
+    @property
     def search_count(self) -> int:
-        return len(self.category_ids) + sum(1 for item, _ in self.wishlist if item.strip())
+        return len(self.category_ids) + self.keyword_count
+
+    def suggested_interval(self, general: GeneralConfig | None = None) -> int:
+        return suggest_interval(len(self.category_ids), general, keyword_searches=self.keyword_count)
+
+    def estimate(self, interval_minutes: float, general: GeneralConfig | None = None) -> RequestEstimate:
+        return estimate_requests(len(self.category_ids), interval_minutes, general,
+                                 keyword_searches=self.keyword_count)
 
 
 def is_category_scan(search: SearchConfig) -> bool:

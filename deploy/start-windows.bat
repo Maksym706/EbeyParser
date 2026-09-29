@@ -9,10 +9,9 @@ set PYTHONIOENCODING=utf-8
 title EbeyParser
 
 echo ============================================================
-echo  EbeyParser. НЕ кликай мышкой внутрь этого окна: в Windows
-echo  клик включает "выделение" (QuickEdit), и программа замирает,
-echo  пока не нажмёшь Enter или Esc. Отключить навсегда: правый
-echo  клик по заголовку окна - Свойства - снять "Выделение мышью".
+echo  EbeyParser. Программа сама отключает в этом окне "выделение
+echo  мышью" (QuickEdit), из-за которого Windows замораживает
+echo  программу после клика. Если окно всё же "замерло" - нажми Esc.
 echo ============================================================
 
 where python >nul 2>nul
@@ -23,26 +22,39 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM Repair a broken virtual environment (moved folder, updated Python, interrupted install).
-if exist .venv\Scripts\python.exe (
-    .venv\Scripts\python.exe -m ebeyparser --help >nul 2>nul
-    if errorlevel 1 (
-        echo Окружение .venv повреждено - переустанавливаю...
-        rmdir /s /q .venv
-    )
-)
-if not exist .venv\Scripts\python.exe (
-    echo Устанавливаю зависимости, это займёт пару минут...
-    python -m venv .venv
-    .venv\Scripts\python.exe -m pip install --upgrade pip >nul
-    .venv\Scripts\python.exe -m pip install -e .
-    if errorlevel 1 (
-        echo Не удалось установить зависимости. Проверь интернет и запусти ещё раз.
-        pause
-        exit /b 1
-    )
-)
+REM Dependencies are (re)installed when pyproject.toml changed since the last install: a new
+REM version may need new packages (e.g. Pillow). The stamp stores a hash of pyproject.toml,
+REM because files unpacked from a ZIP keep old modification times.
+if not exist .venv\Scripts\python.exe goto fresh
+.venv\Scripts\python.exe -c "import hashlib,pathlib,sys; h=hashlib.sha256(pathlib.Path('pyproject.toml').read_bytes()).hexdigest(); s=pathlib.Path('.venv/.deps-stamp'); sys.exit(0 if s.is_file() and s.read_text().strip()==h else 1)" >nul 2>nul
+if errorlevel 1 goto install
+.venv\Scripts\python.exe -m ebeyparser --help >nul 2>nul
+if errorlevel 1 goto repair
+goto ready
 
+:repair
+echo Окружение .venv повреждено - пересоздаю...
+rmdir /s /q .venv
+:fresh
+echo Создаю окружение .venv...
+python -m venv .venv
+if errorlevel 1 goto fail
+:install
+echo Устанавливаю зависимости - первый запуск или новая версия, это займёт пару минут...
+.venv\Scripts\python.exe -m pip install --upgrade pip >nul
+.venv\Scripts\python.exe -m pip install -e .
+if errorlevel 1 goto fail
+.venv\Scripts\python.exe -c "import hashlib,pathlib; pathlib.Path('.venv/.deps-stamp').write_text(hashlib.sha256(pathlib.Path('pyproject.toml').read_bytes()).hexdigest())"
+.venv\Scripts\python.exe -m ebeyparser --help >nul 2>nul
+if errorlevel 1 goto fail
+goto ready
+
+:fail
+echo Не удалось установить зависимости. Проверь интернет и запусти ещё раз.
+pause
+exit /b 1
+
+:ready
 if not exist config.yaml (
     .venv\Scripts\python.exe -m ebeyparser setup
     if not exist config.yaml .venv\Scripts\python.exe -m ebeyparser init
@@ -55,6 +67,6 @@ if errorlevel 3 if not errorlevel 4 (
     pause
     exit /b 3
 )
-echo EbeyParser остановился, перезапуск через 30 секунд... (закрой окно, чтобы выйти)
+echo EbeyParser остановился, перезапуск через 30 секунд... Закрой окно, чтобы выйти.
 timeout /t 30 /nobreak >nul
 goto loop

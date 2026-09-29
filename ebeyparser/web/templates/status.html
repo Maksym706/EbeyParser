@@ -28,8 +28,10 @@
       <dt>Поиски</dt><dd>{{ searches_enabled }} активных из {{ config.searches | length }}</dd>
       <dt>Последняя проверка</dt><dd>{% if last %}{{ last.started_at | ago }}{% else %}ещё не было{% endif %}</dd>
       {% if last %}<dt>Итог</dt><dd>новых {{ last.new_listings }} · выгодных {{ last.deals_found }}{% if last.errors %} · <span class="neg">ошибок {{ last.errors | length }}</span>{% endif %}</dd>{% endif %}
+      {% if backlog %}<dt>Очередь на оценку</dt><dd>{{ backlog.queue if backlog.queue is not none else '—' }}{% if backlog.expired_24h is not none %} · просрочено за сутки: <span class="{{ 'neg' if backlog.expired_24h else '' }}">{{ backlog.expired_24h }}</span>{% endif %}</dd>{% endif %}
     </dl>
     {% if not monitor.available %}<p class="muted small">Монитор не подключён: веб-интерфейс запущен без фоновых проверок.</p>{% endif %}
+    {% if backlog and backlog.expired_24h %}<p class="muted small">Часть объявлений не успела оцениться и устарела: проверок слишком много для лимита запросов. Реже проверяй или убери лишние категории (страница «Настройка»).</p>{% endif %}
   </article>
 
   {# ----------------------------------------------------------------- AI #}
