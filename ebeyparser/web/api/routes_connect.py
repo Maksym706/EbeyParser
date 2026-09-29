@@ -60,10 +60,10 @@ GPU_PRESETS = [
 
 # ====================================================================== AI
 def _pillow() -> dict[str, Any]:
-    from ...runtime import PILLOW_WARNING, pillow_missing
+    from ...runtime import PILLOW_WARNING_RU, pillow_missing
 
     missing = pillow_missing()
-    return {"installed": not missing, "warning_ru": PILLOW_WARNING if missing else ""}
+    return {"installed": not missing, "warning_ru": PILLOW_WARNING_RU if missing else ""}
 
 
 @router.post("/ai/detect", summary="Найти LM Studio (:1234) и Ollama (:11434) на этом компьютере и их vision-модели")

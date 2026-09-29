@@ -14,6 +14,7 @@ import { setBadge } from "../features/badges.js";
 import { normalizeCard, STATUS, PIPELINE, decide } from "../features/deal-model.js";
 import { applyUpdate, moveTo, markBought, markSold, setStatus, writeToSeller } from "../features/deal-actions.js";
 import { DealImage, DecisionPill } from "../features/deal-card.js";
+import { openAd } from "../features/messages.js";
 
 const HINTS = {
   starred: "Нажимай ☆ на находках — они соберутся здесь",
@@ -288,7 +289,10 @@ function PipeCard({ deal, col, now, ...drag }) {
   if (col === "starred") {
     body = html`<${DecisionPill} deal=${deal} size="sm" class="dpill--inline" />
       ${ageDays != null && ageDays >= 3 && html`<span class="pcard__warn"><${Icon} name="clock" size=${13} />может быть уже продано — объявлению ${ageDays} дн.</span>`}`;
-    actions = html`<button type="button" class="pcard__btn pcard__btn--main" onClick=${stop(() => writeToSeller(deal))}><${Icon} name="message-square" size=${15} />Написать</button>
+    // an auction is not negotiated in a chat: the move is a bid on eBay (P1-4)
+    actions = html`${decide(deal).kind === "bid"
+        ? html`<button type="button" class="pcard__btn pcard__btn--main" onClick=${stop(() => openAd(deal.url))}><${Icon} name="external-link" size=${15} />На eBay</button>`
+        : html`<button type="button" class="pcard__btn pcard__btn--main" onClick=${stop(() => writeToSeller(deal))}><${Icon} name="message-square" size=${15} />Написать</button>`}
       <button type="button" class="pcard__btn" onClick=${stop(() => markBought(deal))}>Купил</button>`;
   } else if (col === "contacted") {
     const nudge = contactedHours != null && contactedHours >= 24;

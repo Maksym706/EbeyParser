@@ -26,9 +26,10 @@ class ClaudeVision:
             try:
                 import anthropic
             except ImportError as exc:  # optional dependency
-                raise LLMError(
-                    "Для Claude установи пакет: pip install anthropic (или pip install -e .[claude])"
-                ) from exc
+                error = LLMError("Для Claude установи пакет: pip install anthropic (или pip install -e .[claude])")
+                error.message_ru = ("Для проверки через Claude не хватает модуля — переустанови программу "  # type: ignore[attr-defined]
+                                    "с поддержкой Claude")
+                raise error from exc
             kwargs: dict[str, Any] = {"timeout": cfg.timeout_seconds, "max_retries": 2}
             if cfg.api_key:
                 kwargs["api_key"] = cfg.api_key

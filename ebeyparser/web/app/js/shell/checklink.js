@@ -164,7 +164,7 @@ export function CheckLinkModal({ open, onClose, initialUrl = "" }) {
         ${card.score != null && html`<span class="decision__score" title=${`Оценка ${card.score} из 100`}>${card.score}</span>`}
       </div>
       ${flags.length > 0 &&
-      html`<${Banner} tone=${flags.some((f) => f.scam) ? "red" : "amber"} icon="shield-alert" title=${flags.some((f) => f.scam) ? "Осторожно" : "Обрати внимание"}>${flags
+      html`<${Banner} tone=${flags.some((f) => f.scam) ? "red" : "amber"} icon=${flags.some((f) => f.scam) ? "shield-alert" : "triangle-alert"} title=${flags.some((f) => f.scam) ? "Осторожно" : "Обрати внимание"}>${flags
         .slice(0, 3)
         .map((f) => f.text)
         .join(" · ")}<//>`}

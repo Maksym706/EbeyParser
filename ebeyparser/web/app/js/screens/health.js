@@ -180,7 +180,7 @@ function Tile({ icon, title, tone = "neutral", state, children, actions, tip }) 
       <span class=${cx("htile__icon", `tone-${tone}`)}><${Icon} name=${icon} size=${20} /></span>
       <div class="htile__titles">
         <h3>${title}${tip && html` <${Tooltip} text=${tip}><${Icon} name="circle-help" size=${14} class="htile__tip" /><//>`}</h3>
-        <div class=${cx("htile__state", `tone-${tone}`)}><span class="sdot"></span>${state}</div>
+        <div class=${cx("htile__state", `tone-${tone}`)}><span class="sdot"></span><span class="htile__state-text">${state}</span></div>
       </div>
     </header>
     <div class="htile__body">${children}</div>

@@ -4373,3 +4373,29 @@ a.comps__row:hover {
     min-height: 44px;
   }
 }
+.htile__state {
+  align-items: baseline;
+}
+.htile__state .sdot {
+  flex: none;
+  align-self: center;
+}
+.htile__state-text {
+  min-width: 0;
+}
+.pcard .dpill__text {
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+/* P2-11: phone rows — a tighter action row (the buttons keep their 44 px) */
+@media (max-width: 599px) {
+  .drow {
+    row-gap: 8px;
+    padding-bottom: 2px;
+  }
+  .drow .qa {
+    padding-top: 0;
+  }
+}

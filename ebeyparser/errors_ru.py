@@ -335,7 +335,7 @@ def ai_problem(provider: str, base_url: str, model: str, error: str, *, server_o
 # ------------------------------------------------------------ stored texts
 _CLI_SENTENCE_RE = re.compile(
     r"[^.;!?\n]*(?:python -m ebeyparser|ebeyparser (?:run|init|debug-search|categories|setup)|debug-search"
-    r"|ollama (?:serve|pull)|`[^`]+`)[^.;!?\n]*[.;!?]?", re.IGNORECASE)
+    r"|ollama (?:serve|pull)|pip install|`[^`]+`)[^.;!?\n]*[.;!?]?", re.IGNORECASE)
 _CONFIG_FILE_RE = re.compile(r"\s*(?:,\s*)?(?:или\s+|и\s+)?(?:в\s+)?(?:файле?\s+)?(?:config\.yaml(?:\s*/\s*\.env)?|\.env\b)",
                              re.IGNORECASE)
 _KEY_RE = re.compile(r"\b(?:general|pricing|ai|notifications|ebay|web|searches)\.[a-z_]+(?:\.[a-z_]+)*\b")

@@ -390,6 +390,16 @@ export function DataSection() {
     await loadApp().catch(() => {});
     navigate("/welcome");
   };
+  const restartApp = async () => {
+    const ok = await confirm({ title: "Перезапустить программу?", message: "Страница переподключится сама через несколько секунд.", confirmLabel: "Перезапустить", icon: "refresh-cw" });
+    if (!ok) return;
+    try {
+      const res = await api.post("/system/restart", {});
+      toast.info(res.message_ru || "Перезапускаю… страница переподключится сама");
+    } catch (e) {
+      toast.error(e);
+    }
+  };
   if (error && !data) return html`<${Banner} tone="red" details=${error.details}>${error.message}<//>`;
   const c = (data && data.counts) || {};
   const demoCount = (data && data.demo && data.demo.count) || (app && app.demo && app.demo.count) || 0;
@@ -427,6 +437,14 @@ export function DataSection() {
         <${Button} variant="secondary" icon="wand-sparkles" onClick=${rerun}>Запустить заново<//>
       <//>
     <//>
+    ${app &&
+    app.features &&
+    app.features.restart &&
+    html`<${Group} title="Перезапуск" icon="refresh-cw">
+      <${SettingRow} label="Перезапустить программу" help="Если проверки выключены или что-то зависло — перезапуск всё включит заново. Настройки и данные сохранятся.">
+        <${Button} variant="secondary" icon="refresh-cw" onClick=${restartApp}>Перезапустить<//>
+      <//>
+    <//>`}
     ${data &&
     html`<details class="guide">
       <summary>Для продвинутых</summary>
