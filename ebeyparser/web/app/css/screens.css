@@ -4402,3 +4402,15 @@ a.comps__row:hover {
 .sedit__parsed--warn {
   color: var(--amber-text);
 }
+/* narrow deal drawer (tablets): the header keeps its buttons apart */
+.dhead__pos {
+  white-space: nowrap;
+}
+@media (max-width: 1023px) {
+  .dhead__open .btn__label {
+    display: none;
+  }
+  .dhead__open {
+    --btn-px: 10px;
+  }
+}

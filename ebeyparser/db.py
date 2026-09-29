@@ -6,6 +6,7 @@ calls are quick, so the async code calls these methods directly.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -122,6 +123,25 @@ CREATE TABLE IF NOT EXISTS notify_attempts (
 -- Deals held back by notifications.max_alerts_per_hour, sent later as one digest.
 CREATE TABLE IF NOT EXISTS alert_queue (
     ad_id        TEXT PRIMARY KEY,
+    queued_at    TEXT NOT NULL
+);
+
+-- AI scout (docs/design/AI_SCOUT.md): what the text model read in each ad (JSON of ai.triage.TriageItem).
+CREATE TABLE IF NOT EXISTS scout_triage (
+    ad_id        TEXT PRIMARY KEY REFERENCES listings(ad_id) ON DELETE CASCADE,
+    triaged_at   TEXT NOT NULL,
+    source       TEXT NOT NULL DEFAULT 'ai',  -- ai | script (the model's answer was unusable)
+    kind         TEXT NOT NULL DEFAULT '',
+    interest     INTEGER NOT NULL DEFAULT 0,
+    product      TEXT NOT NULL DEFAULT '',
+    data         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scout_triage_at ON scout_triage(triaged_at);
+
+-- Would-be deals waiting for the vision model (it runs on a PC that is sometimes off).
+CREATE TABLE IF NOT EXISTS vision_queue (
+    ad_id        TEXT PRIMARY KEY REFERENCES listings(ad_id) ON DELETE CASCADE,
+    search_name  TEXT NOT NULL DEFAULT '',
     queued_at    TEXT NOT NULL
 );
 
@@ -678,6 +698,24 @@ class Database:
         params.append(max(0, int(limit)))
         return self._query(sql, params)
 
+    def price_history_keyed(
+        self,
+        key: str,
+        since: datetime | None = None,
+        *,
+        exclude_ad_id: str | None = None,
+        limit: int = 400,
+    ) -> list[tuple[Comparable, datetime, datetime, str]]:
+        """Like price_history_spans, plus the key each price is stored under (the AI scout's
+        "ai:…" keys are compared by their attributes, not by the title)."""
+        rows = self._price_rows(key, since, exclude_ad_id, limit)
+        out: list[tuple[Comparable, datetime, datetime, str]] = []
+        for r in rows:
+            last = datetime.fromisoformat(r["last_seen"] or r["seen_at"])
+            first = datetime.fromisoformat(r["first_seen"] or r["seen_at"])
+            out.append((self._point_comparable(r, last), first, last, r["product_key"]))
+        return out
+
     @staticmethod
     def _point_comparable(r: sqlite3.Row, seen: datetime) -> Comparable:
         return Comparable(title=r["title"], price=r["price"], url=r["url"], source=r["source"],
@@ -696,6 +734,127 @@ class Database:
             return int(self._query("SELECT COUNT(*) FROM price_points")[0][0])
         return int(self._query("SELECT COUNT(*) FROM price_points WHERE product_key = ?",
                                (product_key.strip(),))[0][0])
+
+    # ------------------------------------------------------------------- AI scout
+    def save_triage(self, items: Iterable[dict[str, Any]]) -> int:
+        """Store the scout's reading of ads: dicts of ai.triage.TriageItem (mode="json");
+        ads not in `listings` are skipped (the foreign key would refuse them)."""
+        rows = []
+        for item in items:
+            ad_id = str(item.get("ad_id") or "")
+            if not ad_id:
+                continue
+            rows.append((ad_id, str(item.get("triaged_at") or _ts(utcnow())), str(item.get("source") or "ai"),
+                         str(item.get("kind") or ""), int(item.get("interest") or 0),
+                         str(item.get("product") or "")[:200], json.dumps(item, ensure_ascii=False)))
+        if not rows:
+            return 0
+        stored = 0
+        with self._lock:
+            for row in rows:
+                cur = self._conn.execute(
+                    "INSERT INTO scout_triage (ad_id, triaged_at, source, kind, interest, product, data)"
+                    " SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM listings WHERE ad_id = ?)"
+                    " ON CONFLICT(ad_id) DO UPDATE SET triaged_at = excluded.triaged_at, source = excluded.source,"
+                    " kind = excluded.kind, interest = excluded.interest, product = excluded.product,"
+                    " data = excluded.data", (*row, row[0]))
+                stored += cur.rowcount
+            self._conn.commit()
+        return stored
+
+    def get_triage(self, ad_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """Stored scout readings by ad id (JSON dicts)."""
+        ids = list(dict.fromkeys(ad_ids))
+        out: dict[str, dict[str, Any]] = {}
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            for r in self._query(f"SELECT ad_id, data FROM scout_triage WHERE ad_id IN ({','.join('?' * len(chunk))})",
+                                 chunk):
+                try:
+                    out[r["ad_id"]] = json.loads(r["data"])
+                except ValueError:
+                    continue
+        return out
+
+    def scout_backlog(self, since: datetime, *, limit: int = 100) -> list[Listing]:
+        """Ads the script dismissed (free checks / market data) since `since` that the scout has
+        not read yet — its "second look" when there is time left in a pass. Newest first."""
+        rows = self._query(
+            "SELECT l.data FROM listings l JOIN evaluations e ON e.ad_id = l.ad_id"
+            " LEFT JOIN scout_triage t ON t.ad_id = l.ad_id"
+            " WHERE t.ad_id IS NULL AND e.verdict = 'skip' AND l.first_seen >= ?"
+            " AND json_extract(e.data, '$.stage') IN ('prefilter', 'market')"
+            " ORDER BY l.first_seen DESC LIMIT ?", (_ts(since), max(0, int(limit))))
+        return [Listing.model_validate_json(r["data"]) for r in rows]
+
+    def scout_counts(self, since: datetime) -> dict[str, int]:
+        """Scout readings and scout deals since `since` (the Состояние screen)."""
+        read = self._query("SELECT COUNT(*) FROM scout_triage WHERE triaged_at >= ? AND source = 'ai'",
+                           (_ts(since),))[0][0]
+        found = self._query("SELECT COUNT(*) FROM evaluations WHERE evaluated_at >= ?"
+                            " AND json_extract(data, '$.found_by') = 'ai_scout' AND verdict IN ('buy', 'maybe')",
+                            (_ts(since),))[0][0]
+        return {"read": int(read), "found": int(found)}
+
+    def feedback_examples(self, *, limit: int = 5) -> dict[str, list[dict[str, Any]]]:
+        """What the user told us: hidden deals (with the reason) and bought / sold ones (with prices),
+        newest first — the scout's prompt learns the user's taste from them."""
+        hidden = [dict(r) for r in self._query(
+            "SELECT l.title AS title, l.price AS price, s.hidden_reason AS reason FROM deal_state s"
+            " JOIN listings l ON l.ad_id = s.ad_id WHERE s.status = 'ignored'"
+            " ORDER BY s.updated_at DESC LIMIT ?", (max(0, int(limit)),))]
+        good = [dict(r) for r in self._query(
+            "SELECT l.title AS title, l.price AS price, s.bought_price AS bought, s.sold_price AS sold,"
+            " s.status AS status FROM deal_state s JOIN listings l ON l.ad_id = s.ad_id"
+            " WHERE s.status IN ('bought', 'sold') ORDER BY s.updated_at DESC LIMIT ?", (max(0, int(limit)),))]
+        return {"hidden": hidden, "good": good}
+
+    def top_deals_since(self, since: datetime, *, verdicts: Iterable[str] = ("buy", "maybe"),
+                        per_search: int = 3) -> list[DealView]:
+        """The best evaluated deals since `since`, at most `per_search` per search (by score, then
+        profit), hidden ones left out — the «Топ за день» digest."""
+        wanted = [v for v in verdicts if v in ("buy", "maybe", "skip")] or ["buy"]
+        rows = self._query(
+            "SELECT l.data AS l_data, e.data AS e_data, s.status AS status, s.note AS note,"
+            " l.search_name AS search_name FROM evaluations e JOIN listings l ON l.ad_id = e.ad_id"
+            " LEFT JOIN deal_state s ON s.ad_id = l.ad_id"
+            f" WHERE e.evaluated_at >= ? AND e.verdict IN ({','.join('?' * len(wanted))})"
+            " AND COALESCE(s.status, 'new') != 'ignored'"
+            " ORDER BY e.score DESC, COALESCE(e.profit, -1e9) DESC", (_ts(since), *wanted))
+        taken: dict[str, int] = {}
+        out: list[DealView] = []
+        for r in rows:
+            name = r["search_name"] or ""
+            if taken.get(name, 0) >= max(1, int(per_search)):
+                continue
+            taken[name] = taken.get(name, 0) + 1
+            out.append(DealView(listing=Listing.model_validate_json(r["l_data"]),
+                                evaluation=Evaluation.model_validate_json(r["e_data"]),
+                                status=r["status"] or "new", note=r["note"] or ""))
+        return out
+
+    # ---------------------------------------------------------- vision queue
+    def queue_vision(self, ad_id: str, search_name: str = "", *, at: datetime | None = None) -> None:
+        """Hold a would-be deal until the vision model is back (first queue time is kept)."""
+        self._execute(
+            "INSERT INTO vision_queue (ad_id, search_name, queued_at) SELECT ?, ?, ?"
+            " WHERE EXISTS (SELECT 1 FROM listings WHERE ad_id = ?) ON CONFLICT(ad_id) DO NOTHING",
+            (ad_id, search_name, _ts(at or utcnow()), ad_id))
+
+    def vision_queue(self) -> list[tuple[str, str, datetime]]:
+        """(ad_id, search_name, queued_at), oldest first."""
+        return [(r["ad_id"], r["search_name"], datetime.fromisoformat(r["queued_at"]))
+                for r in self._query("SELECT * FROM vision_queue ORDER BY queued_at")]
+
+    def vision_queued_at(self, ad_id: str) -> datetime | None:
+        rows = self._query("SELECT queued_at FROM vision_queue WHERE ad_id = ?", (ad_id,))
+        return datetime.fromisoformat(rows[0]["queued_at"]) if rows else None
+
+    def unqueue_vision(self, ad_ids: Iterable[str]) -> None:
+        ids = list(dict.fromkeys(ad_ids))
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            self._execute(f"DELETE FROM vision_queue WHERE ad_id IN ({','.join('?' * len(chunk))})", chunk)
 
     # ------------------------------------------------------------- search state
     def search_has_run(self, name: str) -> bool:
@@ -1255,7 +1414,7 @@ class Database:
                     chunk = ids[i:i + 500]
                     marks = ",".join("?" * len(chunk))
                     for table in ("evaluations", "deal_state", "notifications", "notify_attempts", "alert_queue",
-                                  "price_points"):
+                                  "price_points", "scout_triage", "vision_queue"):
                         self._conn.execute(f"DELETE FROM {table} WHERE ad_id IN ({marks})", chunk)
                     removed += self._conn.execute(f"DELETE FROM listings WHERE ad_id IN ({marks})", chunk).rowcount
                 self._conn.commit()
@@ -1284,8 +1443,9 @@ class Database:
         counts: dict[str, int] = {}
         with self._lock:
             try:
-                for table in ("price_point_words", "price_points", "evaluations", "deal_state", "notifications",
-                              "notify_attempts", "alert_queue", "listings", "runs", "search_state"):
+                for table in ("price_point_words", "price_points", "scout_triage", "vision_queue", "evaluations",
+                              "deal_state", "notifications", "notify_attempts", "alert_queue", "listings", "runs",
+                              "search_state"):
                     counts[table] = self._conn.execute(f"DELETE FROM {table}").rowcount
                 self._conn.execute("DELETE FROM kv_state WHERE key NOT LIKE 'migration:%'"
                                    " AND key NOT LIKE 'onboarding%' AND key NOT LIKE 'monitor:%'")

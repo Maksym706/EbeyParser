@@ -169,7 +169,7 @@ function LearningHero({ first, monitor }) {
     : stopped
       ? "автопроверка выключена — нажми «Проверить сейчас»"
       : cd
-        ? `первые уведомления после паузы${around ? `, ${around}` : cd.label ? `, около ${cd.label}` : ""}`
+        ? `первые уведомления после паузы${around ? `, ${around}` : cd.label ? `, ${/^\d/.test(cd.label) ? "около " : ""}${cd.label}` : ""}`
         : `первые уведомления после следующей проверки${lbl ? ` (${around})` : at ? ` (~${hm(at)})` : ""}`;
   return html`<section class="hero hero--learning" aria-label="Изучаю рынок">
     <div class="hero__main">

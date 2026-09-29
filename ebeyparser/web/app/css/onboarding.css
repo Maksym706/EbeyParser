@@ -1626,3 +1626,8 @@
   margin-top: 6px;
   color: var(--text-2);
 }
+@media (pointer: coarse) {
+  .guide__steps li + li {
+    margin-top: 24px;
+  }
+}

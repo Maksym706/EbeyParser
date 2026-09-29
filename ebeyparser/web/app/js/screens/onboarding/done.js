@@ -102,7 +102,7 @@ export function DoneStep({ draft, go }) {
       const kept = new Set((created || []).map((s) => s.name));
       const removed = replaced.filter((n) => !kept.has(n));
       if (replace)
-        toast.success(`Поиски заменены — теперь ${count((created && created.length) || (res && res.count) || 0, "поиск", "поиска", "поисков")}`, {
+        toast.success(`Поиски заменены — теперь ${count((res && res.result_count) || (preview && preview.result_count) || (created && created.length) || 0, "поиск", "поиска", "поисков")}`, {
           message: removed.length ? `Убрал: ${names(removed, 4)}` : "Все прежние поиски созданы заново с новыми настройками",
           duration: 9000,
         });
@@ -112,7 +112,7 @@ export function DoneStep({ draft, go }) {
         const cd = cooldownOf((res && res.cooldown && { cooldown: res.cooldown }) || appStore.get().monitor);
         toast.success("Готово! Изучаю рынок", {
           message: cd
-            ? `${cd.site} попросил паузу — первая проверка начнётся${cd.label ? ` в ${cd.label}` : " сразу после неё"}`
+            ? `${cd.site} попросил паузу — первая проверка начнётся${cd.label ? ` ${/^\d/.test(cd.label) ? "в " : ""}${cd.label}` : " сразу после неё"}`
             : res && res.run_started
               ? "Первая проверка уже идёт — это 10–30 минут"
               : (res && res.message_ru) || "Первая проверка начнётся в течение пары минут",

@@ -130,14 +130,18 @@ function useToasterPlacement(ref, active) {
       const H = window.innerHeight;
       const phone = W < 600;
       const side = phone ? 16 : 24;
-      const width = phone ? W - 2 * side : Math.min(360, W - 2 * side);
+      let width = phone ? W - 2 * side : Math.min(360, W - 2 * side);
       let right = side;
       let bottom = phone ? 12 : 24;
       if (!phone) {
-        // a side drawer is open: sit left of it, over the dimmed page, not over its footer
+        // a side drawer is open: sit left of it, over the dimmed page, not over its content
         const drawer = document.querySelector(".overlay:not(.is-leaving) > .drawer");
         const r = drawer && drawer.getBoundingClientRect();
-        if (r && r.width && r.height > H * 0.6 && r.left - width - 2 * side >= 0) right = W - r.left + side;
+        const space = r ? r.left - 2 * side : 0;
+        if (r && r.width && r.height > H * 0.6 && space >= 280) {
+          width = Math.min(360, space);
+          right = W - r.left + side;
+        }
       }
       const left = W - right - width;
       for (const o of document.querySelectorAll(OBSTACLES)) {
@@ -147,6 +151,7 @@ function useToasterPlacement(ref, active) {
         bottom = Math.max(bottom, Math.round(H - r.top + 12));
       }
       el.style.setProperty("--toaster-right", `${right}px`);
+      if (!phone) el.style.setProperty("--toaster-width", `${width}px`);
       el.style.setProperty("--toaster-bottom", `${bottom}px`);
     };
     place();

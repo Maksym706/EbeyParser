@@ -133,6 +133,10 @@ class Evaluation(BaseModel):
     # AI enabled but unavailable, and the math alone says "buy": stored as "maybe", still sent
     # (notifications.unchecked_deals) marked "⚠ ФОТО НЕ ПРОВЕРЕНЫ ИИ — проверь сам"
     would_buy: bool = False
+    # who found it: "script" (keywords / identity / price history) or "ai_scout" (only the AI scout's
+    # reading made it a candidate or gave it its market price: the «Нашла нейросеть» badge);
+    # "" = evaluated before the scout existed
+    found_by: Literal["", "script", "ai_scout"] = ""
     fees: float = 0.0  # selling fees when reselling
     shipping_cost: float = 0.0
     expected_profit: float | None = None  # resale: net profit; personal: savings vs market
@@ -179,3 +183,14 @@ class RunSummary(BaseModel):
     expired: int = 0  # deferred too long (general PENDING_MAX_AGE): given up, marked as expired
     queued_alerts: int = 0  # deals held back by notifications.max_alerts_per_hour (sent later as a digest)
     health_alerts: int = 0  # "AI down" / "site blocked" / heartbeat messages sent
+    # AI scout (docs/design/AI_SCOUT.md): ads the text model read, ads it didn't reach (script path),
+    # unusable answers (script fallback), model calls and seconds, dismissed ads it brought back
+    scout_read: int = 0
+    scout_overflow: int = 0
+    scout_failed: int = 0
+    scout_calls: int = 0
+    scout_seconds: float = 0.0
+    scout_promoted: int = 0
+    scout_deals: int = 0  # "buy" deals found by the scout
+    super_deals: int = 0  # «🔥 Супер-находка» alerts
+    vision_waiting: int = 0  # would-be deals waiting for the (offline) vision model

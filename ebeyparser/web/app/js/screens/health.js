@@ -141,7 +141,7 @@ function TopBanner({ d, reload, now }) {
   if (cd && (level === "ok" || (level === "error" && onlyPause))) {
     // a block pause is waited out by itself: calm amber, one sentence, when it ends
     level = "warn";
-    banner = { message: `${cd.site} попросил паузу — продолжу${cd.label ? ` в ${cd.label}` : " сам"}. Ничего делать не нужно.`, details: banner.details };
+    banner = { message: `${cd.site} попросил паузу — продолжу${cd.label ? ` ${/^\d/.test(cd.label) ? "в " : ""}${cd.label}` : " сам"}. Ничего делать не нужно.`, details: banner.details };
   } else if (level === "ok" && m.state === "stopped") {
     level = "warn";
     banner = { message: "Автопроверка выключена — новые объявления смотрю только по кнопке «Проверить сейчас»", details: "" };

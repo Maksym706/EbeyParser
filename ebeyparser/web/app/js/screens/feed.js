@@ -162,6 +162,7 @@ function useToday(tick) {
 export default function FeedScreen({ query = {} }) {
   const isPhone = useMediaQuery(BREAKPOINTS.phone);
   const wide = useMediaQuery("(min-width: 1280px)");
+  const desktop = useMediaQuery("(min-width: 1024px)");
   const now = useNow(60000);
   const app = useStore(appStore, (s) => s.app) || {};
   const [view, setView] = useLocalState("ebp.feed.view", "grid");
@@ -453,7 +454,7 @@ export default function FeedScreen({ query = {} }) {
       open=${Boolean(openId)}
       onClose=${closeDeal}
       modal=${!wide}
-      width=${wide ? 600 : 560}
+      width=${wide ? 600 : desktop ? 560 : 480}
       class="deal-drawer"
       restoreFocus=${() => lastOpen.current && document.querySelector(`[data-deal="${CSS.escape(String(lastOpen.current))}"] .dcard__link`)}
       title=${openCard ? openCard.title : "Сделка"}
@@ -487,7 +488,7 @@ function DrawerHead({ card, index, total, onPrev, onNext, id }) {
     <a class="icon-btn icon-btn--ghost icon-btn--sm" href=${`/deal/${encodeURIComponent(id || "")}`} aria-label="Открыть на всю страницу" title="Открыть на всю страницу">
       <${Icon} name="maximize-2" size=${16} />
     </a>
-    ${card && card.url && html`<${Button} size="sm" variant="secondary" iconRight="arrow-up-right" href=${card.url}>Открыть объявление<//>`}
+    ${card && card.url && html`<${Button} size="sm" variant="secondary" iconRight="arrow-up-right" href=${card.url} class="dhead__open" aria-label="Открыть объявление">Открыть объявление<//>`}
   </div>`;
 }
 
