@@ -88,7 +88,8 @@ class JobRegistry:
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
 
-    def list(self) -> list[Job]:
+    def all(self) -> list[Job]:
+        """Newest first."""
         return list(reversed(self._jobs.values()))
 
     def running(self, kind: str | None = None) -> list[Job]:

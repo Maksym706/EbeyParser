@@ -56,7 +56,7 @@
       {% if ai.enabled and ai.model_available is not none %}<dt>Модель скачана</dt><dd class="{{ 'match-yes' if ai.model_available else 'match-no' }}">{{ '✓ да' if ai.model_available else '✗ нет' }}</dd>{% endif %}
     </dl>
     {% if not ai.enabled %}
-    <p class="muted small">Включи нейросеть на странице <a class="link" href="/settings#ai">Настройка</a> (или <code>ai.enabled: true</code> в config.yaml), чтобы она проверяла фото и описание.</p>
+    <p class="muted small">Включи нейросеть на странице <a class="link" href="/classic/settings#ai">Настройка</a> (или <code>ai.enabled: true</code> в config.yaml), чтобы она проверяла фото и описание.</p>
     {% elif ai.error %}
     <p class="neg small">{{ ai.error }}</p>
     {% if ai.provider == 'ollama' and ai.ok %}<p class="muted small">Скачай модель: <code>ollama pull {{ ai.model }}</code></p>{% endif %}

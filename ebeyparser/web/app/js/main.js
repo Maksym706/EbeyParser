@@ -100,23 +100,37 @@ function App() {
   useEffect(() => {
     const offs = [
       onEvent("deal_found", (d) => {
-        const deal = d || {};
-        const listing = deal.listing || deal;
-        const id = listing.ad_id || deal.id || deal.ad_id;
-        const profit = deal.profit ?? (deal.evaluation && deal.evaluation.estimate && deal.evaluation.estimate.profit);
+        // {ad_id, search_name, verdict, action, score, card}
+        const card = (d && d.card) || {};
+        const id = card.id || (d && d.ad_id);
+        const profit = card.profit;
         appStore.set({ newDeals: appStore.get().newDeals + 1 });
+        const amount = profit != null ? (card.profit_kind === "savings" ? `экономия ${money(profit)}` : money(profit, { sign: true })) : null;
         toast({
           kind: "deal",
-          title: "Новая выгодная сделка",
-          message: [listing.title, profit != null ? `прибыль ~${money(profit)}` : null].filter(Boolean).join(" · "),
+          title: `Новая находка: ${card.title || "объявление"}${amount ? ` · ${amount}` : ""}`,
+          message: [card.action_label, card.price != null ? money(card.price) : null, card.location].filter(Boolean).join(" · "),
           action: id ? { label: "Открыть", href: `/deal/${encodeURIComponent(id)}` } : { label: "Лента", href: "/" },
-          duration: 9000,
         });
       }),
       onEvent("run_started", () => refreshMonitor()),
+      onEvent("run_progress", (p) => {
+        // live "3 из 8 поисков" without a round trip
+        const m = appStore.get().monitor;
+        if (m && p && p.total) {
+          const text = `${p.index || 0} из ${p.total} поисков${p.search_name ? ` · ${p.search_name}` : ""}`;
+          appStore.set({ monitor: { ...m, running: true, progress: Math.min(1, (p.index || 0) / p.total), progressText: text } });
+        }
+      }),
       onEvent("run_finished", () => refreshMonitor()),
-      onEvent("monitor", () => refreshMonitor()),
-      onEvent("monitor_state", () => refreshMonitor()),
+      onEvent("monitor_paused", () => refreshMonitor()),
+      onEvent("monitor_resumed", () => refreshMonitor()),
+      onEvent("settings_changed", () => loadApp().catch(() => {})),
+      onEvent("searches_changed", () => loadApp().catch(() => {})),
+      onEvent("health_alert", (a) => {
+        appStore.set({ badges: { ...(appStore.get().badges || {}), health: "dot-red" } });
+        if (a && a.text) toast.warning(a.text, { action: { label: "Состояние", href: "/health" } });
+      }),
       onEvent("connected", () => refreshMonitor()),
     ];
     return () => offs.forEach((off) => off());
@@ -141,15 +155,19 @@ function App() {
   const onboarded = isOnboarded(app);
   const onOnboarding = route.path === "/welcome" || route.path.startsWith("/welcome/");
   useEffect(() => {
-    if (app && app.loaded && !onboarded && !onOnboarding && !target) navigate("/welcome", { replace: true });
+    // first run: onboarding is forced until done — unless demo data is loaded to look around
+    const demo = app && app.demo && app.demo.loaded;
+    if (app && app.loaded && !onboarded && !demo && !onOnboarding && !target) navigate("/welcome", { replace: true });
   }, [app, onboarded, onOnboarding, target]);
 
   const found = findRoute(route.path);
   const mod = useScreen(found && found.route);
   const title = found ? found.route.title : "Страница не найдена";
+  const newDeals = useStore(appStore, (s) => s.newDeals);
   useEffect(() => {
-    document.title = `${title} · EbeyParser`;
-  }, [title]);
+    // «(2) Лента · EbeyParser» while there are unseen finds (brief §4.2.6)
+    document.title = `${newDeals ? `(${newDeals}) ` : ""}${title} · EbeyParser`;
+  }, [title, newDeals]);
 
   if (!app || (!app.loaded && !bootError)) return html`<${Splash} />`;
   if (bootError && !app.loaded) return html`<${BootError} error=${bootError} onRetry=${() => loadApp().then(() => setBootError(null), setBootError)} />`;

@@ -40,6 +40,19 @@ export class ApiError extends Error {
     this.status = status;
     this.code = code;
     this.data = data;
+    // per-field validation messages: { "pricing.min_profit": "не меньше 0", … } (PATCH /settings, POST /setup)
+    const fields = data && data.error && data.error.fields;
+    this.fields = Array.isArray(fields)
+      ? Object.fromEntries(fields.map((f) => [f.field, f.message_ru]))
+      : fields && typeof fields === "object"
+        ? fields
+        : {};
+  }
+  /** Message for one field (accepts "min_profit" or "pricing.min_profit"). */
+  field(name) {
+    if (this.fields[name]) return this.fields[name];
+    const hit = Object.keys(this.fields).find((k) => k.endsWith("." + name) || name.endsWith("." + k));
+    return hit ? this.fields[hit] : undefined;
   }
   /** The endpoint does not exist (yet) — show a friendly placeholder instead of an error. */
   get missing() {

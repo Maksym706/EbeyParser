@@ -15,6 +15,7 @@ export const routes = [
   { path: "/health/*", nav: "health", title: "Состояние", load: () => import("./screens/health.js") },
   { path: "/settings/:section?", nav: "settings", title: "Настройки", load: () => import("./screens/settings/index.js") },
   { path: "/welcome/:step?", fullscreen: true, title: "Первая настройка", load: () => import("./screens/onboarding/index.js") },
+  { path: "/dev/ui", title: "Дизайн-система", load: () => import("./screens/gallery.js") }, // component gallery (QA)
 ];
 
 /** Old / alternative addresses → current ones (links from Telegram, the classic UI, the README). */

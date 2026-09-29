@@ -993,9 +993,10 @@ class Database:
         with self._lock:
             for ad_id in dict.fromkeys(ad_ids):
                 cur = self._conn.execute(
-                    "INSERT INTO deal_state (ad_id, status, note, updated_at, seen_at) VALUES (?, 'new', '', ?, ?)"
+                    "INSERT INTO deal_state (ad_id, status, note, updated_at, seen_at)"
+                    " SELECT ?, 'new', '', ?, ? WHERE EXISTS (SELECT 1 FROM listings WHERE ad_id = ?)"
                     " ON CONFLICT(ad_id) DO UPDATE SET seen_at = COALESCE(deal_state.seen_at, excluded.seen_at)"
-                    " WHERE deal_state.seen_at IS NULL", (ad_id, when, when))
+                    " WHERE deal_state.seen_at IS NULL", (ad_id, when, when, ad_id))
                 count += cur.rowcount
             self._conn.commit()
         return count
@@ -1020,6 +1021,7 @@ class Database:
         no_flags: bool = False,
         unseen: bool = False,
         ai_checked: bool | None = None,
+        actionable: bool = False,
         since: datetime | None = None,
         ad_ids: list[str] | None = None,
     ) -> tuple[str, list[Any]]:
@@ -1041,6 +1043,8 @@ class Database:
             where.append("(" + " OR ".join(parts) + ")")
         if actions:
             among("json_extract(e.data, '$.action')", actions)
+        if actionable:  # worth acting on: a "buy" verdict or a buy / haggle / bid action
+            where.append("(e.verdict = 'buy' OR json_extract(e.data, '$.action') IN ('buy', 'haggle', 'bid'))")
         if statuses:
             among("COALESCE(s.status, 'new')", statuses)
         elif not include_ignored:
@@ -1260,7 +1264,8 @@ class Database:
                 for table in ("price_point_words", "price_points", "evaluations", "deal_state", "notifications",
                               "notify_attempts", "alert_queue", "listings", "runs", "search_state"):
                     counts[table] = self._conn.execute(f"DELETE FROM {table}").rowcount
-                self._conn.execute("DELETE FROM kv_state WHERE key NOT LIKE 'migration:%'")
+                self._conn.execute("DELETE FROM kv_state WHERE key NOT LIKE 'migration:%'"
+                                   " AND key NOT LIKE 'onboarding%' AND key NOT LIKE 'monitor:%'")
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()

@@ -178,7 +178,7 @@ def test_seed_demo_idempotent() -> None:
 
 # --------------------------------------------------------------------- pages
 def test_dashboard_renders(client: TestClient) -> None:
-    r = client.get("/")
+    r = client.get("/classic")
     assert r.status_code == 200
     html = r.text
     for text in ("EbeyParser", "Сделки", "Поиски", "Статус", "Проверить сейчас", "Лучшие", "Покупать",
@@ -194,27 +194,27 @@ def test_dashboard_renders(client: TestClient) -> None:
 
 
 def test_dashboard_filters(client: TestClient) -> None:
-    r = client.get("/", params={"verdict": "skip"})
+    r = client.get("/classic", params={"verdict": "skip"})
     assert "iPhone 13 128GB" in r.text and "Canyon" in r.text and "RTX 3090" not in r.text
-    r = client.get("/", params={"verdict": "all", "status": "ignored"})
+    r = client.get("/classic", params={"verdict": "all", "status": "ignored"})
     assert "Bosch Professional" in r.text and "Gigabyte GeForce RTX 3090" not in r.text
-    r = client.get("/", params={"q": "thinkpad"})
+    r = client.get("/classic", params={"q": "thinkpad"})
     assert "ThinkPad T480" in r.text and "Mac mini" not in r.text
-    r = client.get("/", params={"purpose": "personal"})
+    r = client.get("/classic", params={"purpose": "personal"})
     assert "DDR4 ECC" in r.text and "HP Z440" in r.text and "Dyson V11 Absolute Akkusauger" not in r.text
-    r = client.get("/", params={"source": "ebay"})
+    r = client.get("/classic", params={"source": "ebay"})
     assert "RTX 4070" in r.text and "iPad Air" in r.text and "Dyson V11 Absolute Akkusauger" not in r.text
-    r = client.get("/", params={"search": "Apple техника", "verdict": "all"})
+    r = client.get("/classic", params={"search": "Apple техника", "verdict": "all"})
     assert "Mac mini" in r.text and "iPhone 13" in r.text and "Dyson V11 Absolute Akkusauger" not in r.text
     # garbage parameters never break the page
-    r = client.get("/", params={"min_score": "abc", "sort": "evil", "verdict": "x", "page": "-3", "source": "zz"})
+    r = client.get("/classic", params={"min_score": "abc", "sort": "evil", "verdict": "x", "page": "-3", "source": "zz"})
     assert r.status_code == 200 and "RTX 3090" in r.text
 
 
 def test_dashboard_empty_state() -> None:
     app = create_app(AppConfig(), Database())
     with TestClient(app, base_url=LOCAL) as c:
-        r = c.get("/")
+        r = c.get("/classic")
     assert r.status_code == 200
     assert "Пока нет ни одного объявления" in r.text
     assert "Добавить поиск" in r.text
@@ -229,16 +229,16 @@ def test_dashboard_pagination(db: Database) -> None:
         db.save_evaluation(Evaluation(ad_id=ad, verdict="maybe", score=40, buy_price=10 + i))
     app = create_app(AppConfig(), db)
     with TestClient(app, base_url=LOCAL) as c:
-        first = c.get("/")
+        first = c.get("/classic")
         assert 'aria-label="Страницы"' in first.text
-        second = c.get("/", params={"page": 2})
+        second = c.get("/classic", params={"page": 2})
         assert second.status_code == 200 and "страница 2 из 2" in second.text
         api = c.get("/api/deals", params={"limit": 5, "offset": 5}).json()
         assert len(api["items"]) == 5 and api["total"] == db.count_deals(verdict=["buy", "maybe"])
 
 
 def test_deal_page(client: TestClient) -> None:
-    r = client.get(f"/deal/{RTX3090}")
+    r = client.get(f"/classic/deal/{RTX3090}")
     assert r.status_code == 200
     html = r.text
     for text in ("Открыть на Kleinanzeigen", 'target="_blank"', "noopener", "Расчёт прибыли", "Рыночная цена",
@@ -251,21 +251,21 @@ def test_deal_page(client: TestClient) -> None:
 
 
 def test_deal_page_ebay_auction_and_personal(client: TestClient) -> None:
-    html = client.get(f"/deal/{EBAY_AUCTION}").text
+    html = client.get(f"/classic/deal/{EBAY_AUCTION}").text
     for text in ("Открыть на eBay", "Максимальная ставка", "7 ставок", "Текущая ставка", "вкл. доставку 6,99",
                  "99,6", "заканчивается через"):
         assert text in html, text
-    personal = client.get("/deal/2893790331").text
+    personal = client.get("/classic/deal/2893790331").text
     assert "Сколько сэкономлю" in personal and "Экономия" in personal and "Для себя" in personal
 
 
 def test_deal_404(client: TestClient) -> None:
-    r = client.get("/deal/does-not-exist")
+    r = client.get("/classic/deal/does-not-exist")
     assert r.status_code == 404
     assert "Страница не найдена" in r.text and "Такого объявления нет" in r.text
     r = client.get("/api/deals/does-not-exist")
     assert r.status_code == 404 and r.json()["detail"]
-    assert client.get("/nowhere").status_code == 404
+    assert client.get("/classic/nowhere").status_code == 404
 
 
 def test_status_page(db: Database, monitor: FakeMonitor) -> None:
@@ -275,7 +275,7 @@ def test_status_page(db: Database, monitor: FakeMonitor) -> None:
     config.notifications.telegram.chat_id = "518204417"
     app = create_app(config, db, monitor=monitor)
     with TestClient(app, base_url=LOCAL) as c:
-        html = c.get("/status").text
+        html = c.get("/classic/status").text
     for text in ("Последние проверки", "ИИ выключен в конфиге", "Отправить тестовое уведомление", "st***@gmail.com",
                  "51***17", "Второе мнение", "eBay API", "Не настроен", "Главные настройки", "HTTP 429",
                  "qwen2.5vl:7b", "Длительность"):
@@ -291,21 +291,21 @@ def test_status_page_ai_health(db: Database, monitor: FakeMonitor) -> None:
     config.ebay.client_secret = "secret"
     app = create_app(config, db, monitor=monitor)
     with TestClient(app, base_url=LOCAL) as c:
-        html = c.get("/status").text
+        html = c.get("/classic/status").text
         assert "Работает, модель на месте" in html
         assert "Подключён" in html and "12345678" not in html
         monitor.health = {"ok": False, "error": "Connection refused"}
-        html = c.get("/status").text
+        html = c.get("/classic/status").text
         assert "Недоступна" in html and "Connection refused" in html
 
 
 def test_searches_page_renders(editable) -> None:
     c, _, _ = editable
-    html = c.get("/searches").text
+    html = c.get("/classic/searches").text
     for text in ("мастер настройки", "настрой его на kleinanzeigen.de", "Видеокарты Берлин",
                  "Новый поиск", "Добавить поиск", "Источник", "Категории eBay", "Формат продажи"):
         assert text in html, text
-    edit = c.get("/searches", params={"edit": "Видеокарты Берлин"}).text
+    edit = c.get("/classic/searches", params={"edit": "Видеокарты Берлин"}).text
     assert "Изменить поиск «Видеокарты Берлин»" in edit and 'value="rtx 3090"' in edit
 
 
@@ -485,7 +485,7 @@ def test_searches_form_flow(editable) -> None:
         "min_price": "", "max_price": "120,5", "include_keywords": "ecc, reg", "exclude_keywords": "ddr3;defekt",
         "target_price": "90", "min_roi": "25", "max_pages": "2",
     }
-    r = c.post("/searches/save", data=form, follow_redirects=False)
+    r = c.post("/classic/searches/save", data=form, follow_redirects=False)
     assert r.status_code == 303 and "saved=" in r.headers["location"]
     saved = load_config(path).search_by_name("AI-сервер (для себя)")
     assert saved is not None
@@ -495,24 +495,24 @@ def test_searches_form_flow(editable) -> None:
     assert "сохранён" in c.get(r.headers["location"]).text
 
     # edit + rename
-    r = c.post("/searches/save", data={**form, "name": "RAM для сервера", "original_name": "AI-сервер (для себя)"},
+    r = c.post("/classic/searches/save", data={**form, "name": "RAM для сервера", "original_name": "AI-сервер (для себя)"},
                follow_redirects=False)
     assert r.status_code == 303
     names = [s.name for s in load_config(path).searches]
     assert names == ["Видеокарты Берлин", "RAM для сервера"]
 
     # validation errors re-render the form with messages
-    r = c.post("/searches/save", data={"name": "", "radius_km": "abc"})
+    r = c.post("/classic/searches/save", data={"name": "", "radius_km": "abc"})
     assert r.status_code == 400 and "нужно целое число" in r.text
-    r = c.post("/searches/save", data={**form, "name": "Видеокарты Берлин"})
+    r = c.post("/classic/searches/save", data={**form, "name": "Видеокарты Берлин"})
     assert r.status_code == 400 and "уже есть" in r.text
-    r = c.post("/searches/save", data={"name": "Ничего", "source": "kleinanzeigen"})
+    r = c.post("/classic/searches/save", data={"name": "Ничего", "source": "kleinanzeigen"})
     assert r.status_code == 400 and "Укажи URL" in r.text
 
     # toggle + delete
-    r = c.post("/searches/toggle", data={"name": "RAM для сервера"}, follow_redirects=False)
+    r = c.post("/classic/searches/toggle", data={"name": "RAM для сервера"}, follow_redirects=False)
     assert r.status_code == 303 and load_config(path).search_by_name("RAM для сервера").enabled is False
-    r = c.post("/searches/delete", data={"name": "RAM для сервера"}, follow_redirects=False)
+    r = c.post("/classic/searches/delete", data={"name": "RAM для сервера"}, follow_redirects=False)
     assert r.status_code == 303 and [s.name for s in load_config(path).searches] == ["Видеокарты Берлин"]
     assert [s.name for s in config.searches] == ["Видеокарты Берлин"]
 
@@ -521,14 +521,14 @@ def test_searches_read_only(db: Database) -> None:
     config = AppConfig(searches=[SearchConfig(name="Видеокарты Берлин", query="rtx 3090")])
     app = create_app(config, db)
     with TestClient(app, base_url=LOCAL) as c:
-        html = c.get("/searches").text
+        html = c.get("/classic/searches").text
         assert "Только просмотр" in html and "Видеокарты Берлин" in html
-        assert 'action="/searches/save"' not in html
+        assert 'action="/classic/searches/save"' not in html
         assert c.get("/api/searches").json()["editable"] is False
         assert c.post("/api/searches", json={"name": "x", "query": "y"}).status_code == 403
         assert c.put("/api/searches/Видеокарты Берлин", json={"name": "x", "query": "y"}).status_code == 403
         assert c.delete("/api/searches/Видеокарты Берлин").status_code == 403
-        assert c.post("/searches/save", data={"name": "x", "query": "y"}).status_code == 403
+        assert c.post("/classic/searches/save", data={"name": "x", "query": "y"}).status_code == 403
     assert [s.name for s in config.searches] == ["Видеокарты Берлин"]
 
 
@@ -547,8 +547,8 @@ def test_formatters() -> None:
     assert mask_secret("123") == "***"
     assert page_links(5, 10) == [1, None, 4, 5, 6, None, 10]
     f = DealFilters.from_params({"verdict": "buy", "q": "rtx", "min_score": "70"})
-    assert f.url(page=2) == "/?verdict=buy&q=rtx&min_score=70&page=2"
-    assert DealFilters.from_params({}).url() == "/"
+    assert f.url(page=2) == "/classic?verdict=buy&q=rtx&min_score=70&page=2"
+    assert DealFilters.from_params({}).url() == "/classic"
 
 
 # ------------------------------------------------------------- setup wizard
@@ -598,19 +598,19 @@ def setup_env(tmp_path: Path, db: Database, monitor: FakeMonitor, restore_enviro
 
 def test_dashboard_setup_banner_when_no_searches(db: Database) -> None:
     with TestClient(create_app(AppConfig(), db), base_url=LOCAL) as c:
-        html = c.get("/").text
-    assert "Настрой поиски за 2 минуты" in html and 'href="/setup"' in html and "Настройка" in html
+        html = c.get("/classic").text
+    assert "Настрой поиски за 2 минуты" in html and 'href="/classic/setup"' in html and "Настройка" in html
     with TestClient(create_app(AppConfig(), Database()), base_url=LOCAL) as c:
-        empty = c.get("/").text
+        empty = c.get("/classic").text
     assert "Настроить за 2 минуты" in empty and "Добавить поиск" in empty
     config = AppConfig(searches=[SearchConfig(name="x", query="y")])
     with TestClient(create_app(config, db), base_url=LOCAL) as c:
-        assert "Настрой поиски за 2 минуты" not in c.get("/").text
+        assert "Настрой поиски за 2 минуты" not in c.get("/classic").text
 
 
 def test_setup_page_uses_builtin_list_without_requests(setup_env) -> None:
     c, config, _, calls, _ = setup_env
-    r = c.get("/setup")
+    r = c.get("/classic/setup")
     assert r.status_code == 200 and calls == []  # no request to Kleinanzeigen on a normal visit
     html = r.text
     for text in ("Настройка за 2 минуты", "Встроенный справочник категорий", "Handy &amp; Telefon",
@@ -624,16 +624,16 @@ def test_setup_page_uses_builtin_list_without_requests(setup_env) -> None:
 
 def test_setup_refresh_discovers_once_and_caches(setup_env, tmp_path: Path) -> None:
     c, _, _, calls, state = setup_env
-    r = c.get("/setup", params={"location": "Berlin", "radius": "30", "category": ["173", "234"],
+    r = c.get("/classic/setup", params={"location": "Berlin", "radius": "30", "category": ["173", "234"],
                                 "wish_item": ["RTX 3090"], "wish_price": ["550"], "refresh": "1"})
     assert r.status_code == 200 and calls == [("Berlin", 30)]
     assert "с kleinanzeigen.de" in r.text and f"{fmt_number(12345)} объявлений" in r.text and "Sammeln" in r.text
     assert 'name="category" value="234" checked' in r.text and 'value="RTX 3090"' in r.text  # form state kept
     assert (tmp_path / "data" / "categories.json").is_file()
-    again = c.get("/setup", params={"location": "berlin", "radius": "30"})
+    again = c.get("/classic/setup", params={"location": "berlin", "radius": "30"})
     assert calls == [("Berlin", 30)] and "Sammeln" in again.text  # served from the cache
     state["fail"] = True
-    failed = c.get("/setup", params={"location": "Hamburg", "radius": "30", "refresh": "1"})
+    failed = c.get("/classic/setup", params={"location": "Hamburg", "radius": "30", "refresh": "1"})
     assert failed.status_code == 200 and "получить не удалось" in failed.text and "proxy says no" in failed.text
     assert "Handy &amp; Telefon" in failed.text  # built-in fallback
 
@@ -643,8 +643,8 @@ def test_setup_save_replaces_searches_and_keeps_comments(setup_env, monitor: Fak
     form = {"location": "berlin", "radius": "25", "purpose": "resale", "max_price": "300", "min_profit": "50",
             "category": ["173", "278"], "wish_item": ["RTX 3090", ""], "wish_price": ["550", ""],
             "interval_minutes": "20", "replace": "1"}
-    r = c.post("/setup", data=form, follow_redirects=False)
-    assert r.status_code == 303 and r.headers["location"] == "/searches?setup=3"
+    r = c.post("/classic/setup", data=form, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/classic/searches?setup=3"
     saved = load_config(path)
     assert [s.name for s in saved.searches] == ["Handy & Telefon · berlin 30 км", "Notebooks · berlin 30 км",
                                                 "Для себя: RTX 3090"]
@@ -660,12 +660,12 @@ def test_setup_save_replaces_searches_and_keeps_comments(setup_env, monitor: Fak
 
 def test_setup_save_can_keep_existing_and_validates(setup_env) -> None:
     c, _, path, _, _ = setup_env
-    r = c.post("/setup", data={"location": "Berlin", "radius": "30", "category": ["279"]}, follow_redirects=False)
+    r = c.post("/classic/setup", data={"location": "Berlin", "radius": "30", "category": ["279"]}, follow_redirects=False)
     assert r.status_code == 303
     assert [s.name for s in load_config(path).searches] == ["Мой поиск", "Konsolen · Berlin 30 км"]
-    r = c.post("/setup", data={"location": "Berlin", "radius": "30"})
+    r = c.post("/classic/setup", data={"location": "Berlin", "radius": "30"})
     assert r.status_code == 400 and "Выбери хотя бы одну категорию" in r.text
-    r = c.post("/setup", data={"location": "", "category": ["173"], "max_price": "abc",
+    r = c.post("/classic/setup", data={"location": "", "category": ["173"], "max_price": "abc",
                                "wish_item": ["RTX"], "wish_price": ["дёшево"], "interval_minutes": "1"})
     assert r.status_code == 400
     for text in ("Укажи город", "Максимальная цена за вещь", "«RTX»: цена", "Как часто проверять"):
@@ -675,13 +675,13 @@ def test_setup_save_can_keep_existing_and_validates(setup_env) -> None:
 def test_setup_read_only_and_foreign_origin(db: Database) -> None:
     config = AppConfig(searches=[SearchConfig(name="Видеокарты", query="rtx")])
     with TestClient(create_app(config, db), base_url=LOCAL) as c:
-        html = c.get("/setup").text
+        html = c.get("/classic/setup").text
         assert "Только просмотр" in html and "disabled" in html
-        assert c.post("/setup", data={"location": "Berlin", "category": ["173"]}).status_code == 403
-        assert c.post("/settings/ai", data={"provider": "openai", "model": "x"}).status_code == 403
-        assert "Только просмотр" in c.get("/settings").text
+        assert c.post("/classic/setup", data={"location": "Berlin", "category": ["173"]}).status_code == 403
+        assert c.post("/classic/settings/ai", data={"provider": "openai", "model": "x"}).status_code == 403
+        assert "Только просмотр" in c.get("/classic/settings").text
     with TestClient(create_app(AppConfig(), db, config_path=Path("/nonexistent/config.yaml")), base_url=LOCAL) as c:
-        r = c.post("/setup", data={"location": "Berlin", "category": ["173"]}, headers={"Origin": "https://evil.example"})
+        r = c.post("/classic/setup", data={"location": "Berlin", "category": ["173"]}, headers={"Origin": "https://evil.example"})
         assert r.status_code == 403
     assert [s.name for s in config.searches] == ["Видеокарты"]
 
@@ -689,29 +689,29 @@ def test_setup_read_only_and_foreign_origin(db: Database) -> None:
 # ----------------------------------------------------------------- settings
 def test_settings_ai_telegram_pricing(setup_env, monitor: FakeMonitor) -> None:
     c, config, path, _, _ = setup_env
-    html = c.get("/settings").text
+    html = c.get("/classic/settings").text
     for text in ("Локальная нейросеть", "Найти LM Studio / Ollama", "Проверить", "Telegram", "@BotFather",
                  "Что считать выгодным", "Минимальный ROI"):
         assert text in html, text
 
-    r = c.post("/settings/ai", data={"enabled": "1", "provider": "openai", "base_url": "http://localhost:1234/v1",
+    r = c.post("/classic/settings/ai", data={"enabled": "1", "provider": "openai", "base_url": "http://localhost:1234/v1",
                                      "model": "qwen/qwen2.5-vl-7b"}, follow_redirects=False)
     assert r.status_code == 303 and "saved=ai" in r.headers["location"]
     assert (config.ai.provider, config.ai.model, config.ai.enabled) == ("openai", "qwen/qwen2.5-vl-7b", True)
-    assert monitor.updated is config and "Настройки нейросети сохранены" in c.get("/settings?saved=ai").text
-    assert c.post("/settings/ai", data={"provider": "openai", "base_url": "ftp://x", "model": ""}).status_code == 400
+    assert monitor.updated is config and "Настройки нейросети сохранены" in c.get("/classic/settings?saved=ai").text
+    assert c.post("/classic/settings/ai", data={"provider": "openai", "base_url": "ftp://x", "model": ""}).status_code == 400
 
     token = "123456789:AAHfakeTokenFakeTokenFake_12345"
-    r = c.post("/settings/telegram", data={"enabled": "1", "bot_token": token, "chat_id": "987654"},
+    r = c.post("/classic/settings/telegram", data={"enabled": "1", "bot_token": token, "chat_id": "987654"},
                follow_redirects=False)
     assert r.status_code == 303
     assert token in (path.parent / ".env").read_text(encoding="utf-8")
     text = path.read_text(encoding="utf-8")
     assert token not in text and "${TELEGRAM_BOT_TOKEN}" in text and "# мой конфиг" in text
     assert config.notifications.telegram.enabled and config.notifications.telegram.bot_token == token
-    assert c.post("/settings/telegram", data={"enabled": "1", "bot_token": "nope", "chat_id": "x"}).status_code == 400
+    assert c.post("/classic/settings/telegram", data={"enabled": "1", "bot_token": "nope", "chat_id": "x"}).status_code == 400
 
-    r = c.post("/settings/pricing", data={"min_profit": "60", "min_roi": "30", "max_capital": "500",
+    r = c.post("/classic/settings/pricing", data={"min_profit": "60", "min_roi": "30", "max_capital": "500",
                                           "vb_discount": "12"}, follow_redirects=False)
     assert r.status_code == 303
     saved = load_config(path)
@@ -721,7 +721,7 @@ def test_settings_ai_telegram_pricing(setup_env, monitor: FakeMonitor) -> None:
         assert saved.pricing.max_capital == 500
     if hasattr(saved.pricing, "vb_expected_discount"):
         assert saved.pricing.vb_expected_discount == pytest.approx(0.12)
-    assert c.post("/settings/pricing", data={"min_roi": "много"}).status_code == 400
+    assert c.post("/classic/settings/pricing", data={"min_roi": "много"}).status_code == 400
     assert [s.name for s in load_config(path).searches] == ["Мой поиск"]  # searches untouched
 
 
@@ -787,13 +787,13 @@ def test_status_page_shows_site_limits_and_cooldown(tmp_path: Path, db: Database
     config = AppConfig()
     config.general.data_dir = str(tmp_path)
     with TestClient(create_app(config, db), base_url=LOCAL) as c:
-        html = c.get("/status").text
+        html = c.get("/classic/status").text
     assert "Запросы к сайтам и защита от блокировки" in html and "Запросов к сайтам пока не было" in html
     state = tmp_path / "http_state.json"
     _blocked_state(state)
     before = state.read_text(encoding="utf-8")
     with TestClient(create_app(config, db), base_url=LOCAL) as c:
-        html = c.get("/status").text
+        html = c.get("/classic/status").text
     assert "www.kleinanzeigen.de" in html and "пауза до" in html and "пауза после блокировки" in html
     assert state.read_text(encoding="utf-8") == before  # the page only reads the shared state
 
@@ -809,9 +809,9 @@ def test_status_page_shows_site_limits_and_cooldown(tmp_path: Path, db: Database
             return {}  # the monitor creates its HTTP client lazily
 
     with TestClient(create_app(config, db, monitor=IdleMonitor()), base_url=LOCAL) as c:
-        assert "пауза до" in c.get("/status").text  # falls back to the shared state file
+        assert "пауза до" in c.get("/classic/status").text  # falls back to the shared state file
     with TestClient(create_app(config, db, monitor=LimitsMonitor()), base_url=LOCAL) as c:
-        html = c.get("/status").text
+        html = c.get("/classic/status").text
     assert "150 / 150" in html and "лимит в этот час исчерпан" in html and "всё спокойно" in html
 
 
@@ -821,7 +821,7 @@ def test_status_page_shows_evaluation_backlog(db: Database) -> None:
             return {"pending": 17, "expired_24h": 4}
 
     with TestClient(create_app(AppConfig(), db, monitor=BacklogMonitor()), base_url=LOCAL) as c:
-        html = c.get("/status").text
+        html = c.get("/classic/status").text
     assert "Очередь на оценку" in html and "17" in html and "просрочено за сутки" in html and "устарела" in html
 
     class BrokenMonitor(FakeMonitor):
@@ -829,14 +829,14 @@ def test_status_page_shows_evaluation_backlog(db: Database) -> None:
             raise RuntimeError("boom")
 
     with TestClient(create_app(AppConfig(), db, monitor=BrokenMonitor()), base_url=LOCAL) as c:
-        r = c.get("/status")  # falls back to the database counts (or hides the line)
+        r = c.get("/classic/status")  # falls back to the database counts (or hides the line)
     assert r.status_code == 200
 
 
 def test_dashboard_hint_for_keyword_only_searches(db: Database) -> None:
     keywords = AppConfig(searches=[SearchConfig(name="RTX", query="rtx 3090")])
     with TestClient(create_app(keywords, db), base_url=LOCAL) as c:
-        html = c.get("/").text
+        html = c.get("/classic").text
     assert "Сейчас только поиски по словам" in html and "data-dismiss-hint" in html and "ebp-hide-cat-hint" in html
     assert "Настрой поиски за 2 минуты" not in html
     scans = AppConfig(searches=[SearchConfig(name="Handy", category_id=173, location="Berlin"),
@@ -844,4 +844,4 @@ def test_dashboard_hint_for_keyword_only_searches(db: Database) -> None:
     by_url = AppConfig(searches=[SearchConfig(name="URL", url="https://www.kleinanzeigen.de/s-berlin/c225l3331r20")])
     for config in (scans, by_url):
         with TestClient(create_app(config, db), base_url=LOCAL) as c:
-            assert "Сейчас только поиски по словам" not in c.get("/").text
+            assert "Сейчас только поиски по словам" not in c.get("/classic").text

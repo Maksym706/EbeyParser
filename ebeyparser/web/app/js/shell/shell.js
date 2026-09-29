@@ -59,7 +59,7 @@ function Sidebar({ nav, collapsed, onToggle }) {
       )}
     </nav>
     <div class="sidebar__bottom">
-      ${app && app.demo && html`<a class="sidebar__demo" href="/settings/data" title="Показаны демо-данные"><${Icon} name="flask-conical" size=${14} /><span>Демо-данные</span></a>`}
+      ${app && app.demo && app.demo.loaded && html`<a class="sidebar__demo" href="/settings/data" title="Показаны демо-данные"><${Icon} name="flask-conical" size=${14} /><span>Демо-данные</span></a>`}
       <${MonitorCard} compact=${collapsed} />
       <div class="sidebar__tools">
         <${IconButton} size="sm" icon=${theme === "dark" ? "sun" : "moon"} label=${theme === "dark" ? "Светлая тема" : "Тёмная тема"} onClick=${toggleTheme} />
@@ -116,7 +116,7 @@ function TopBar({ title, onCheck, phone }) {
     <${Button} variant="secondary" icon="scan-search" class="topbar__check" onClick=${() => onCheck("")} title="Вставь ссылку на объявление — посчитаю выгоду (Ctrl+K)">
       <span class="hide-md">Проверить объявление</span>
     <//>
-    <${Tooltip} text=${newDeals ? `Новых находок: ${newDeals}` : "Новых находок нет"} placement="bottom">
+    <${Tooltip} text=${newDeals ? `Новых находок: ${newDeals}` : "Новых находок нет"} placement="bottom-end">
       <${IconButton}
         icon="bell"
         label="Новые находки"

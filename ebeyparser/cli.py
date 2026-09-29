@@ -149,49 +149,179 @@ def _long_running(config: AppConfig) -> Iterator[bool]:
         lock.release()
 
 
-def cmd_run(args: argparse.Namespace) -> int:
-    """Web UI + background monitoring (main mode)."""
+BROWSER_MARKER = ".browser_opened"
+BROWSER_QUIET_SECONDS = 10 * 60  # a crash-restart loop (start-windows.bat) must not open a tab every time
+BROWSER_WAIT_SECONDS = 60.0
+
+
+def bootstrap_config(config_path: Path) -> bool:
+    """No config.yaml yet: create it silently from the example — without its sample searches
+    and with the AI off — so the web UI's onboarding takes over. Also .env from .env.example."""
+    if config_path.exists():
+        return False
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    if EXAMPLE_CONFIG.is_file():
+        shutil.copyfile(EXAMPLE_CONFIG, config_path)
+    else:
+        config_path.write_text("", encoding="utf-8")
+    save_searches_block(config_path, [])
+    update_yaml_values(config_path, {"ai.enabled": False})
+    env = config_path.parent / ".env"
+    if not env.exists() and EXAMPLE_ENV.is_file():
+        shutil.copyfile(EXAMPLE_ENV, env)
+    return True
+
+
+def browser_allowed(args: argparse.Namespace) -> bool:
+    """Open the dashboard automatically? Not with --no-browser / EBEYPARSER_NO_BROWSER, not in
+    Docker, CI or a systemd service, not on a Linux box without a desktop, not when stdin is
+    redirected (Windows: pythonw without a console counts as a user double-click)."""
+    import os
+
+    if getattr(args, "no_browser", False) or os.environ.get("EBEYPARSER_NO_BROWSER"):
+        return False
+    if os.environ.get("CI") or os.environ.get("INVOCATION_ID") or os.environ.get("container") \
+            or Path("/.dockerenv").exists():
+        return False
+    stdin = sys.stdin
+    if sys.platform == "win32":
+        return stdin is None or stdin.isatty()
+    if sys.platform != "darwin" and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    return stdin is not None and stdin.isatty()
+
+
+def _browser_recently_opened(data_dir: Path, now: float) -> bool:
+    marker = Path(data_dir) / BROWSER_MARKER
+    try:
+        last = float(marker.read_text(encoding="utf-8").strip() or 0)
+    except (OSError, ValueError):
+        last = 0.0
+    if now - last < BROWSER_QUIET_SECONDS:
+        return True
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(now), encoding="utf-8")
+    except OSError:
+        pass
+    return False
+
+
+def open_browser_when_ready(server: Any, url: str, data_dir: Path, *, opener: Callable[[str], Any] | None = None,
+                            clock: Callable[[], float] | None = None, sleep: Callable[[float], Any] | None = None) -> None:
+    """Wait (in a thread) until uvicorn listens, then open `url` once."""
+    import threading
+    import time
+    import webbrowser
+
+    opener = opener or webbrowser.open
+    clock = clock or time.time
+    sleep = sleep or time.sleep
+
+    def wait() -> None:
+        waited = 0.0
+        while not getattr(server, "started", False):
+            if getattr(server, "should_exit", False) or waited >= BROWSER_WAIT_SECONDS:
+                return
+            sleep(0.2)
+            waited += 0.2
+        if _browser_recently_opened(data_dir, clock()):
+            return
+        try:
+            opener(url)
+        except Exception as exc:  # noqa: BLE001 - no browser is not an error
+            logging.getLogger(__name__).info("Browser not opened: %s", exc)
+
+    threading.Thread(target=wait, name="ebeyparser-browser", daemon=True).start()
+
+
+def _make_server(app: Any, host: str, port: int, verbose: bool) -> Any:
+    """uvicorn server that also ends the open live-update streams (SSE) on Ctrl+C."""
     import uvicorn
 
+    class _Server(uvicorn.Server):
+        def handle_exit(self, sig: int, frame: Any) -> None:
+            hub = getattr(app.state, "api_events", None)
+            if hub is not None:
+                hub.close_threadsafe()
+            super().handle_exit(sig, frame)
+
+    return _Server(uvicorn.Config(app, host=host, port=port, log_level="info" if verbose else "warning"))
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Web UI + background monitoring (main mode). Opens the browser once the server is up;
+    without config.yaml it creates one and the UI's onboarding takes over."""
     from .monitor import Monitor
     from .notify.base import build_notifiers
     from .web.app import create_app
     from .web.security import TOKEN_PARAM, ensure_token, is_loopback, lan_urls
 
     config_path = Path(args.config)
+    created = bootstrap_config(config_path)
+    if created:
+        print(f"✔ Создан {config_path} — настройка продолжится в браузере (город, категории, нейросеть, Telegram).")
+    open_browser = browser_allowed(args)
     with _long_running(load_config(config_path)) as ok:
         if not ok:
             return 3
-        config, db = _open(config_path)
-        host = args.host or config.web.host
-        port = args.port or config.web.port
-        base_url = _web_base_url(config)
-        token = None if is_loopback(host) else ensure_token(config.data_path)
-        monitor = Monitor(config, db, web_base_url=base_url)
-        app = create_app(
-            config, db,
-            config_path=config_path,
-            monitor=monitor,
-            notifiers_factory=lambda: build_notifiers(app.state.config.notifications, web_base_url=base_url),
-            start_monitor=config.web.run_monitor and not args.no_monitor,
-            bind_host=host,
-            access_token=token,
-        )
-        if token is None:
-            print(f"🚀 EbeyParser: открой http://localhost:{port}")
-        else:
-            everywhere = host in ("0.0.0.0", "::")
-            print(f"⚠ Панель открыта {'для всей сети' if everywhere else 'по адресу ' + host}"
-                  " — вход только по ссылке с ключом.")
-            if everywhere:
-                print("   Не делай так в общественном Wi-Fi (общежитие, кафе); для телефона лучше Tailscale.")
-                print(f"🚀 На этом компьютере: http://localhost:{port}/?token={token}")
-            urls = lan_urls(port, token) if everywhere else [f"http://{host}:{port}/?{TOKEN_PARAM}={token}"]
-            for url in urls:
-                print(f"📱 С телефона: {url}")
-            print(f"   Ключ хранится в {config.data_path / 'web_token.txt'} — удали файл, чтобы сменить ключ.")
-        print(f"   Лог: {config.data_path / 'logs' / 'ebeyparser.log'}. Ctrl+C — остановить.")
-        uvicorn.run(app, host=host, port=port, log_level="info" if args.verbose else "warning")
+        while True:
+            config, db = _open(config_path)
+            if created:  # the web UI's onboarding asks for the AI step (see web/api/routes_app.is_onboarded)
+                db.set_state("onboarding:bootstrapped", "1")
+                created = False
+            host = args.host or config.web.host
+            port = args.port or config.web.port
+            base_url = _web_base_url(config)
+            token = None if is_loopback(host) else ensure_token(config.data_path)
+            monitor = Monitor(config, db, web_base_url=base_url)
+            app = create_app(
+                config, db,
+                config_path=config_path,
+                monitor=monitor,
+                notifiers_factory=lambda: build_notifiers(app.state.config.notifications, web_base_url=base_url),
+                start_monitor=config.web.run_monitor and not args.no_monitor,
+                bind_host=host,
+                access_token=token,
+            )
+            local_url = f"http://localhost:{port}/" + (f"?{TOKEN_PARAM}={token}" if token else "")
+            if token is None:
+                print(f"🚀 EbeyParser: открой http://localhost:{port}")
+            else:
+                everywhere = host in ("0.0.0.0", "::")
+                print(f"⚠ Панель открыта {'для всей сети' if everywhere else 'по адресу ' + host}"
+                      " — вход только по ссылке с ключом.")
+                if everywhere:
+                    print("   Не делай так в общественном Wi-Fi (общежитие, кафе); для телефона лучше Tailscale.")
+                    print(f"🚀 На этом компьютере: {local_url}")
+                urls = lan_urls(port, token) if everywhere else [f"http://{host}:{port}/?{TOKEN_PARAM}={token}"]
+                for url in urls:
+                    print(f"📱 С телефона: {url}")
+                print(f"   Ключ хранится в {config.data_path / 'web_token.txt'} — удали файл, чтобы сменить ключ.")
+            print(f"   Лог: {config.data_path / 'logs' / 'ebeyparser.log'}. Ctrl+C — остановить.")
+            server = _make_server(app, host, port, args.verbose)
+            restart = {"requested": False}
+
+            def request_restart(server: Any = server, app: Any = app, restart: dict = restart) -> None:
+                restart["requested"] = True
+                hub = getattr(app.state, "api_events", None)
+                if hub is not None:
+                    hub.close()
+                server.should_exit = True
+
+            app.state.restart_callback = request_restart
+            if open_browser:
+                open_browser_when_ready(server, local_url, config.data_path)
+                open_browser = False
+            try:
+                server.run()
+            except KeyboardInterrupt:
+                return 0
+            finally:
+                db.close()
+            if not restart["requested"]:
+                break
+            print("♻ Перезапускаю с новыми настройками…")
     return 0
 
 
@@ -1032,6 +1162,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("-c", "--config", default=str(DEFAULT_CONFIG_PATH), help="путь к config.yaml")
     parser.add_argument("-v", "--verbose", action="store_true", help="подробный лог")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="не открывать браузер при запуске (для `run` и запуска без команды)")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("init", help="создать config.yaml и .env из примеров").set_defaults(func=cmd_init)
@@ -1040,6 +1172,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host")
     p.add_argument("--port", type=int)
     p.add_argument("--no-monitor", action="store_true", help="только веб-интерфейс, без проверок")
+    p.add_argument("--no-browser", action="store_true", default=argparse.SUPPRESS,
+                   help="не открывать браузер при запуске")
     p.set_defaults(func=cmd_run)
 
     sub.add_parser("monitor", help="мониторинг без веб-интерфейса").set_defaults(func=cmd_monitor)
@@ -1097,7 +1231,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command is None:
         args = parser.parse_args([*(argv or sys.argv[1:]), "run"])
-    for name, default in (("host", None), ("port", None), ("no_monitor", False)):
+    for name, default in (("host", None), ("port", None), ("no_monitor", False), ("no_browser", False)):
         if not hasattr(args, name):
             setattr(args, name, default)
     _setup_logging(args.verbose)

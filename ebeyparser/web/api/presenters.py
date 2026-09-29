@@ -7,7 +7,7 @@ import math
 import re
 import unicodedata
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, overload
 
 from ...config import AppConfig, SearchConfig
 from ...models import AIVerdict, DealView, Evaluation, Listing, utcnow
@@ -70,7 +70,23 @@ STAGE_LABELS = {"": "—", "prefilter": "Отсеяно фильтром", "mark
                 "expired": "Не успели проверить"}
 
 
+try:
+    from zoneinfo import ZoneInfo
+
+    LOCAL_TZ: Any = ZoneInfo("Europe/Berlin")
+except Exception:  # pragma: no cover - missing tzdata
+    LOCAL_TZ = timezone.utc
+
+
 # --------------------------------------------------------------------- helpers
+@overload
+def aware(dt: datetime) -> datetime: ...
+
+
+@overload
+def aware(dt: None) -> None: ...
+
+
 def aware(dt: datetime | None) -> datetime | None:
     if dt is None:
         return None

@@ -333,7 +333,9 @@ class Monitor:
         old_general = self.config.general
         self.config = config
         self._comps_cache.clear()
-        if self._client is not None and _request_settings(old_general) != _request_settings(config.general):
+        # compare with what the client was built from: the web UI changes the shared config in place
+        built_from = getattr(self, "_client_settings", None) or _request_settings(old_general)
+        if self._client is not None and built_from != _request_settings(config.general):
             self._client = _close_soon(self._client)  # new delays / limits / user agent
             if not self._injected["scraper"]:
                 self._scraper = None
@@ -356,6 +358,7 @@ class Monitor:
             self._client = PoliteClient.from_config(
                 self.config.general, state_path=self.config.data_path / "http_state.json"
             )
+            self._client_settings = _request_settings(self.config.general)
         if self._scraper is None:
             self._scraper = KleinanzeigenScraper(self._client, debug_dir=self.config.data_path / "debug")
         if self._ebay is None:

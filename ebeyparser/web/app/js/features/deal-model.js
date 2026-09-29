@@ -167,8 +167,10 @@ export function decide(d, { now = new Date(), offer } = {}) {
   const firstReason = trimReason((d.reasons || [])[0]);
   const market = d.market_price;
   const profit = d.profit;
-  const offerPrice = offer ?? d.offer_price;
-  const offerProfit = d.profit_at_offer ?? null;
+  // offers are shown rounded the way people say them (293 → 290); profit follows the rounding
+  const rawOffer = offer ?? d.offer_price;
+  const offerPrice = offer != null ? offer : humanOffer(rawOffer);
+  const offerProfit = d.profit_at_offer != null && d.offer_price != null && offerPrice != null ? d.profit_at_offer + (d.offer_price - offerPrice) : null;
   const maxBuy = d.max_buy_price;
   const price = d.price;
 
@@ -265,7 +267,8 @@ export function decide(d, { now = new Date(), offer } = {}) {
       sub: profit != null ? `Возможная ${personal ? "экономия" : "прибыль"} ${money(profit, { sign: true })}` : "",
     });
   }
-  out.badge = score != null ? `${out.verb} · ${score}` : out.verb;
+  const short = { haggle: "Торг", skip: "Пропусти", free: "Даром" }[out.kind] || (out.tone === "haggle" ? "Торг" : out.verb);
+  out.badge = score != null ? `${short} · ${score}` : short;
   return out;
 }
 
@@ -322,10 +325,13 @@ const TYPES = [
 ];
 
 export function productType(d) {
+  if (d && d.product_type && d.product_type !== "other" && CHECKLISTS_KEYS.includes(d.product_type)) return d.product_type;
   const text = [d && d.title, d && d.ai && d.ai.product, d && d.search_name].filter(Boolean).join(" ");
   const t = TYPES.find((x) => x.re.test(text));
   return t ? t.key : "generic";
 }
+
+const CHECKLISTS_KEYS = ["phone", "gpu", "laptop", "console"];
 
 export const TYPE_LABELS = { phone: "Телефон", gpu: "Видеокарта", laptop: "Ноутбук", console: "Консоль", generic: "Общее" };
 

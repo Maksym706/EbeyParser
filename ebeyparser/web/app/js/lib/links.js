@@ -6,5 +6,8 @@ export const LINKS = {
   lmStudio: "https://lmstudio.ai",
   ollama: "https://ollama.com",
   ebayDevelopers: "https://developer.ebay.com/my/keys",
+  ebayRegister: "https://developer.ebay.com",
+  googleAppPasswords: "https://myaccount.google.com/apppasswords",
+  tailscale: "https://tailscale.com/download",
   kleinanzeigen: "https://www.kleinanzeigen.de",
 };

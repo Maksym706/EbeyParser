@@ -17,6 +17,8 @@ export {
   StatusDot,
   Spinner,
   ExternalLink,
+  HelpTip,
+  CopyButton,
 } from "./core.js";
 export {
   Field,
@@ -34,6 +36,8 @@ export {
   TestResult,
   SaveState,
   ChoiceCards,
+  ChipInput,
+  SettingRow,
 } from "./forms.js";
 export { Modal, Drawer, confirm, DialogHost, Portal, usePresence } from "./overlay.js";
 export { toast, Toaster, dismissToast } from "./toast.js";
@@ -51,5 +55,6 @@ export {
   Section,
   KeyValue,
   Stat,
+  Meter,
 } from "./feedback.js";
 export { QrCode } from "./qr.js";

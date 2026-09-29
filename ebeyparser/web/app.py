@@ -60,6 +60,7 @@ from .configfile import (
     write_env_values,
 )
 from .localai import LMSTUDIO_URL, OLLAMA_URL, detect_local_ai, probe_json
+from .spa import CLASSIC_PREFIX, index_response, install_spa, wants_spa
 from .security import (
     COOKIE_MAX_AGE,
     COOKIE_NAME,
@@ -461,7 +462,7 @@ class DealFilters:
 
     def url(self, **overrides: Any) -> str:
         params = self.params(**overrides)
-        return "/?" + urlencode(params) if params else "/"
+        return f"{CLASSIC_PREFIX}?" + urlencode(params) if params else CLASSIC_PREFIX
 
     @property
     def panel_active(self) -> int:
@@ -661,7 +662,7 @@ def present_deal(deal: DealView) -> DealCard:
     return DealCard(
         deal=deal,
         id=listing.ad_id,
-        href=f"/deal/{quote(listing.ad_id, safe='')}",
+        href=f"{CLASSIC_PREFIX}/deal/{quote(listing.ad_id, safe='')}",
         title=listing.title,
         url=listing.url,
         source=source,
@@ -1312,6 +1313,14 @@ def notification_channels(config: AppConfig) -> list[dict[str, Any]]:
     ]
 
 
+def _error_body(request: Request, code: str, message: str) -> dict[str, Any]:
+    """Middleware refusals: {"detail"} for the old API, plus {"error"} (the /api/v1 shape)."""
+    body: dict[str, Any] = {"detail": message}
+    if request.url.path.startswith("/api/v1"):
+        body["error"] = {"code": code, "message_ru": message}
+    return body
+
+
 # =============================================================================
 def create_app(
     config: AppConfig,
@@ -1349,6 +1358,10 @@ def create_app(
             yield
         finally:
             stop.set()
+            api = getattr(app.state, "api", None)
+            if api is not None:  # end open SSE streams and running jobs (/api/v1)
+                api.hub.close()
+                api.jobs.cancel_all()
             await _stop_task(app.state.monitor_task, SHUTDOWN_TIMEOUT)
             app.state.monitor_task = None
             await _stop_task(app.state.run_task, 0)
@@ -1377,6 +1390,7 @@ def create_app(
     app.state.category_cache = {}  # (location, radius) -> CategoryList
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    install_spa(app)  # new UI: /app assets, "/" and every other page path (see spa.py)
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     env = templates.env
     env.filters.update(
@@ -1425,7 +1439,8 @@ def create_app(
             if origin:
                 allowed = {request.headers.get("host", ""), request.headers.get("x-forwarded-host", "")}
                 if urlsplit(origin).netloc not in allowed - {""}:
-                    return JSONResponse({"detail": "Запрос с чужого сайта отклонён"}, status_code=403)
+                    return JSONResponse(_error_body(request, "foreign_origin", "Запрос с чужого сайта отклонён"),
+                                        status_code=403)
         return await call_next(request)
 
     @app.middleware("http")
@@ -1433,7 +1448,7 @@ def create_app(
         """Network mode: every page and API call needs the token (cookie, header or ?token=)."""
         token: str | None = app.state.access_token
         path = request.url.path
-        if not token or path.startswith("/static/"):
+        if not token or path.startswith(("/static/", "/app/")):
             return await call_next(request)
         if token_matches(request.query_params.get(TOKEN_PARAM), token):
             if request.method == "GET" and not path.startswith("/api/"):
@@ -1448,7 +1463,8 @@ def create_app(
                 request.headers.get(TOKEN_HEADER), token):
             return await call_next(request)
         if path.startswith("/api/"):
-            return JSONResponse({"detail": "Нужен ключ доступа: открой ссылку с ?token=… из окна программы"},
+            return JSONResponse(_error_body(request, "unauthorized",
+                                            "Нужен ключ доступа: открой ссылку с ?token=… из окна программы"),
                                 status_code=401)
         return render(request, "error.html", {
             "code": 401,
@@ -1467,7 +1483,9 @@ def create_app(
     @app.exception_handler(StarletteHTTPException)
     async def http_error(request: Request, exc: StarletteHTTPException) -> Response:
         path = request.url.path
-        wants_html = not path.startswith(("/api/", "/static/")) and exc.status_code in (403, 404)
+        if exc.status_code == 404 and wants_spa(request):
+            return index_response()  # client-side route of the new UI (/deal/123, /settings/ai, …)
+        wants_html = not path.startswith(("/api/", "/static/", "/app/")) and exc.status_code in (403, 404)
         if not wants_html:
             return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=getattr(exc, "headers", None))
         title = "Страница не найдена" if exc.status_code == 404 else "Доступ запрещён"
@@ -1475,7 +1493,7 @@ def create_app(
         return render(request, "error.html", {"code": exc.status_code, "title": title, "message": message}, exc.status_code)
 
     # ================================================================= pages
-    @app.get("/", response_class=HTMLResponse)
+    @app.get(CLASSIC_PREFIX, response_class=HTMLResponse)
     async def dashboard(request: Request) -> HTMLResponse:
         params = request.query_params
         filters = DealFilters.from_params(params)
@@ -1511,7 +1529,7 @@ def create_app(
             "editable": app.state.config_path is not None,
         })
 
-    @app.get("/deal/{ad_id}", response_class=HTMLResponse)
+    @app.get(CLASSIC_PREFIX + "/deal/{ad_id}", response_class=HTMLResponse)
     async def deal_page(request: Request, ad_id: str) -> HTMLResponse:
         deal = db.get_deal(ad_id)
         if deal is None:
@@ -1533,7 +1551,7 @@ def create_app(
             "ai_enabled": app.state.config.ai.enabled,
         })
 
-    @app.get("/searches", response_class=HTMLResponse)
+    @app.get(CLASSIC_PREFIX + "/searches", response_class=HTMLResponse)
     async def searches_page(request: Request) -> HTMLResponse:
         return _render_searches(request)
 
@@ -1585,7 +1603,7 @@ def create_app(
             "builtin_categories": builtin_categories(),
         }, status_code)
 
-    @app.get("/status", response_class=HTMLResponse)
+    @app.get(CLASSIC_PREFIX + "/status", response_class=HTMLResponse)
     async def status_page(request: Request) -> HTMLResponse:
         cfg: AppConfig = app.state.config
         runs = db.list_runs(limit=30)
@@ -1691,7 +1709,7 @@ def create_app(
                        "share": RESULT_PAGES_SHARE},
         }, status_code)
 
-    @app.get("/setup", response_class=HTMLResponse)
+    @app.get(CLASSIC_PREFIX + "/setup", response_class=HTMLResponse)
     async def setup_page(request: Request) -> HTMLResponse:
         params = request.query_params
         cfg: AppConfig = app.state.config
@@ -1709,7 +1727,7 @@ def create_app(
         categories = await _categories_for(answers.location, answers.radius_km, live=live)
         return _render_setup(request, answers, values, categories, refreshed=live)
 
-    @app.post("/setup", response_class=HTMLResponse)
+    @app.post(CLASSIC_PREFIX + "/setup", response_class=HTMLResponse)
     async def setup_save(request: Request) -> Response:
         path = _require_editable()
         cfg: AppConfig = app.state.config
@@ -1740,7 +1758,7 @@ def create_app(
         if interval != cfg.general.interval_minutes:
             _write_settings({"general.interval_minutes": interval})
         _persist(merged)
-        return RedirectResponse("/searches?" + urlencode({"setup": len(generated)}), status_code=303)
+        return RedirectResponse(f"{CLASSIC_PREFIX}/searches?" + urlencode({"setup": len(generated)}), status_code=303)
 
     # ---------------------------------------------------------------- settings
     def _write_settings(updates: dict[str, Any], env: dict[str, str] | None = None) -> None:
@@ -1799,11 +1817,11 @@ def create_app(
             "has_capital": hasattr(pricing, "max_capital"),
         }, status_code)
 
-    @app.get("/settings", response_class=HTMLResponse)
+    @app.get(CLASSIC_PREFIX + "/settings", response_class=HTMLResponse)
     async def settings_page(request: Request) -> HTMLResponse:
         return _render_settings(request)
 
-    @app.post("/settings/ai", response_class=HTMLResponse)
+    @app.post(CLASSIC_PREFIX + "/settings/ai", response_class=HTMLResponse)
     async def settings_ai(request: Request) -> Response:
         _require_editable()
         form = await request.form()
@@ -1824,9 +1842,9 @@ def create_app(
             base_url = LMSTUDIO_URL if provider == "openai" else OLLAMA_URL
         _write_settings({"ai.enabled": bool(form.get("enabled")), "ai.provider": provider,
                          "ai.base_url": base_url, "ai.model": model})
-        return RedirectResponse("/settings?saved=ai#ai", status_code=303)
+        return RedirectResponse(f"{CLASSIC_PREFIX}/settings?saved=ai#ai", status_code=303)
 
-    @app.post("/settings/telegram", response_class=HTMLResponse)
+    @app.post(CLASSIC_PREFIX + "/settings/telegram", response_class=HTMLResponse)
     async def settings_telegram(request: Request) -> Response:
         path = _require_editable()
         form = await request.form()
@@ -1855,9 +1873,9 @@ def create_app(
             updates["notifications.telegram.chat_id"] = "${TELEGRAM_CHAT_ID}"
         _write_settings(updates, env)
         log.info("Telegram settings saved (%s)", path.parent / ".env")
-        return RedirectResponse("/settings?saved=telegram#telegram", status_code=303)
+        return RedirectResponse(f"{CLASSIC_PREFIX}/settings?saved=telegram#telegram", status_code=303)
 
-    @app.post("/settings/pricing", response_class=HTMLResponse)
+    @app.post(CLASSIC_PREFIX + "/settings/pricing", response_class=HTMLResponse)
     async def settings_pricing(request: Request) -> Response:
         _require_editable()
         form = await request.form()
@@ -1889,7 +1907,7 @@ def create_app(
         if hasattr(pricing, "vb_expected_discount") and vb is not None:
             updates["pricing.vb_expected_discount"] = round(vb / 100, 4)
         _write_settings(updates)
-        return RedirectResponse("/settings?saved=pricing#pricing", status_code=303)
+        return RedirectResponse(f"{CLASSIC_PREFIX}/settings?saved=pricing#pricing", status_code=303)
 
     @app.get("/api/ai/check")
     async def api_ai_check() -> dict[str, Any]:
@@ -1937,7 +1955,7 @@ def create_app(
         _persist(current)
         return []
 
-    @app.post("/searches/save", response_class=HTMLResponse)
+    @app.post(CLASSIC_PREFIX + "/searches/save", response_class=HTMLResponse)
     async def searches_save(request: Request) -> Response:
         _require_editable()
         form = await request.form()
@@ -1947,9 +1965,9 @@ def create_app(
             errors = _upsert_search(original, search)
         if errors or search is None:
             return _render_searches(request, form_values=values, errors=errors, editing=original, status_code=400)
-        return RedirectResponse("/searches?" + urlencode({"saved": search.name}), status_code=303)
+        return RedirectResponse(f"{CLASSIC_PREFIX}/searches?" + urlencode({"saved": search.name}), status_code=303)
 
-    @app.post("/searches/delete")
+    @app.post(CLASSIC_PREFIX + "/searches/delete")
     async def searches_delete(request: Request) -> Response:
         _require_editable()
         name = str((await request.form()).get("name") or "")
@@ -1958,9 +1976,9 @@ def create_app(
         if len(remaining) == len(current):
             raise HTTPException(404, f"Поиск «{name}» не найден")
         _persist(remaining)
-        return RedirectResponse("/searches?" + urlencode({"deleted": name}), status_code=303)
+        return RedirectResponse(f"{CLASSIC_PREFIX}/searches?" + urlencode({"deleted": name}), status_code=303)
 
-    @app.post("/searches/toggle")
+    @app.post(CLASSIC_PREFIX + "/searches/toggle")
     async def searches_toggle(request: Request) -> Response:
         _require_editable()
         name = str((await request.form()).get("name") or "")
@@ -1972,7 +1990,7 @@ def create_app(
         else:
             raise HTTPException(404, f"Поиск «{name}» не найден")
         _persist(current)
-        return RedirectResponse("/searches?" + urlencode({"toggled": name}), status_code=303)
+        return RedirectResponse(f"{CLASSIC_PREFIX}/searches?" + urlencode({"toggled": name}), status_code=303)
 
     # =================================================================== API
     @app.get("/api/deals")
@@ -2117,4 +2135,9 @@ def create_app(
         _persist(remaining)
         return {"deleted": name}
 
+    # ------------------------------------------------------------ JSON API v1 (SPA)
+    from .api import mount_api_v1
+
+    mount_api_v1(app, category_discovery=category_discovery, ai_probe=ai_probe,
+                 bind_host=bind_host if bind_host is not None else config.web.host)
     return app

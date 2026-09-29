@@ -32,6 +32,7 @@ log = logging.getLogger(__name__)
 LIVE_SECTIONS = ("general", "pricing", "ai", "notifications", "ebay", "web")
 ONBOARDING_KEY = "onboarding"
 ONBOARDING_DRAFT_KEY = "onboarding:draft"
+BOOTSTRAPPED_KEY = "onboarding:bootstrapped"  # config.yaml was created by `run` for the web onboarding
 DEMO_RUNS_KEY = "demo:run_ids"
 ONBOARDING_STEPS: tuple[tuple[str, str, bool], ...] = (  # key, title, required
     ("location", "Где искать", True),
@@ -369,14 +370,15 @@ def parse_since(value: str | None) -> datetime | None:
     """'24h' / '7d' / '90m' / ISO timestamp -> aware datetime (None when empty/invalid)."""
     from datetime import timedelta, timezone
 
-    text = (value or "").strip().lower()
+    raw = (value or "").strip()
+    text = raw.lower()
     if not text or text in ("all", "всё", "все"):
         return None
     units = {"m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
     if text[-1] in units and text[:-1].replace(".", "", 1).isdigit():
         return utcnow() - timedelta(seconds=float(text[:-1]) * units[text[-1]])
     try:
-        dt = datetime.fromisoformat(text.replace("z", "+00:00"))
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         return None
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)

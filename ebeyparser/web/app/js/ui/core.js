@@ -1,7 +1,8 @@
 // Basic building blocks: Button, IconButton, Card, Badge, Chip, Spinner, Avatar, Glyph,
 // Money, Tooltip, Kbd, Divider, StatusDot.
-import { html, cx } from "../lib/html.js";
+import { html, cx, useState, useRef, useEffect } from "../lib/html.js";
 import { money } from "../lib/format.js";
+import { hue } from "../lib/tones.js";
 import { Icon } from "./icons.js";
 
 export function Spinner({ size = 18, class: cls = "" }) {
@@ -9,11 +10,13 @@ export function Spinner({ size = 18, class: cls = "" }) {
 }
 
 /**
- * <Button variant="primary|secondary|ghost|danger|soft" size="sm|md|lg" icon="plus" loading block href="/x">
+ * <Button variant="primary|secondary|ghost|danger|danger-ghost|tinted|link" size="sm|md|lg" icon="plus" loading block href="/x">
+ * variant="tinted" takes tone="green|amber|violet|red|blue|neutral" (contextual actions inside hue blocks).
  * With `href` it renders a link (internal links are routed without reload; external ones open a new tab).
  */
 export function Button({
   variant = "secondary",
+  tone,
   size = "md",
   icon,
   iconRight,
@@ -26,7 +29,7 @@ export function Button({
   children,
   ...rest
 }) {
-  const classes = cx("btn", `btn--${variant}`, `btn--${size}`, block && "btn--block", loading && "is-loading", cls);
+  const classes = cx("btn", `btn--${variant}`, `btn--${size}`, tone && `tone-${tone}`, block && "btn--block", loading && "is-loading", cls);
   const iconSize = size === "sm" ? 16 : size === "lg" ? 20 : 18;
   const inner = html`
     ${loading ? html`<${Spinner} size=${iconSize} class="btn__spinner" />` : icon && html`<${Icon} name=${icon} size=${iconSize} />`}
@@ -69,7 +72,7 @@ export function IconButton({ icon, label, size = "md", variant = "ghost", badge,
 /** Surface container. `interactive` adds hover lift; `as="a"` + href for clickable cards. */
 export function Card({ as = "div", interactive = false, padded = true, tone, class: cls = "", children, ...rest }) {
   const Tag = as;
-  return html`<${Tag} class=${cx("card", padded && "card--padded", interactive && "card--interactive", tone && `card--${tone}`, cls)} ...${rest}>
+  return html`<${Tag} class=${cx("card", padded && "card--padded", interactive && "card--interactive", tone && `card--${hue(tone)}`, cls)} ...${rest}>
     ${children}
   <//>`;
 }
@@ -91,12 +94,12 @@ export function CardHeader({ title, subtitle, icon, tone = "neutral", actions, c
  * variant: soft (default) | solid | outline
  */
 export function Badge({ tone = "neutral", variant = "soft", icon, size = "md", class: cls = "", children, ...rest }) {
-  return html`<span class=${cx("badge", `badge--${tone}`, `badge--${variant}`, `badge--${size}`, cls)} ...${rest}>
+  return html`<span class=${cx("badge", `badge--${hue(tone)}`, `badge--${variant}`, `badge--${size}`, cls)} ...${rest}>
     ${icon && html`<${Icon} name=${icon} size=${size === "sm" ? 12 : 14} stroke=${2.25} />`}${children}
   </span>`;
 }
 
-/** Selectable pill (filters, multi-select). */
+/** Filter chip (§6.8.5): 32 px pill; selected = ink with a leading check. */
 export function Chip({ selected = false, icon, count, onClick, disabled, class: cls = "", children, ...rest }) {
   return html`<button
     type="button"
@@ -106,7 +109,7 @@ export function Chip({ selected = false, icon, count, onClick, disabled, class: 
     disabled=${disabled}
     ...${rest}
   >
-    ${icon && html`<${Icon} name=${icon} size=${16} />`}
+    ${selected && !icon ? html`<${Icon} name="check" size=${14} stroke=${2.5} class="chip__check" />` : icon && html`<${Icon} name=${icon} size=${16} />`}
     <span>${children}</span>
     ${count != null && html`<span class="chip__count">${count}</span>`}
   </button>`;
@@ -115,7 +118,7 @@ export function Chip({ selected = false, icon, count, onClick, disabled, class: 
 /** Colored rounded tile with an icon — for list rows, cards, onboarding steps. */
 export function Glyph({ icon, tone = "neutral", size = "md", class: cls = "" }) {
   const px = size === "sm" ? 16 : size === "lg" ? 26 : size === "xl" ? 32 : 20;
-  return html`<span class=${cx("glyph", `glyph--${tone}`, `glyph--${size}`, cls)} aria-hidden="true"><${Icon} name=${icon} size=${px} /></span>`;
+  return html`<span class=${cx("glyph", `glyph--${hue(tone)}`, `glyph--${size}`, cls)} aria-hidden="true"><${Icon} name=${icon} size=${px} /></span>`;
 }
 
 export function Avatar({ name = "", src, size = 36, tone }) {
@@ -137,7 +140,7 @@ export function Avatar({ name = "", src, size = 36, tone }) {
 
 /** Price with tabular digits. tone="profit" colours it green, sign adds "+". */
 export function Money({ value, sign = false, cents = false, tone, size, class: cls = "" }) {
-  const auto = tone === "auto" ? (value > 0 ? "profit" : value < 0 ? "danger" : "neutral") : tone;
+  const auto = tone === "auto" ? (value > 0 ? "green" : value < 0 ? "red" : "neutral") : tone && hue(tone);
   return html`<span class=${cx("money", auto && `text-${auto}`, size && `money--${size}`, cls)}>${money(value, { sign, cents })}</span>`;
 }
 
@@ -160,7 +163,7 @@ export function Divider({ label }) {
 
 /** Coloured dot, optionally pulsing (live status). tone: profit | haggle | danger | info | neutral */
 export function StatusDot({ tone = "neutral", pulse = false }) {
-  return html`<span class=${cx("status-dot", `status-dot--${tone}`, pulse && "is-pulsing")} aria-hidden="true"></span>`;
+  return html`<span class=${cx("status-dot", `status-dot--${hue(tone)}`, pulse && "is-pulsing")} aria-hidden="true"></span>`;
 }
 
 /** External link that opens in a new tab with an arrow icon. */
@@ -168,4 +171,59 @@ export function ExternalLink({ href, children, class: cls = "" }) {
   return html`<a class=${cx("ext-link", cls)} href=${href} target="_blank" rel="noopener noreferrer"
     >${children}<${Icon} name="arrow-up-right" size=${14} /></a
   >`;
+}
+
+/**
+ * «?» help popover (§6.8.16): click-triggered (works on touch), closes on outside click / Esc.
+ *   <HelpTip title="Что такое ROI">Сколько заработаешь на каждый вложенный евро…</HelpTip>
+ */
+export function HelpTip({ title, children, align = "center", label = "Подробнее" }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    const onDown = (e) => ref.current && !ref.current.contains(e.target) && setOpen(false);
+    const onKey = (e) => e.key === "Escape" && setOpen(false);
+    document.addEventListener("pointerdown", onDown, true);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onDown, true);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+  return html`<span class="popover-anchor" ref=${ref}>
+    <button type="button" class="help-btn" aria-label=${title || label} aria-expanded=${open} onClick=${(e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setOpen(!open);
+    }}>
+      <${Icon} name="circle-question-mark" size=${16} />
+    </button>
+    ${open &&
+    html`<span class=${cx("popover", align !== "center" && `popover--${align}`)} role="dialog">
+      ${title && html`<span class="popover__title">${title}</span>`}
+      <span class="popover__body">${children}</span>
+    </span>`}
+  </span>`;
+}
+
+/** Copy text to the clipboard with a check-mark confirmation (1.5 s). */
+export function CopyButton({ text, label = "Скопировать", done = "Скопировано", size = "sm", variant = "secondary", icon = "copy", onCopied }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(typeof text === "function" ? text() : text);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = typeof text === "function" ? text() : text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    setCopied(true);
+    onCopied && onCopied();
+    setTimeout(() => setCopied(false), 1500);
+  };
+  return html`<${Button} size=${size} variant=${variant} icon=${copied ? "check" : icon} onClick=${copy}>${copied ? done : label}<//>`;
 }

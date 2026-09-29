@@ -14,6 +14,8 @@ const dayRu = (day) => (DAYS.find((d) => d.value === day) || DAYS[0]).ru;
 export function shortTitle(d) {
   const ai = d && d.ai && d.ai.product;
   let t = String(ai || (d && d.title) || "den Artikel")
+    .replace(/\s*[([][^)\]]*[)\]]/g, "")
+    .replace(/\s+[–—-]\s+.*$/, "")
     .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, "")
     .replace(/[!*#|]+/g, " ")
     .replace(/\s+/g, " ")
@@ -23,6 +25,8 @@ export function shortTitle(d) {
     const cut = t.lastIndexOf(" ");
     t = (cut > 20 ? t.slice(0, cut) : t.slice(0, 40)).replace(/[\s,.;:–-]+$/, "");
   }
+  const open = t.lastIndexOf("(");
+  if (open > 10 && t.indexOf(")", open) < 0) t = t.slice(0, open).trim();
   return t;
 }
 
@@ -104,11 +108,12 @@ export const ADDONS = {
 /** Which template to start with (brief §7.4 "Composer logic"). */
 export function defaultTemplate(d) {
   if (!d) return "available";
-  if (d.action === "haggle") return "offer";
-  if (d.action === "bid") return "condition";
-  if (d.action === "buy" && d.price != null && d.max_buy_price != null && d.price <= d.max_buy_price * 0.8) return "buy_now";
+  const action = d.action || (d.verdict === "buy" ? "buy" : "");
+  if (action === "haggle") return "offer";
+  if (action === "bid") return "condition";
+  if (action === "buy" && d.price != null && d.max_buy_price != null && d.price <= d.max_buy_price * 0.8) return "buy_now";
   if (d.negotiable && d.offer_price != null) return "offer";
-  if (d.action === "buy") return "buy_now";
+  if (action === "buy") return "buy_now";
   if (d.price != null && d.max_buy_price != null && d.max_buy_price < d.price) return "offer";
   return "available";
 }

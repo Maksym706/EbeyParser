@@ -31,11 +31,12 @@ export function toast(input, extra = {}) {
     message: opts.message || "",
     action: opts.action || null,
     icon: opts.icon,
-    duration: opts.duration ?? (opts.kind === "error" ? 7000 : opts.kind === "loading" ? 0 : 4500),
+    // §6.8.10: 4 s plain, 6 s with an action, 8 s for errors; loading toasts stay until replaced
+    duration: opts.duration ?? (opts.kind === "loading" ? 0 : opts.kind === "error" ? 8000 : opts.action ? 6000 : 4000),
   };
   store.update((s) => {
     const rest = s.items.filter((t) => t.id !== id);
-    return { items: [...rest, item].slice(-4) };
+    return { items: [...rest, item].slice(-3) };
   });
   return id;
 }

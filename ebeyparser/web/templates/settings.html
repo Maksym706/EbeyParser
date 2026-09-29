@@ -8,8 +8,8 @@
   </div>
 </section>
 <nav class="subnav" aria-label="Настройка">
-  <a href="/setup">{{ icon('search') }}Что искать</a>
-  <a href="/settings" class="active" aria-current="page">{{ icon('sliders') }}Нейросеть, уведомления, выгода</a>
+  <a href="/classic/setup">{{ icon('search') }}Что искать</a>
+  <a href="/classic/settings" class="active" aria-current="page">{{ icon('sliders') }}Нейросеть, уведомления, выгода</a>
 </nav>
 
 {% if notice or errors or not editable %}
@@ -22,7 +22,7 @@
 
 <div class="settings-grid">
   {# --------------------------------------------------------------- AI #}
-  <form class="card settings-card" id="ai" method="post" action="/settings/ai" novalidate>
+  <form class="card settings-card" id="ai" method="post" action="/classic/settings/ai" novalidate>
     <div class="status-card-head">
       <span class="status-icon">{{ icon('cpu') }}</span>
       <div class="grow"><h2>Локальная нейросеть</h2><div class="muted small">Смотрит фото и описание каждого перспективного объявления</div></div>
@@ -57,7 +57,7 @@
   </form>
 
   {# --------------------------------------------------------- Telegram #}
-  <form class="card settings-card" id="telegram" method="post" action="/settings/telegram" novalidate autocomplete="off">
+  <form class="card settings-card" id="telegram" method="post" action="/classic/settings/telegram" novalidate autocomplete="off">
     <div class="status-card-head">
       <span class="status-icon">{{ icon('send') }}</span>
       <div class="grow"><h2>Telegram</h2><div class="muted small">Сообщение с фото и кнопкой, как только найдётся выгодное</div></div>
@@ -86,7 +86,7 @@
   </form>
 
   {# ---------------------------------------------------------- pricing #}
-  <form class="card settings-card" id="pricing" method="post" action="/settings/pricing" novalidate>
+  <form class="card settings-card" id="pricing" method="post" action="/classic/settings/pricing" novalidate>
     <div class="status-card-head">
       <span class="status-icon">{{ icon('wallet') }}</span>
       <div class="grow"><h2>Что считать выгодным</h2><div class="muted small">Для перепродажи; для поисков «для себя» считается экономия</div></div>

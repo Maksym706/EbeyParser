@@ -180,7 +180,7 @@ async def sse_stream(
                 if wait <= 0:
                     return
             try:
-                event = await asyncio.wait_for(queue.get(), timeout=wait)
+                item: Event | None = await asyncio.wait_for(queue.get(), timeout=wait)
             except asyncio.TimeoutError:
                 if deadline is not None and loop.time() >= deadline:
                     return
@@ -188,12 +188,12 @@ async def sse_stream(
                     return
                 yield ": ping\n\n"
                 continue
-            if event is None:
+            if item is None:
                 return
-            if event.id <= seen:
+            if item.id <= seen:
                 continue
-            seen = event.id
-            yield event.as_sse()
+            seen = item.id
+            yield item.as_sse()
             sent += 1
             if max_events and sent >= max_events:
                 return

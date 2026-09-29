@@ -4,10 +4,12 @@
 //   useEffect(() => onEvent("deal_found", (data) => reload()), []);
 //   onEvent("*", ({ type, data }) => …)          // every event
 //
-// Event types (see ebeyparser/web/api/events.py): ready, run_started, run_finished,
+// Event types (see ebeyparser/web/api/events.py): ready, run_started, run_progress, run_finished,
 // deal_found {ad_id, verdict, action, score, card}, deal_updated {ad_id, card},
-// health_alert {kind, text, at}, settings_changed, searches_changed, monitor_paused,
-// monitor_resumed, job_finished (a Job). Plus the local pseudo-event "connected".
+// health_alert {kind, text, at}, settings_changed, searches_changed, data_changed,
+// monitor_paused, monitor_resumed, job_progress, job_finished (a Job).
+// Plus the local pseudo-event "connected". EventSource only delivers named events that have a
+// listener — every name in KNOWN gets one; add new server event names here.
 // Reconnects with backoff; handlers get (data, type).
 import { API_BASE, authToken } from "./api.js";
 import { appStore } from "./store.js";
@@ -15,14 +17,17 @@ import { appStore } from "./store.js";
 const KNOWN = [
   "ready",
   "run_started",
+  "run_progress",
   "run_finished",
   "deal_found",
   "deal_updated",
   "health_alert",
   "settings_changed",
   "searches_changed",
+  "data_changed",
   "monitor_paused",
   "monitor_resumed",
+  "job_progress",
   "job_finished",
 ];
 

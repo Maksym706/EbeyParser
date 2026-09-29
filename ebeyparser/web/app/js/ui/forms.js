@@ -163,12 +163,13 @@ export function Checkbox({ checked, onChange, label, description, disabled }) {
 }
 
 /**
- * Range slider with a floating value bubble.
- *   <Slider value={30} steps={[5,10,20,30,50,100]} format={(v) => `${v} км`} onChange={set} />
- *   <Slider value={400} min={50} max={2000} step={50} format={money} onChange={set} onCommit={save} />
- * `steps` makes the slider snap to those values (evenly spaced on the track).
+ * Range slider (§6.8.4) with a value bubble above the thumb.
+ *   <Slider value={30} steps={[0,5,10,20,30,50,100]} format={(v) => `${v} км`} onChange={set} bubble="always" />
+ *   <Slider value={400} min={50} max={1500} step={10} format={money} onChange={set} onCommit={save} tone="green" />
+ * `steps` snaps to those values (evenly spaced, with 4 px ticks). bubble: "drag" (default) | "always" | "none".
+ * tone: ink (default) | green | amber | violet | blue. Keyboard: arrows step, PgUp/PgDn ×5 (native).
  */
-export function Slider({ value, onChange, onCommit, min = 0, max = 100, step = 1, steps, format = (v) => v, marks, tone = "brand", label, disabled, bubble = "always" }) {
+export function Slider({ value, onChange, onCommit, min = 0, max = 100, step = 1, steps, format = (v) => v, marks, tone = "ink", label, disabled, bubble = "drag" }) {
   const discrete = Array.isArray(steps) && steps.length > 1;
   const idx = discrete ? Math.max(0, nearestIndex(steps, value)) : null;
   const rmin = discrete ? 0 : min;
@@ -177,10 +178,17 @@ export function Slider({ value, onChange, onCommit, min = 0, max = 100, step = 1
   const pct = rmax === rmin ? 0 : ((rval - rmin) / (rmax - rmin)) * 100;
   const toValue = (raw) => (discrete ? steps[Number(raw)] : Number(raw));
   const [dragging, setDragging] = useState(false);
-  const showMarks = marks || (discrete ? steps.map((s) => ({ value: s, label: format(s, true) })) : null);
-  return html`<div class=${cx("slider", `slider--${tone}`, dragging && "is-dragging", disabled && "is-disabled", bubble === "always" && "has-bubble")} style=${{ "--pos": `${pct}%`, "--pct": pct / 100 }}>
+  const showMarks = marks === false ? null : marks || (discrete ? steps.map((s) => ({ value: s, label: format(s, true) })) : null);
+  return html`<div
+    class=${cx("slider", `slider--${tone}`, dragging && "is-dragging", disabled && "is-disabled", bubble === "always" && "has-bubble")}
+    style=${{ "--pos": `${pct}%`, "--pct": pct / 100 }}
+  >
     <div class="slider__track-wrap">
       ${bubble !== "none" && html`<output class="slider__bubble" aria-hidden="true">${format(value)}</output>`}
+      ${discrete &&
+      html`<span class="slider__ticks" aria-hidden="true">
+        ${steps.map((_, i) => html`<span class=${cx("slider__tick", i <= idx && "is-filled")} style=${{ left: `${(i / (steps.length - 1)) * 100}%` }}></span>`)}
+      </span>`}
       <input
         type="range"
         class="slider__input"
@@ -195,6 +203,7 @@ export function Slider({ value, onChange, onCommit, min = 0, max = 100, step = 1
         onChange=${(e) => onCommit && onCommit(toValue(e.currentTarget.value))}
         onPointerDown=${() => setDragging(true)}
         onPointerUp=${() => setDragging(false)}
+        onPointerCancel=${() => setDragging(false)}
         onBlur=${() => setDragging(false)}
       />
     </div>
@@ -401,3 +410,89 @@ export function ChoiceCards({ value, onChange, options = [], columns = 3 }) {
   </div>`;
 }
 
+
+/**
+ * Token input for word lists (§6.8.2 chip input): Enter or comma adds, paste splits by comma/newline,
+ * Backspace on an empty field removes the last token.
+ *   <ChipInput value={["defekt","bastler"]} onChange={setWords} suggestions={["suche","tausch"]} />
+ */
+export function ChipInput({ value = [], onChange, placeholder = "Добавь слово и нажми Enter", suggestions = [], max = 50 }) {
+  const [text, setText] = useState("");
+  const inputRef = useRef(null);
+  const add = (raw) => {
+    const words = String(raw)
+      .split(/[,\n;]+/)
+      .map((w) => w.trim())
+      .filter(Boolean);
+    if (!words.length) return;
+    const next = [...value];
+    for (const w of words) if (!next.some((x) => x.toLowerCase() === w.toLowerCase()) && next.length < max) next.push(w);
+    onChange(next);
+    setText("");
+  };
+  const remove = (i) => onChange(value.filter((_, j) => j !== i));
+  const left = suggestions.filter((s) => !value.some((v) => v.toLowerCase() === s.toLowerCase()));
+  return html`<div>
+    <div class="chip-input" onClick=${() => inputRef.current && inputRef.current.focus()}>
+      ${value.map(
+        (w, i) => html`<span class="chip-input__token" key=${w}>
+          ${w}
+          <button type="button" aria-label=${`Убрать «${w}»`} onClick=${(e) => {
+            e.stopPropagation();
+            remove(i);
+          }}><${Icon} name="x" size=${12} stroke=${2.5} /></button>
+        </span>`,
+      )}
+      <input
+        ref=${inputRef}
+        value=${text}
+        placeholder=${value.length ? "" : placeholder}
+        onInput=${(e) => {
+          const v = e.currentTarget.value;
+          if (/[,;]/.test(v)) add(v);
+          else setText(v);
+        }}
+        onKeyDown=${(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            add(text);
+          } else if (e.key === "Backspace" && !text && value.length) {
+            remove(value.length - 1);
+          }
+        }}
+        onPaste=${(e) => {
+          const t = (e.clipboardData || window.clipboardData).getData("text");
+          if (/[,\n;]/.test(t)) {
+            e.preventDefault();
+            add(t);
+          }
+        }}
+        onBlur=${() => text.trim() && add(text)}
+      />
+    </div>
+    ${left.length > 0 &&
+    html`<div class="chip-input__suggest">
+      ${left.map((sug) => html`<button type="button" key=${sug} onClick=${() => add(sug)}>+ ${sug}</button>`)}
+    </div>`}
+  </div>`;
+}
+
+/**
+ * Settings row (§4.7): label + helper on the left, control on the right (stacked on phones).
+ *   <SettingRow label="Не больше в час" help="Остальное придёт одним сообщением" error={errors.max}>
+ *     <NumberInput … />
+ *   </SettingRow>
+ * `kind="switch"` keeps a toggle on the right even on phones; `wide` puts the control under the text.
+ */
+export function SettingRow({ label, help, error, tip, kind, wide = false, id, children }) {
+  const auto = useId();
+  const rid = id || auto;
+  return html`<div class=${cx("setting-row", kind === "switch" && "setting-row--switch", wide && "setting-row--wide")}>
+    <div class="setting-row__text">
+      <label class="setting-row__label" for=${rid}>${label}${tip}</label>
+      ${help && html`<div class="setting-row__help">${help}</div>`}
+      ${error && html`<div class="setting-row__error" role="alert"><${Icon} name="circle-alert" size=${14} />${error}</div>`}
+    </div>
+    <div class="setting-row__control">${typeof children === "function" ? children(rid) : children}</div>
+  </div>`;
+}

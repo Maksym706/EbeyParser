@@ -3,6 +3,7 @@
 import { html, cx, useRef } from "../lib/html.js";
 import { Icon } from "./icons.js";
 import { Button, Glyph } from "./core.js";
+import { hue } from "../lib/tones.js";
 
 /** Shimmering placeholder. <Skeleton w="60%" h={14} /> or <Skeleton variant="card" /> */
 export function Skeleton({ w = "100%", h = 14, radius, variant, count = 1, class: cls = "" }) {
@@ -33,7 +34,7 @@ export function Skeleton({ w = "100%", h = 14, radius, variant, count = 1, class
 /** Friendly empty screen with an icon, text and optional action(s). */
 export function EmptyState({ icon = "inbox", tone = "neutral", title, message, action, secondary, compact = false, children }) {
   return html`<div class=${cx("empty", compact && "empty--compact")}>
-    <div class=${cx("empty__art", `empty__art--${tone}`)}>
+    <div class=${cx("empty__art", `empty__art--${hue(tone)}`)}>
       <span class="empty__ring"></span>
       <${Icon} name=${icon} size=${compact ? 24 : 30} />
     </div>
@@ -73,7 +74,7 @@ export function ErrorState({ error, onRetry, compact = false, title }) {
 export function Progress({ value = null, tone = "brand", size = "md", label }) {
   const indeterminate = value === null || value === undefined;
   return html`<div
-    class=${cx("progress", `progress--${tone}`, `progress--${size}`, indeterminate && "is-indeterminate")}
+    class=${cx("progress", `progress--${hue(tone)}`, `progress--${size}`, indeterminate && "is-indeterminate")}
     role="progressbar"
     aria-label=${label}
     aria-valuemin="0"
@@ -88,7 +89,7 @@ export function Progress({ value = null, tone = "brand", size = "md", label }) {
 export function Ring({ value = 0, size = 44, stroke = 4, tone = "brand", children }) {
   const r = (size - stroke) / 2;
   const c = 2 * Math.PI * r;
-  return html`<span class=${cx("ring", `ring--${tone}`)} style=${{ width: size, height: size }}>
+  return html`<span class=${cx("ring", `ring--${hue(tone)}`)} style=${{ width: size, height: size }}>
     <svg width=${size} height=${size} viewBox=${`0 0 ${size} ${size}`} aria-hidden="true">
       <circle class="ring__track" cx=${size / 2} cy=${size / 2} r=${r} stroke-width=${stroke} fill="none" />
       <circle
@@ -135,8 +136,9 @@ export function Checklist({ items = [] }) {
 
 /** Inline callout. tone: info | profit | haggle | danger | neutral | bid */
 export function Banner({ tone = "info", icon, title, children, action, onClose, class: cls = "" }) {
-  const defaultIcon = { info: "info", profit: "circle-check", haggle: "triangle-alert", danger: "circle-alert", neutral: "lightbulb", bid: "gavel" }[tone];
-  return html`<div class=${cx("banner", `banner--${tone}`, cls)} role=${tone === "danger" ? "alert" : "note"}>
+  const h = hue(tone);
+  const defaultIcon = { blue: "info", green: "circle-check", amber: "triangle-alert", red: "circle-alert", neutral: "lightbulb", violet: "gavel" }[h];
+  return html`<div class=${cx("banner", `banner--${h}`, cls)} role=${h === "red" ? "alert" : "note"}>
     <span class="banner__icon"><${Icon} name=${icon || defaultIcon} size=${18} /></span>
     <div class="banner__body">
       ${title && html`<div class="banner__title">${title}</div>`}
@@ -241,9 +243,31 @@ export function KeyValue({ rows = [] }) {
 
 /** Big number with a label (KPI tiles). */
 export function Stat({ label, value, hint, tone, icon }) {
-  return html`<div class=${cx("stat", tone && `stat--${tone}`)}>
+  return html`<div class=${cx("stat", tone && `stat--${hue(tone)}`)}>
     <div class="stat__label">${icon && html`<${Icon} name=${icon} size=${14} />`}${label}</div>
     <div class="stat__value">${value}</div>
     ${hint && html`<div class="stat__hint">${hint}</div>`}
+  </div>`;
+}
+
+/**
+ * Load / limit meter (§6.8.14): 8 px bar, green < 60 %, amber 60–85 %, red > 85 %, optional marker.
+ *   <Meter label="Нагрузка на Kleinanzeigen" value={64} max={150} marker={0.4} hint="Проверка каждые 30 мин — безопасно" />
+ */
+export function Meter({ label, value = 0, max = 100, marker, hint, valueText, tone }) {
+  const ratio = max > 0 ? Math.max(0, Math.min(1, value / max)) : 0;
+  const auto = ratio > 0.85 ? "red" : ratio >= 0.6 ? "amber" : "green";
+  const t = tone || auto;
+  return html`<div class=${cx("meter", `meter--${t}`)}>
+    ${(label || valueText !== false) &&
+    html`<div class="meter__top">
+      <span class="meter__label">${label}</span>
+      <span class="meter__value">${valueText ?? `${Math.round(value)} / ${Math.round(max)}`}</span>
+    </div>`}
+    <div class="meter__track" role="meter" aria-label=${label} aria-valuemin="0" aria-valuemax=${max} aria-valuenow=${value}>
+      <span class="meter__fill" style=${{ width: `${ratio * 100}%` }}></span>
+      ${marker != null && html`<span class="meter__marker" style=${{ left: `${marker * 100}%` }} title="рекомендуемая граница"></span>`}
+    </div>
+    ${hint && html`<div class="meter__hint">${hint}</div>`}
   </div>`;
 }
