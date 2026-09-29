@@ -83,7 +83,8 @@ async def test_email_send_text_uses_the_first_line_as_subject() -> None:
 
 
 async def test_ai_down_is_reported_once_per_six_hours_and_deals_still_arrive_marked() -> None:
-    monitor, db, source, (email,) = build([make_listing("1", "RTX 3080", 300.0)], verdict=DOWN)
+    monitor, db, source, (email,) = build([make_listing("1", "RTX 3080", 300.0)], verdict=DOWN,
+                                          ai={"vision_wait_minutes": 0})  # no waiting for the vision model
     first = await monitor.run_once()
     # the default provider is Ollama: its own hint (LM Studio users get "Developer → Start Server")
     assert any("Нейросеть не отвечает" in t and "Ollama" in t for t in email.texts) and first.health_alerts == 1

@@ -14,6 +14,7 @@ from ..models import DealView
 from ..errors_ru import humanize, status_message
 from .base import NotifyError
 from .render import (
+    SUPER_PREFIX,
     more_deals_phrase,
     deal_web_url,
     deals_count_phrase,
@@ -79,7 +80,7 @@ class TelegramNotifier:
                     await self._sleep(PAUSE_BETWEEN_MESSAGES)
                 first = False
 
-            if title and len(deals) > 1:
+            if title and (len(deals) > 1 or title.startswith(SUPER_PREFIX)):
                 await pause()
                 header = f"<b>{_esc(title)}</b>\n{deals_count_phrase(len(deals))}"
                 if rest:

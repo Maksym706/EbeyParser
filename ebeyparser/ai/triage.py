@@ -207,14 +207,14 @@ def _raw_items(text: str) -> list[dict]:
             return [data]
         values = [v for v in data.values() if isinstance(v, dict)]
         if values and all(_item_like(v) for v in values):  # {"0": {...}, "1": {...}}
-            out = []
+            keyed: list[dict] = []
             for k, v in data.items():
                 if isinstance(v, dict):
                     v = dict(v)
                     if str(k).isdigit() and not any(a in v for a in ("i", "index", "idx")):
                         v["i"] = int(k)
-                    out.append(v)
-            return out
+                    keyed.append(v)
+            return keyed
     if isinstance(data, list):
         return [d for d in data if isinstance(d, dict)]
     # broken / truncated JSON: every complete item-like object anywhere in the text
@@ -657,11 +657,13 @@ class TriageEngine:
             EMA_ALPHA * per_ad + (1 - EMA_ALPHA) * self.stats.sec_per_ad)
 
     async def triage(self, listings: Iterable[Listing], *, deadline: float | None = None,
-                     categories: dict[str, str] | None = None, hints: str = "") -> TriageRun:
+                     categories: dict[str, str] | None = None, hints: str = "",
+                     count_overflow: bool = True) -> TriageRun:
         """Triage `listings` in the given order (put the most important first) until done,
         the `deadline` (engine clock) or the hourly cap. Ads not reached are `overflow`; ads
         the model answered badly get a script_item (in `failed`). An LLMError stops the run
-        (the model is down): what is left is overflow and `error` says why."""
+        (the model is down): what is left is overflow and `error` says why. `count_overflow=False`:
+        a second look at old ads — the ones not reached were counted in their own pass already."""
         queue = [listing for listing in listings]
         run = TriageRun()
         cats = categories or {}
@@ -698,6 +700,46 @@ class TriageEngine:
             if got:
                 self.stats.last_ok_at = now
         run.overflow = [listing.ad_id for listing in queue]
-        self.stats.add(triaged=run.ai_count, overflow=len(run.overflow), failed=len(run.failed),
+        self.stats.add(triaged=run.ai_count, overflow=len(run.overflow) if count_overflow else 0, failed=len(run.failed),
                        seconds=run.seconds, calls=run.calls)
         return run
+
+
+# ---------------------------------------------------------------------------
+# Built-in sample (Settings → Нейросеть → «Проверить разведчика»)
+# ---------------------------------------------------------------------------
+
+_SAMPLE = (
+    ("scout-sample-0", "Alter Rechner vom Dachboden", 120.0, True,
+     "PC von meinem Sohn, lange nicht benutzt. Drin ist eine Grafikkarte RTX 3070, i5 9600k, 16GB RAM. Nur Abholung."),
+    ("scout-sample-1", "Iphne 13 128gb blau", 330.0, False, "Akku 87 %, kleine Kratzer am Rahmen, mit Hülle."),
+    ("scout-sample-2", "Suche PS5 Controller", None, False, "Suche zwei DualSense Controller, zahle bis 60 €."),
+    ("scout-sample-3", "Kinderwagen Bugaboo", 90.0, True, "Gebraucht, voll funktionsfähig."),
+)
+
+
+def sample_ads() -> list[Listing]:
+    return [Listing(ad_id=ad_id, url=f"https://www.kleinanzeigen.de/s-anzeige/{ad_id}", title=title, price=price,
+                    price_text=f"{price:.0f} € VB" if price is not None and vb else (f"{price:.0f} €" if price else "VB"),
+                    negotiable=vb, description=text)
+            for ad_id, title, price, vb, text in _SAMPLE]
+
+
+def check_sample(run: TriageRun) -> dict[str, Any]:
+    """How well the model read the sample: answers, the hidden GPU, the typo, the wanted ad."""
+    items = run.items
+    ai = {k: v for k, v in items.items() if v.is_ai}
+    pc = ai.get("scout-sample-0")
+    phone = ai.get("scout-sample-1")
+    wanted = ai.get("scout-sample-2")
+    found_gpu = pc is not None and any("3070" in c for c in pc.contents + [pc.product])
+    return {
+        "answered": len(ai),
+        "total": len(_SAMPLE),
+        "hidden_gpu": found_gpu,
+        "typo_fixed": phone is not None and "iphone" in normalize(phone.product) and "13" in phone.product,
+        "wanted_seen": wanted is not None and wanted.kind == "wanted",
+        "items": [{"title": title, "kind": ai[ad_id].kind, "product": ai[ad_id].product,
+                   "contents": ai[ad_id].contents, "interest": ai[ad_id].interest, "reason": ai[ad_id].reason}
+                  for ad_id, title, *_ in _SAMPLE if ad_id in ai],
+    }

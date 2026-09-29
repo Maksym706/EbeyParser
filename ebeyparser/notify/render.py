@@ -558,6 +558,18 @@ def deal_headline(deal: DealView) -> str:
     return f"{UNCHECKED_WARNING} · {line}" if info.unchecked else line
 
 
+SUPER_PREFIX = "🔥 Супер-находка"
+
+
+def super_title(deal: DealView) -> str:
+    """Headline of a «Супер-находка» alert: "🔥 Супер-находка: RTX 3080 за 150 € → прибыль ≈ 180 €"."""
+    info = _collect(deal)
+    head = f"{SUPER_PREFIX}: {_clip(info.title, 60)} за {info.price_short}"
+    if info.profit is not None:
+        head += f" → {info.profit_label.lower()} ≈ {format_money(info.profit)}"
+    return head
+
+
 def email_subject(deals: list[DealView]) -> str:
     """"🔥 1 выгодное предложение: RTX 3090 за 450 €" / "🔥 5 выгодных предложений на Kleinanzeigen"."""
     n = len(deals)

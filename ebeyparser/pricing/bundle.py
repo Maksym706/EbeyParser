@@ -9,12 +9,17 @@ conservative lower bound — and only given when enough of the model-numbered pa
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from ..models import Comparable, PriceEstimate
 from .ai_key import ProductRef
 
 MAX_COMPARABLES = 30
+MINOR_CATEGORIES = frozenset({"ram", "ssd", "hdd", "storage"})
+MINOR_WORDS = frozenset({"ram", "ssd", "hdd", "nvme", "netzteil", "psu", "gehaeuse", "gehäuse", "case", "kabel",
+                         "arbeitsspeicher", "festplatte", "monitor", "tastatur", "maus", "lüfter", "luefter"})
+_SIZE_RE = re.compile(r"\b\d+(?:[.,]\d+)?\s*(?:gb|tb|mb|w|watt|mhz|ghz|zoll|\")|\bddr\d\b|\bpcie\s*\d\b|\bm\.2\b")
 
 
 @dataclass
@@ -28,8 +33,14 @@ class Component:
     @property
     def major(self) -> bool:
         """Has a model number ("RTX 3070", "i7 8700k"): a part that can carry real value.
-        "Gehäuse", "Tastatur", "Kabel" are minor and never block a valuation."""
-        return any(ch.isdigit() for ch in self.name) or (self.ref is not None and not self.ref.is_ai)
+        "Gehäuse", "Tastatur", "Kabel", and RAM / SSD / power supplies (their numbers are sizes,
+        not models) are minor and never block a valuation."""
+        if self.ref is not None and self.ref.category in MINOR_CATEGORIES:
+            return False
+        words = _SIZE_RE.sub(" ", self.name.lower())
+        if any(w in words.split() for w in MINOR_WORDS):
+            return False
+        return any(ch.isdigit() for ch in words) or (self.ref is not None and not self.ref.is_ai)
 
     @property
     def value(self) -> float | None:

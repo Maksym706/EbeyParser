@@ -11,10 +11,20 @@ from typing import Any, Iterable, overload
 
 from ...config import AppConfig, SearchConfig
 from ...models import AIVerdict, DealView, Evaluation, Listing, utcnow
+from ...pricing.tiers import TIER_LABELS_RU, deal_tier
 from ...timefmt import local_tz, when_label
 
 # the glossary of the UI (§7.2): Покупай / Подумай / Не выгодно
 VERDICT_LABELS = {"buy": "Покупай", "maybe": "Подумай", "skip": "Не выгодно", "none": "Не оценено"}
+FOUND_BY_LABELS = {"ai_scout": "Нашла нейросеть"}
+SCOUT_REASON_PREFIX = "🔎 Нашла нейросеть: "
+
+
+def scout_reason(ev: Evaluation | None) -> str:
+    """The AI scout's one-line reason ("старый ПК, внутри RTX 3070"), "" if it didn't find this deal."""
+    if ev is None or ev.found_by != "ai_scout":
+        return ""
+    return next((r[len(SCOUT_REASON_PREFIX):] for r in ev.reasons if r.startswith(SCOUT_REASON_PREFIX)), "")
 ACTION_LABELS = {
     "buy": "Брать по цене",
     "haggle": "Торговаться",
@@ -361,6 +371,13 @@ def deal_card(deal: DealView, extras: dict[str, Any] | None = None, *, config: A
         "red_flags": dedupe(ev.red_flags) if ev else [],
         "ai_flags": ai_flags(ev),
         "ai_checked": ev.ai_checked if ev else None,
+        # AI scout: who found it («Нашла нейросеть» badge) and the alert tier («🔥 Супер-находка»)
+        "found_by": (ev.found_by or "script") if ev else None,
+        "found_by_label": FOUND_BY_LABELS.get(ev.found_by, "") if ev else "",
+        "scout_reason": scout_reason(ev),
+        "tier": deal_tier(ev, config.notifications.super_deals if config is not None else None) or None,
+        "tier_label": TIER_LABELS_RU.get(deal_tier(ev, config.notifications.super_deals if config is not None
+                                                   else None), ""),
         "ai_verdict": ev.ai.verdict if ev and ev.ai else None,
         "ai_confidence": rnd(ev.ai.confidence, 2) if ev and ev.ai else None,
         "ai_summary": (ev.ai.reasoning if ev and ev.ai else "") or "",

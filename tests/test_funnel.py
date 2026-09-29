@@ -302,8 +302,10 @@ async def test_best_deals_first_and_alert_right_away():
 async def test_ai_unavailable_means_no_buy_but_a_marked_unchecked_alert():
     # v0.2 final round: the deal stays "maybe" in the DB but is still sent (unchecked_deals),
     # flagged would_buy + ai_checked=False so the renderer marks it "ФОТО НЕ ПРОВЕРЕНЫ ИИ"
+    # (ai.vision_wait_minutes: 0 — no waiting for the vision model; the waiting queue has its own tests)
     down = AIVerdict(verdict="maybe", confidence=0.0, reasoning="LM Studio не отвечает")
-    monitor, db, _, _, _, notifier = build([make_listing("1", "RTX 3080", 300.0)], verdict=down)
+    monitor, db, _, _, _, notifier = build([make_listing("1", "RTX 3080", 300.0)], verdict=down,
+                                           ai={"vision_wait_minutes": 0})
     await monitor.run_once()
     ev = db.get_evaluation("1")
     assert ev.ai_checked is False and ev.verdict == "maybe" and ev.would_buy
@@ -312,7 +314,8 @@ async def test_ai_unavailable_means_no_buy_but_a_marked_unchecked_alert():
     off = parse_config({"general": {"baseline_first_run": False}, "searches": [{"name": "GPU", "query": "rtx 3080"}],
                         "notifications": {"unchecked_deals": False}})
     monitor, db, _, _, _, notifier = build([make_listing("1", "RTX 3080", 300.0)], verdict=down,
-                                           notifications=off.notifications.model_dump())
+                                           notifications=off.notifications.model_dump(),
+                                           ai={"vision_wait_minutes": 0})
     await monitor.run_once()
     assert notifier.sent == []
 

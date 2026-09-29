@@ -172,6 +172,13 @@ async def health(ai: bool = Query(True, description="проверять нейр
     if ai_info and ai_info.get("ok") is False:
         add("error", f"{AI_DOWN_RU}. {ai_info.get('error_ru') or ''}".strip(),
             {"label_ru": "Настройки нейросети", "href": "/settings/ai"}, str(ai_info.get("details") or ""))
+    scout = mon.get("scout") or {}
+    if scout.get("enabled") and scout.get("state") == "down":
+        add("warn", scout.get("text_ru") or "Разведчик не отвечает", {"label_ru": "Настройки нейросети",
+                                                                       "href": "/settings/ai"})
+    if (scout.get("vision_queue") or {}).get("waiting"):  # the photo model is offline: deals wait for it
+        add("warn", f"{scout['vision_queue']['text_ru']} — нейросеть для фото сейчас не отвечает",
+            {"label_ru": "Настройки нейросети", "href": "/settings/ai"})
     if not mon["available"]:
         restart = callable(getattr(ctx.app.state, "restart_callback", None))
         add("warn", "Фоновые проверки выключены — перезапусти программу, и они включатся сами",
@@ -223,6 +230,7 @@ async def health(ai: bool = Query(True, description="проверять нейр
         "uptime_seconds": int((utcnow() - ctx.started_at).total_seconds()),
         "monitor": {k: v for k, v in mon.items() if k != "http"},
         "ai": ai_info,
+        "scout": mon.get("scout"),
         "sites": sites,
         "cooldown": cooldown,
         "ebay": {"configured": ctx.config.ebay.configured, "marketplace_id": ctx.config.ebay.marketplace_id},

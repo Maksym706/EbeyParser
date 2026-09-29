@@ -4,11 +4,15 @@ Event types (the SSE `event:` field; `data:` is JSON):
   ready            first message of every stream: {"version", "last_event_id", "server_time"}
   run_started      {"run_id", "started_at", "searches"}
   run_finished     the RunSummary of the pass
-  deal_found       {"ad_id", "search_name", "verdict", "action", "score", "card": DealCard}
+  deal_found       {"ad_id", "search_name", "title", "verdict", "action", "score", "found_by" ("script" |
+                   "ai_scout"), "tier" (super|deal|unchecked|maybe|skip), "listing", "evaluation", "card": DealCard}
   health_alert     {"kind", "text", "text_ru" (no "⚠", for a toast), "at", "at_label" ("21:34", user's zone)}
   settings_changed {"sections": [...], "keys": [...]}
   searches_changed {"count", "ids"}
-  deal_updated     {"ad_id", "card": DealCard}
+  deal_updated     {"ad_id", "card": DealCard} (+ the deal_found keys when the monitor re-checked it, e.g. the
+                   vision model came back online and checked the photos)
+  project_updated  {"id", "reason", "card": ProjectCard | null, "ad_id"?, "alert"?} («Сборки»: a build changed,
+                   got a better offer or sent an alert; reason: created|updated|tracking|bought|offer|run|alert|deleted)
   monitor_paused / monitor_resumed   {"paused": bool}
   job_progress     {"id", "kind", "stage", "text_ru", "ad_id"} (a step of a running job)
   job_finished     a Job (see jobs.py)
@@ -41,7 +45,7 @@ RETRY_MS = 3000
 EVENT_TYPES = (
     "ready", "run_started", "run_finished", "deal_found", "health_alert", "settings_changed",
     "searches_changed", "deal_updated", "monitor_paused", "monitor_resumed", "job_progress", "job_finished",
-    "run_progress",
+    "run_progress", "project_updated",
 )
 
 
@@ -79,7 +83,13 @@ class EventHub:
         self._next_id = 1
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._listeners: list[Any] = []  # in-process consumers (e.g. build-project alerts), called on publish
         self.closed = False
+
+    def add_listener(self, listener: Any) -> None:
+        """listener(event) is called synchronously for every published event; it must be quick
+        (schedule real work) — a failing listener is logged and never breaks publishing."""
+        self._listeners.append(listener)
 
     @property
     def last_id(self) -> int:
@@ -99,6 +109,11 @@ class EventHub:
             loop.call_soon_threadsafe(self._deliver, event)
         else:
             self._deliver(event)
+        for listener in list(self._listeners):
+            try:
+                listener(event)
+            except Exception:  # noqa: BLE001 - a consumer must never break publishing
+                log.exception("event listener failed (%s)", type_)
         return event
 
     def _deliver(self, event: Event | None) -> None:

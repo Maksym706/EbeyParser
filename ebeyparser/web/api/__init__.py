@@ -30,6 +30,7 @@ TAGS = [
     {"name": "monitor", "description": "Проверки, пауза, события (SSE), задачи, проверка ссылки"},
     {"name": "deals", "description": "Лента, сделка, «Мои сделки», статистика, экспорт"},
     {"name": "system", "description": "Состояние, логи, демо, резервная копия, сброс данных"},
+    {"name": "projects", "description": "Сборки: план из б/у деталей, отслеживание, лучшие предложения, покупки"},
 ]
 
 
@@ -44,6 +45,9 @@ def build_router() -> APIRouter:
     router.include_router(routes_monitor.router, tags=["monitor"])
     router.include_router(routes_deals.router, tags=["deals"])
     router.include_router(routes_system.router, tags=["system"])
+    from . import routes_projects
+
+    router.include_router(routes_projects.router, tags=["projects"])
     return router
 
 
@@ -82,6 +86,9 @@ def mount_api_v1(
     hooks = getattr(app.state.monitor, "on_event", None)
     if isinstance(hooks, list):
         hooks.append(monitor_bridge(ctx))
+    from .routes_projects import install_project_alerts
+
+    install_project_alerts(ctx)  # «Сборки»: alerts from deal_found / deal_updated / run_finished on the hub
     if app.openapi_tags is None:
         app.openapi_tags = list(TAGS)
     return ctx

@@ -108,7 +108,7 @@ def plan(listing: Listing, item: TriageItem, lookup: PriceLookup, *, bundle_disc
          pc_discount: float = 0.25, min_priced_share: float = 0.5) -> ScoutPlan:
     """Stage B for one ad: ground the product / parts in the ad text, price them from history."""
     text = ad_text(listing)
-    kind = item.kind if item.kind in BUNDLE_KINDS or item.kind == "single" else item.kind
+    kind = item.kind
     result = ScoutPlan(item=item, kind=kind, interest=item.interest, blocked=_blocked(item),
                        query=item.query or "")
     if not item.is_ai:
@@ -162,18 +162,31 @@ def worth_a_look(plan_: ScoutPlan, *, deal_math: Callable[[PriceEstimate], bool]
     priced parts needs an even higher interest — the vision check can't price it either)."""
     if not plan_.usable:
         return False
-    if plan_.estimate is not None and plan_.estimate.market_price:
-        return deal_math(plan_.estimate)
+    if plan_.estimate is not None and plan_.estimate.market_price and deal_math(plan_.estimate):
+        return True
     if plan_.kind in BUNDLE_KINDS:
-        return plan_.interest >= min_interest + 2 and plan_.grounded
+        # the parts' sum is a lower bound: model-numbered parts without a price yet ("i7-8700K")
+        # may still make it a deal once the paid stage looks up their comparables
+        if unpriced_parts(plan_) and plan_.interest >= min_interest + 1:
+            return True
+        return plan_.estimate is None and plan_.interest >= min_interest + 2 and plan_.grounded
+    if plan_.estimate is not None and plan_.estimate.market_price:
+        return False
     return plan_.identified and plan_.interest >= min_interest and bool(plan_.query)
 
 
+def unpriced_parts(plan_: ScoutPlan, limit: int = 2) -> list[Component]:
+    """Grounded, model-numbered parts identity.py knows but the history had no price for."""
+    return [c for c in plan_.components if c.grounded and c.estimate is None and c.major
+            and c.ref is not None and c.ref.identity is not None][:limit]
+
+
 def vision_for_plan(verdict: AIVerdict | None, plan_: ScoutPlan | None) -> AIVerdict | None:
-    """A PC / lot / bundle the scout priced by its parts is expected to BE one: the vision
-    model's item_type "complete_pc" / "bundle" / "laptop" is then no veto (bundle = several
-    products sold together, priced from parts). Everything else in the verdict stays."""
-    if verdict is None or plan_ is None or plan_.kind not in BUNDLE_KINDS or plan_.estimate is None:
+    """A PC / lot / bundle the scout read as one is expected to BE one: the vision model's
+    item_type "complete_pc" / "bundle" / "laptop" is then no veto (bundle = several products
+    sold together, priced from parts — or, without prices, at most "maybe" by the old rule).
+    Everything else in the verdict stays (part, accessory, box only, wanted still veto)."""
+    if verdict is None or plan_ is None or plan_.kind not in BUNDLE_KINDS or not plan_.usable:
         return verdict
     if verdict.item_type in ("complete_pc", "bundle", "laptop"):
         return verdict.model_copy(update={"item_type": "bundle"})
@@ -195,6 +208,18 @@ def vision_disagrees(verdict: AIVerdict | None, plan_: ScoutPlan | None) -> str:
     if (a.family, a.model, a.variant) != (b.family, b.model, b.variant):
         return f"⚠ Разведчик увидел «{plan_.ref.name}», проверка фото — «{verdict.product}»"
     return ""
+
+
+def reprice(plan_: ScoutPlan, *, bundle_discount: float = 0.15, pc_discount: float = 0.25,
+            min_priced_share: float = 0.5) -> ScoutPlan:
+    """Value the bundle again after parts got prices (comparables in the paid stage)."""
+    if plan_.kind not in BUNDLE_KINDS:
+        return plan_
+    discount = pc_discount if plan_.kind in ("pc", "lot") else bundle_discount
+    plan_.bundle = value_bundle(plan_.components, discount=discount, min_priced_share=min_priced_share,
+                                label=KIND_LABEL_RU.get(plan_.kind, "Комплект"))
+    plan_.estimate = plan_.bundle.estimate
+    return plan_
 
 
 def record_rows(listing: Listing, plan_: ScoutPlan) -> list[tuple[str, Listing]]:
@@ -219,4 +244,99 @@ def summary(plan_: ScoutPlan) -> dict[str, Any]:
         "market": plan_.estimate.market_price if plan_.estimate else None,
         "parts": [{"name": c.name, "qty": c.qty, "grounded": c.grounded,
                    "price": c.estimate.market_price if c.estimate else None} for c in plan_.components],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Learning loop and status (for the monitor and the UI)
+# ---------------------------------------------------------------------------
+
+HINTS_LIMIT = 600  # characters of user preferences in the prompt
+
+
+def _clip(text: Any, limit: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def feedback_hints(examples: dict[str, list[dict[str, Any]]], *, limit: int = HINTS_LIMIT) -> str:
+    """The user's feedback as a few prompt lines: hidden deals (+ reason) mean "not interested
+    in things like this", bought / sold ones "more like this". Capped at `limit` characters."""
+    lines: list[str] = []
+    for row in examples.get("good", [])[:3]:
+        bits = [f"bought {row['bought']:.0f} €" if row.get("bought") else "",
+                f"sold {row['sold']:.0f} €" if row.get("sold") else ""]
+        extra = ", ".join(b for b in bits if b)
+        lines.append(f"- good buy: {_clip(row.get('title'), 60)}" + (f" ({extra})" if extra else ""))
+    for row in examples.get("hidden", [])[:4]:
+        reason = _clip(row.get("reason"), 40)
+        lines.append(f"- not interesting: {_clip(row.get('title'), 60)}" + (f" ({reason})" if reason else ""))
+    if not lines:
+        return ""
+    text = "The user's feedback (rate similar ads accordingly):\n" + "\n".join(lines)
+    return text[:limit]
+
+
+MODE_RU = {
+    "all": "читает все новые объявления",
+    "candidates": "читает только непонятные объявления: без модели, ПК, комплекты, лоты",
+}
+
+
+def _words(n: int, one: str, few: str, many: str) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def status_view(*, enabled: bool, mode_setting: str, provider: str, base_url: str, model: str, own_endpoint: bool,
+                snap: dict[str, Any], vision_waiting: int, vision_wait_minutes: float) -> dict[str, Any]:
+    """Everything the Settings → Нейросеть and Состояние screens show about the scout."""
+    seen = int(snap.get("seen_last_hour") or 0)
+    read = int(snap.get("triaged_last_hour") or 0)
+    capacity = snap.get("capacity_per_hour")
+    sec = snap.get("sec_per_ad")
+    mode = snap.get("mode") or ("all" if mode_setting == "auto" else mode_setting)
+    error, error_at, ok_at = snap.get("last_error") or "", snap.get("last_error_at"), snap.get("last_ok_at")
+    down = bool(error) and (ok_at is None or (error_at or 0) > ok_at)
+    if not enabled:
+        state, text = "off", "Разведчик выключен — объявления отбираю по названию и истории цен"
+    elif down:
+        state, text = "down", "Разведчик не отвечает — пока смотрю объявления обычным способом"
+    elif seen == 0 and read == 0:
+        state, text = "idle", "Разведчик готов — новых объявлений за последний час не было"
+    else:
+        state = "ok" if read >= seen else "behind"
+        text = f"Успевает смотреть {read} из {seen} {_words(seen, 'нового объявления', 'новых объявлений', 'новых объявлений')} в час"
+    speed = ""
+    if sec:
+        speed = f"≈ {sec:.1f} с на объявление"
+        if capacity:
+            speed += f", до {capacity} {_words(int(capacity), 'объявления', 'объявлений', 'объявлений')} в час"
+    return {
+        "enabled": enabled,
+        "state": state,
+        "text_ru": text,
+        "speed_ru": speed,
+        "mode": mode,
+        "mode_setting": mode_setting,
+        "mode_ru": MODE_RU.get(mode, ""),
+        "provider": provider,
+        "base_url": base_url,
+        "model": model,
+        "own_endpoint": own_endpoint,
+        "seen_last_hour": seen,
+        "read_last_hour": read,
+        "overflow_last_hour": int(snap.get("overflow_last_hour") or 0),
+        "failed_last_hour": int(snap.get("failed_last_hour") or 0),
+        "sec_per_ad": sec,
+        "capacity_per_hour": capacity,
+        "batch_size": snap.get("batch_size") or None,
+        "vision_queue": {
+            "waiting": vision_waiting,
+            "max_wait_minutes": vision_wait_minutes,
+            "text_ru": (f"Ждут проверки фото: {vision_waiting}" if vision_waiting else ""),
+        },
     }

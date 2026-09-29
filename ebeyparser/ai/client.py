@@ -190,13 +190,17 @@ def looks_like_vision_model(name: str) -> bool:
 class VisionLLM:
     """chat_json / health / aclose for Ollama and OpenAI-compatible servers."""
 
-    def __init__(self, cfg: LLMSettings, transport: httpx.AsyncBaseTransport | None = None):
+    def __init__(self, cfg: LLMSettings, transport: httpx.AsyncBaseTransport | None = None,
+                 extra_body: dict[str, Any] | None = None):
         if cfg.provider not in ("ollama", "openai"):
             raise LLMError(
                 f"VisionLLM поддерживает только ollama и openai-совместимые серверы, а не «{cfg.provider}»"
             )
         self.cfg = cfg
         self.provider = cfg.provider
+        # extra request fields, e.g. thinking off for the scout's text calls:
+        # {"chat_template_kwargs": {"enable_thinking": False}} (llama.cpp / LM Studio / vLLM), {"think": False} (Ollama)
+        self._extra_body = dict(extra_body or {})
         self._resolved_model: str | None = None  # the server's exact id for cfg.model
         self._resolve_tried = False
         base = (cfg.base_url or "").strip().rstrip("/")
@@ -308,6 +312,7 @@ class VisionLLM:
                 "num_ctx": OLLAMA_NUM_CTX,
                 "num_predict": self._max_tokens,
             },
+            **self._extra_body,
         }
         resp = await self._request("POST", self._chat_url(), payload)
         if resp.status_code == 400 and schema and "format" in resp.text.lower():
@@ -346,6 +351,7 @@ class VisionLLM:
             "temperature": self.cfg.temperature,
             "max_tokens": self._max_tokens,
             "stream": False,
+            **self._extra_body,
         }
         # Strictest first: json_schema (LM Studio, llama.cpp, vLLM constrain the output to
         # the schema), then json_object, then plain text (the prompt demands JSON anyway).

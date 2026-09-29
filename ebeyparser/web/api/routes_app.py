@@ -43,7 +43,7 @@ DEMO_IDS_CACHE: list[str] = []
 SECTIONS = ("general", "pricing", "ai", "notifications", "ebay", "web")
 READ_ONLY_KEYS = frozenset({
     "general.data_dir",
-    "ai.api_key", "ai.second_opinion.api_key",
+    "ai.api_key", "ai.second_opinion.api_key", "ai.scout.api_key",
     "notifications.email.username", "notifications.email.password", "notifications.email.from_addr",
     "notifications.email.to_addrs", "notifications.telegram.bot_token", "notifications.telegram.chat_id",
     "ebay.client_id", "ebay.client_secret", "ebay.oauth_token",
@@ -85,6 +85,25 @@ RANGES: dict[str, tuple[float | None, float | None]] = {
     "ai.second_opinion.max_per_run": (0, 1000),
     "ai.second_opinion.max_images": (0, 10),
     "ai.second_opinion.timeout_seconds": (5, 1800),
+    "ai.vision_wait_minutes": (0, 1440),
+    "ai.scout.timeout_seconds": (5, 1800),
+    "ai.scout.temperature": (0, 2),
+    "ai.scout.max_tokens": (200, 16000),
+    "ai.scout.batch_size": (1, 32),
+    "ai.scout.min_batch": (1, 32),
+    "ai.scout.max_batch": (1, 32),
+    "ai.scout.max_per_hour": (0, 20000),
+    "ai.scout.pass_share": (0.05, 1),
+    "ai.scout.min_interest": (0, 10),
+    "ai.scout.backlog_hours": (0, 72),
+    "ai.scout.bundle_discount": (0, 0.9),
+    "ai.scout.pc_discount": (0, 0.9),
+    "ai.scout.min_priced_share": (0, 1),
+    "notifications.super_deals.min_profit": (0, 100000),
+    "notifications.super_deals.min_roi": (0, 10),
+    "notifications.super_deals.min_score": (0, 100),
+    "notifications.daily_top.hour": (0, 23),
+    "notifications.daily_top.per_search": (1, 20),
     "notifications.min_score": (0, 100),
     "notifications.max_alerts_per_hour": (0, 1000),
     "notifications.heartbeat_hour": (0, 23),
@@ -199,6 +218,11 @@ def _problems(cfg: AppConfig, keys: list[str]) -> dict[str, str]:
     if touched & {"ai.base_url", "ai.provider", "ai.enabled"} and ai.provider != "anthropic":
         if ai.base_url and urlsplit(ai.base_url).scheme not in ("http", "https"):
             problems["ai.base_url"] = "адрес должен начинаться с http://, например http://localhost:1234/v1"
+    if touched & {"ai.scout.base_url", "ai.scout.enabled"} and ai.scout.base_url.strip() \
+            and urlsplit(ai.scout.base_url).scheme not in ("http", "https"):
+        problems["ai.scout.base_url"] = "адрес должен начинаться с http://, например http://127.0.0.1:8080/v1"
+    if touched & {"ai.scout.min_batch", "ai.scout.max_batch"} and ai.scout.min_batch > ai.scout.max_batch:
+        problems["ai.scout.min_batch"] = "минимум не может быть больше максимума"
     if "ai.model" in touched and not ai.model.strip():
         problems["ai.model"] = "укажи модель, например qwen/qwen2.5-vl-7b"
     if "general.request_delay_seconds" in touched:

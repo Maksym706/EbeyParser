@@ -203,6 +203,7 @@ class Database:
         self._conn.executescript(SCHEMA)
         self._migrate_schema()
         self._migrate_deal_state()
+        self._migrate_projects()
         self._conn.commit()
 
     def _migrate_schema(self) -> None:
@@ -776,15 +777,18 @@ class Database:
                     continue
         return out
 
-    def scout_backlog(self, since: datetime, *, limit: int = 100) -> list[Listing]:
-        """Ads the script dismissed (free checks / market data) since `since` that the scout has
-        not read yet — its "second look" when there is time left in a pass. Newest first."""
+    def scout_backlog(self, since: datetime, *, min_interest: int = 0, limit: int = 100) -> list[Listing]:
+        """Ads the script dismissed (free checks / market data) since `since` that the scout has not
+        read yet (or whose reading failed: source "script"), or read as interesting (>= min_interest)
+        without a second look so far — the scout's "second look" when there is time left in a pass."""
         rows = self._query(
             "SELECT l.data FROM listings l JOIN evaluations e ON e.ad_id = l.ad_id"
             " LEFT JOIN scout_triage t ON t.ad_id = l.ad_id"
-            " WHERE t.ad_id IS NULL AND e.verdict = 'skip' AND l.first_seen >= ?"
+            " WHERE e.verdict = 'skip' AND l.first_seen >= ?"
             " AND json_extract(e.data, '$.stage') IN ('prefilter', 'market')"
-            " ORDER BY l.first_seen DESC LIMIT ?", (_ts(since), max(0, int(limit))))
+            " AND COALESCE(json_extract(e.data, '$.found_by'), '') != 'ai_scout'"
+            " AND (t.ad_id IS NULL OR t.source = 'script' OR (t.source = 'ai' AND t.interest >= ?))"
+            " ORDER BY l.first_seen DESC LIMIT ?", (_ts(since), int(min_interest), max(0, int(limit))))
         return [Listing.model_validate_json(r["data"]) for r in rows]
 
     def scout_counts(self, since: datetime) -> dict[str, int]:
@@ -1472,3 +1476,74 @@ class Database:
     def table_counts(self) -> dict[str, int]:
         return {t: int(self._query(f"SELECT COUNT(*) FROM {t}")[0][0])
                 for t in ("listings", "evaluations", "price_points", "runs", "deal_state")}
+
+    # ================================================= «Сборки» (build projects, additive)
+    def _migrate_projects(self) -> None:
+        """Tables of ebeyparser.projects (CREATE IF NOT EXISTS: safe on any old database; the
+        queries live in ebeyparser/projects/store.py)."""
+        self._conn.executescript(PROJECTS_SCHEMA)
+
+
+# Build projects («Сборки»): a plan of slots with alternatives, the searches that track them, and
+# the alerts already sent. JSON `data` columns hold the details (see ebeyparser/projects/models.py).
+PROJECTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS projects (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL DEFAULT '',
+    goal         TEXT NOT NULL DEFAULT '',
+    template     TEXT NOT NULL DEFAULT 'custom',
+    budget       REAL,
+    status       TEXT NOT NULL DEFAULT 'draft',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    data         TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS project_slots (
+    project_id   INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    slot         TEXT NOT NULL,
+    position     INTEGER NOT NULL DEFAULT 0,
+    status       TEXT NOT NULL DEFAULT 'open',
+    chosen       TEXT NOT NULL DEFAULT '',
+    data         TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (project_id, slot)
+);
+
+CREATE TABLE IF NOT EXISTS project_options (
+    project_id   INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    slot         TEXT NOT NULL,
+    option       TEXT NOT NULL,
+    position     INTEGER NOT NULL DEFAULT 0,
+    kb_key       TEXT,
+    qty          INTEGER NOT NULL DEFAULT 1,
+    target_price REAL,
+    max_price    REAL,
+    data         TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (project_id, slot, option)
+);
+
+-- searches (config names) created by «Начать отслеживание» for a slot's option
+CREATE TABLE IF NOT EXISTS project_searches (
+    project_id   INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    slot         TEXT NOT NULL,
+    option       TEXT NOT NULL,
+    search_name  TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (project_id, search_name)
+);
+CREATE INDEX IF NOT EXISTS idx_project_searches_name ON project_searches(search_name);
+
+-- alerts already sent per project (one per ad and kind)
+CREATE TABLE IF NOT EXISTS project_alerts (
+    project_id   INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    ad_id        TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    slot         TEXT NOT NULL DEFAULT '',
+    price        REAL,
+    total        REAL,
+    text         TEXT NOT NULL DEFAULT '',
+    delivered    INTEGER NOT NULL DEFAULT 0,
+    sent_at      TEXT NOT NULL,
+    PRIMARY KEY (project_id, ad_id, kind)
+);
+"""

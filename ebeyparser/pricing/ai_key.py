@@ -90,14 +90,10 @@ class ProductRef:
         return self.identity is None
 
 
-# identity's catch-all matcher turns any "word + number" into a key ("iphne|13" for a typo):
-# those are no better than an AI key, so the AI's own spelling wins there
-_WEAK_CATEGORIES = frozenset({None, "other"})
-
-
 def resolve(product: str) -> ProductRef | None:
-    """identity key when identity.py recognises the name (not only by its catch-all rule),
-    else the normalized AI key; None for an empty / unidentifiable name."""
+    """identity key when identity.py recognises the name — also by its catch-all "word + number"
+    rule ("Garmin Fenix 7" -> fenix|7): the scout writes canonical names, so that key is the one
+    the script's history already uses — else the normalized AI key; None for an empty name."""
     qty, name = split_quantity(product)
     name = name.strip(" .,;:-")
     if not name:
@@ -107,7 +103,7 @@ def resolve(product: str) -> ProductRef | None:
         category = product_category(name)
     except Exception:  # noqa: BLE001 - identity must never break the scout
         key, category = None, None
-    if key is not None and category not in _WEAK_CATEGORIES:
+    if key is not None:
         return ProductRef(name, key, key.key(), key.coarse_key(), key.query() or normalize(name), category)
     akey = ai_key(name)
     if akey is None:
@@ -124,7 +120,10 @@ def _query_words(name: str) -> str:
 # Grounding: is the product really written in the ad?
 # ---------------------------------------------------------------------------
 
-_NEG_BEFORE = frozenset("ohne kein keine keinen keiner nicht fehlt fehlen fehlende ausgebaut entfernt war".split())
+_NEG_BEFORE = frozenset("""
+    ohne kein keine keinen keiner nicht fehlt fehlen fehlende ausgebaut entfernt war
+    suche suchen gesucht statt anstatt waere wuensche gegen
+""".split())
 _NEG_AFTER = frozenset("fehlt fehlen ausgebaut entfernt verkauft nicht defekt kaputt drin verbaut".split())
 _NEG_AFTER_EXCUSE = frozenset({"drin", "verbaut"})  # "war ... drin": only with "war" before
 _GENERIC_FAMILY = frozenset({"pc", "computer", "rechner", "gaming", "set", "controller", "konsole",
@@ -173,7 +172,12 @@ def _fuzzy_in(word: str, tokens: tuple[str, ...]) -> list[int]:
     return out
 
 
+_WANT_WORDS = frozenset("suche suchen sucht gesucht statt anstatt waere wuensche haette".split())
+
+
 def _negated_at(tokens: tuple[str, ...], pos: int) -> bool:
+    if _WANT_WORDS.intersection(tokens[:pos]):  # "suche eigentlich was mit RTX 3080" (whole clause)
+        return True
     before = tokens[max(0, pos - 4):pos]
     after = tokens[pos + 1:pos + 4]
     if any(t in _NEG_BEFORE and t != "war" for t in before):
@@ -209,6 +213,11 @@ def _present(word: str, clauses: list[tuple[str, ...]]) -> bool:
     return False
 
 
+# edition words the AI may add ("iPhone 13" -> "iPhone 13 Pro"): each costs money, so each must be written
+_VARIANT_WORDS = frozenset("pro max ultra plus mini lite ti super xt xtx fe oled digital slim air gre".split())
+_CAPACITY_RE = re.compile(r"^\d+(?:\.\d+)?(?:gb|tb)$")
+
+
 def _weak_model(tok: str) -> bool:
     """'7', '13', '5', 'i7', 'r5': a short token names nothing without its product line
     (and "i7" is only the series of an "8700k")."""
@@ -229,7 +238,11 @@ def grounded(product: str, text: str) -> bool:
         return False
     models = [t for t in ptoks if any(c.isdigit() for c in t) and not _ATTR_RE.fullmatch(t)]
     words = [t for t in ptoks if not any(c.isdigit() for c in t) and t not in _GENERIC_FAMILY
-             and not _ATTR_RE.fullmatch(t)]
+             and not _ATTR_RE.fullmatch(t) and t not in _VARIANT_WORDS]
+    if not all(_present(v, clauses) for v in ptoks if v in _VARIANT_WORDS):
+        return False  # "Pro", "Ti", "OLED" the ad doesn't say
+    if not all(_present(c, clauses) for c in ptoks if _CAPACITY_RE.fullmatch(c)):
+        return False  # a storage size the ad doesn't say
     if models:
         strong = [t for t in models if not _weak_model(t)]
         if not all(_present(tok, clauses) for tok in strong or models):

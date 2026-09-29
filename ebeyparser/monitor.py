@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 from collections import OrderedDict
 import logging
 import random
@@ -39,6 +40,7 @@ from .config import AppConfig, GeneralConfig, LLMSettings, SearchConfig
 from .db import Database
 from .models import AIVerdict, Comparable, DealView, Evaluation, Listing, PriceEstimate, RunSummary, utcnow
 from .notify.base import build_notifiers
+from .notify.render import super_title
 from .pricing.estimator import (
     below_min_price,
     comparable_fits,
@@ -58,7 +60,7 @@ from .pricing.ai_key import ProductRef, ai_keys_compatible
 from .pricing.identity import Identity, ProductKey, identify
 from .pricing.tiers import TIER_SUPER, deal_tier
 from .pricing.text import SEVERE_FLAGS, detect_red_flags, is_model_key, make_search_query, normalize
-from .errors_ru import AI_DOWN_RU, budget_message, humanize
+from .errors_ru import AI_DOWN_RU, ai_problem, budget_message, humanize
 from .scraper.ebay_api import EBAY_NOT_CONNECTED_RU, EbayAPIError, EbayBrowseClient
 from .scraper.ebay_sold import EbaySoldScraper
 from .scraper.http import BlockedError, PoliteClient, RateBudgetExceeded
@@ -107,6 +109,9 @@ _URL_PRICE_FILTER_RE = re.compile(r"preis:\d|preis::\d|[?&](?:minPrice|maxPrice)
 # run_finished, deal_found, health_alert, monitor_paused, monitor_resumed.
 EventHook = Callable[[str, dict[str, Any]], Any]
 PAUSED_STATE_KEY = "monitor:paused"  # kv_state: "1" = passes are skipped (survives restarts)
+SCOUT_STATS_KEY = "scout:stats"  # kv_state: the AI scout's last throughput snapshot (JSON)
+scout_feedback_hints = scout_ai.feedback_hints
+scout_status_view = scout_ai.status_view
 DEAL_EVENT_ACTIONS = frozenset({"buy", "haggle", "bid"})
 
 
@@ -434,7 +439,7 @@ class Monitor:
         if self._scout is None and sc.enabled and not self._injected["scout"]:
             try:
                 settings = self._scout_llm_settings()
-                self._scout_llm = make_llm(settings)
+                self._scout_llm = make_scout_llm(settings)
                 self._scout = TriageEngine.from_config(self._scout_llm, sc.model_copy(update={"model": settings.model}))
             except Exception as exc:  # e.g. anthropic package missing: the script path works as before
                 log.warning("AI scout disabled: %s", exc)
@@ -561,7 +566,9 @@ class Monitor:
             self._ensure_components()
             self._upkeep()
             self._prune_history()
+            self._scout_begin_pass(len(searches))
             await self._retry_deliveries(summary)
+            await self._drain_vision_queue(summary)
             for search in searches:
                 summary.searches += 1
                 self.progress = {"run_id": summary.id, "index": summary.searches, "total": len(searches),
@@ -605,12 +612,14 @@ class Monitor:
                     continue
                 await self._check_search_health(search, summary.listings_seen - seen_before, summary)
                 digest.extend(deals)  # instant mode: already sent while evaluating
+            digest.extend(await self._scout_rescue(summary))
             digest = [d for d in digest if not self._is_repost(d.listing)]
             if digest:
                 summary.notified += await self._notify(digest, summary)
             await self._after_run(summary)
         finally:
             summary.finished_at = utcnow()
+            self._scout_save_stats(summary)
             self.db.finish_run(summary)
             self.last_summary = summary
             self._running = False
@@ -650,6 +659,7 @@ class Monitor:
         todo: list[Listing] = []
         price_dropped: set[str] = set()
         rechecks: set[str] = set()
+        fresh: set[str] = set()  # first seen in this pass
         new_here = 0
         for listing in listings:
             listing.search_name = search.name
@@ -657,6 +667,7 @@ class Monitor:
             self.db.upsert_listing(listing)
             if previous is None:
                 new_here += 1
+                fresh.add(listing.ad_id)
                 todo.append(listing)
                 continue
             stored = self.db.get_listing(listing.ad_id) or listing
@@ -702,6 +713,9 @@ class Monitor:
         instant = self.config.notifications.mode == "instant"
         to_notify: list[DealView] = []
 
+        # phase 0 — the AI scout reads the new ads (bounded time; what it doesn't reach goes the usual way)
+        await self._scout_read(search, todo, fresh, summary)
+
         # phase 1 — free: filters, reference price / price history, early "no deal"
         candidates: list[_Candidate] = []
         for listing in todo:
@@ -745,20 +759,9 @@ class Monitor:
             why = f" — {evaluation.reasons[0]}" if evaluation.verdict == "skip" and evaluation.reasons else ""
             log.info("         → %s, балл %.0f%s%s", _VERDICT_RU.get(evaluation.verdict, evaluation.verdict),
                      evaluation.score, _profit_note(evaluation), why)
-            if evaluation.verdict == "buy":
-                summary.deals_found += 1
-            if evaluation.verdict == "buy" or evaluation.action in DEAL_EVENT_ACTIONS:
-                self._emit("deal_found", {"ad_id": listing.ad_id, "search_name": search.name,
-                                          "title": listing.title, "verdict": evaluation.verdict,
-                                          "action": evaluation.action, "score": evaluation.score})
-            if self._should_notify(evaluation):
-                deal = self.db.get_deal(listing.ad_id)
-                if deal is None:
-                    continue
-                if instant:  # a good deal is gone in minutes: don't wait for the rest of the search
-                    await self._alert(deal, summary)
-                else:
-                    to_notify.append(deal)
+            deal = await self._after_evaluation(listing, search, evaluation, summary, instant=instant)
+            if deal is not None:
+                to_notify.append(deal)
 
         evaluated_here = summary.evaluated - evaluated_before
         if evaluated_here >= 6 and summary_buy_share(self.db, todo) >= 0.7:
@@ -907,7 +910,9 @@ class Monitor:
         price history, early "no deal". Returns the stored evaluation, or the candidate for
         the paid part. `recheck`: an earlier early skip seen again — not counted twice."""
         counted = not recheck
+        plan = self._scout_plan_for(listing)  # the AI scout's priced reading (None: not read / off)
         keep, reasons = prefilter(listing, search)
+        kind_vetoed = False
         if keep:
             floor = search.min_price if search.min_price is not None else self.config.general.min_listing_price
             too_cheap = below_min_price(listing, floor)
@@ -917,11 +922,16 @@ class Monitor:
         if keep:
             veto = self._kind_veto(ident, search)
             if veto:
-                keep, reasons = False, [veto]
+                keep, reasons, kind_vetoed = False, [veto], True
         if not keep:
+            skip = self._skip_evaluation(listing, search, reasons)
+            # "alter PC mit RTX 3080": the script drops the kind, the scout priced its parts
+            if (kind_vetoed and plan is not None and _scout_may_overrule(ident.kind, plan)
+                    and self._scout_worth(listing, search, plan)):
+                return self._scout_candidate(listing, plan, skip, budget.summary, counted)
             if counted:
                 budget.summary.prefiltered += 1
-            return self._save_skip(listing, search, reasons)
+            return self._save(skip)
 
         known = self._reference_estimate(listing, search)
         if known is None:
@@ -934,12 +944,19 @@ class Monitor:
                 if not self._may_skip_early(known, ident):
                     known = None  # thin/unclear history says "no deal": check comparables first
                 else:
+                    skip = best.model_copy(update={"reasons": no_deal_reasons(best), "stage": "market"})
+                    # the title reads as one product, the scout saw another (or a bundle) worth more
+                    if (plan is not None and self._scout_sees_other(plan, ident)
+                            and self._scout_worth(listing, search, plan)):
+                        return self._scout_candidate(listing, plan, skip, budget.summary, counted)
                     if counted:
                         budget.summary.early_skips += 1
                         budget.summary.history_hits += known.source == "history"
-                    return self._save(best.model_copy(update={"reasons": no_deal_reasons(best), "stage": "market"}))
+                    return self._save(skip)
             if known is not None and known.source == "history" and counted:
                 budget.summary.history_hits += 1
+        if plan is not None:
+            return self._scout_enrich(listing, search, plan, ident, known, hint, budget.summary, counted)
         return _Candidate(listing, known, hint)
 
     def _may_skip_early(self, est: PriceEstimate, ident: Identity) -> bool:
@@ -1008,6 +1025,7 @@ class Monitor:
         if the market is still unknown) → local AI. Raises _Deferred when a budget is used up."""
         self._ensure_components()
         listing, estimate = cand.listing, cand.estimate
+        plan, found_by = cand.plan, cand.found_by
         source = self._source_for(listing)
         pricing = self.config.pricing
 
@@ -1026,33 +1044,65 @@ class Monitor:
             if not keep:
                 budget.summary.prefiltered += 1
                 return self._save_skip(listing, search, reasons)
+        if plan is not None:  # the full text may change the scout's picture ("ohne Grafikkarte")
+            plan = self._scout_replan(listing, plan)
+            if found_by == scout_ai.FOUND_BY_SCOUT and not self._scout_worth(listing, search, plan):
+                if cand.script_skip is not None:
+                    return self._save(cand.script_skip)  # back to what the script alone decided
+                plan, found_by, estimate = None, scout_ai.FOUND_BY_SCRIPT, None  # the script's own way
+            elif found_by == scout_ai.FOUND_BY_SCOUT:
+                estimate = plan.estimate
+                if plan.kind in scout_ai.BUNDLE_KINDS and scout_ai.unpriced_parts(plan):
+                    estimate = await self._scout_price(listing, search, plan, budget) or estimate
 
         # 4: comparables, only when neither reference nor history knew the market
+        if estimate is None and plan is not None and plan.usable:
+            ident = listing_identity(listing)
+            if plan.estimate is not None and plan.estimate.market_price:
+                estimate = plan.estimate  # the history knows the scout's product by now
+            elif self._scout_sees_other(plan, ident) or found_by == scout_ai.FOUND_BY_SCOUT:
+                estimate = await self._scout_price(listing, search, plan, budget)
+            if estimate is not None and (found_by == scout_ai.FOUND_BY_SCOUT or self._scout_sees_other(plan, ident)):
+                found_by = scout_ai.FOUND_BY_SCOUT
         if estimate is None:
             estimate = await self._market_estimate(listing, search, budget, use_history=False)
         best = evaluate(listing, estimate, None, search, pricing)
         if market_says_no_deal(best):  # the AI can't turn this into a deal
-            return self._save(best.model_copy(update={"stage": "full"}))
+            return self._save(best.model_copy(update={"stage": "full", "found_by": found_by}))
 
         # 5: local AI
         wants_ai = self._wants_ai(listing, estimate, search) and budget.spend("ai_calls")
         return await self._conclude(listing, search, estimate, source, budget if wants_ai else None,
-                                    ask_ai=wants_ai)
+                                    ask_ai=wants_ai, plan=plan, found_by=found_by)
 
     async def _conclude(
         self, listing: Listing, search: SearchConfig, estimate: PriceEstimate, source: Any,
-        budget: _Budget | None, *, ask_ai: bool,
+        budget: _Budget | None, *, ask_ai: bool, plan: Any = None, found_by: str = "script",
     ) -> Evaluation:
-        """AI verdict (if asked) → final evaluation → second opinion → store."""
+        """AI verdict (if asked) → final evaluation → second opinion → store. `plan`: the AI
+        scout's priced reading (a PC / bundle it priced by parts is no veto for the photo check)."""
         verdict = None
         from_ai_query = False
         if ask_ai:
-            verdict, estimate, from_ai_query = await self._ask_ai(listing, search, estimate, source, budget)
-        vague = not from_ai_query and self._listing_target(listing) is None
+            verdict, estimate, from_ai_query = await self._ask_ai(listing, search, estimate, source, budget,
+                                                                  plan=plan)
+            verdict = scout_ai.vision_for_plan(verdict, plan)
+        scout_knows = plan is not None and plan.usable and (plan.identified or plan.estimate is not None)
+        vague = not from_ai_query and not scout_knows and self._listing_target(listing) is None
         evaluation = evaluate(listing, estimate, verdict, search, self.config.pricing, ai_expected=ask_ai,
                               vague=vague)
+        warning = scout_ai.vision_disagrees(verdict, plan)
+        if warning:
+            evaluation = _capped_maybe(evaluation, warning)
         evaluation = await self._maybe_second_opinion(listing, search, estimate, evaluation, source)
-        return self._save(evaluation.model_copy(update={"stage": "full"}))
+        update: dict[str, Any] = {"stage": "full", "found_by": found_by}
+        if found_by == scout_ai.FOUND_BY_SCOUT and plan is not None and plan.reason_ru():
+            reasons = list(evaluation.reasons)
+            reasons.insert(min(1, len(reasons)), f"🔎 {scout_ai.FOUND_BY_LABEL_RU[found_by]}: {plan.reason_ru()}")
+            update["reasons"] = reasons
+        evaluation = self._save(evaluation.model_copy(update=update))
+        self._hold_for_vision(listing, search, evaluation)
+        return evaluation
 
     # ------------------------------------------------------------ evaluation
     async def evaluate_listing(self, listing: Listing, search: SearchConfig, *,
@@ -1095,10 +1145,14 @@ class Monitor:
         return evaluation
 
     def _save_skip(self, listing: Listing, search: SearchConfig, reasons: list[str]) -> Evaluation:
-        return self._save(Evaluation(
+        return self._save(self._skip_evaluation(listing, search, reasons))
+
+    @staticmethod
+    def _skip_evaluation(listing: Listing, search: SearchConfig, reasons: list[str]) -> Evaluation:
+        return Evaluation(
             ad_id=listing.ad_id, purpose=search.purpose, buy_price=listing.price,
-            verdict="skip", action="skip", score=0.0, reasons=reasons, stage="prefilter",
-        ))
+            verdict="skip", action="skip", score=0.0, reasons=reasons, stage="prefilter", found_by="script",
+        )
 
     async def _load_detail(self, listing: Listing, search: SearchConfig, source: Any) -> tuple[Listing, bool, list[str]]:
         """Open the ad page (full text, all photos) and re-run the prefilter on it.
@@ -1124,14 +1178,16 @@ class Monitor:
 
     async def _ask_ai(
         self, listing: Listing, search: SearchConfig, estimate: PriceEstimate, source: Any,
-        budget: _Budget | None,
+        budget: _Budget | None, *, plan: Any = None,
     ) -> tuple[AIVerdict, PriceEstimate, bool]:
         """Local AI verdict. The model sees a few comparables (never our market price — it
         guesses its own blind) and says which of them are the same variant. The third value:
-        the market price now comes from the AI's own search query."""
+        the market price now comes from the AI's own search query. A bundle priced by its
+        parts shows no comparables (the parts are not "the same variant" as the whole)."""
         assert self._evaluator is not None
         images = await self._images(listing, source, self.config.ai.max_images)
-        shown = prompt_comparables(None, _comparables_for_ai(estimate))
+        by_parts = plan is not None and plan.kind in scout_ai.BUNDLE_KINDS and estimate is plan.estimate
+        shown = [] if by_parts else prompt_comparables(None, _comparables_for_ai(estimate))
         verdict = await self._evaluator.evaluate(
             listing, images, purpose=search.purpose,
             estimate=estimate if estimate.market_price is not None else None,
@@ -1143,9 +1199,12 @@ class Monitor:
         else:
             self._ai_failed += 1
         estimate = self._variant_checked(estimate, same_variant_comparables(verdict, shown) if shown else None)
-        # The model often identifies the product better than the raw title does.
+        # The model often identifies the product better than the raw title does. Not for a PC /
+        # bundle / lot the scout read: its phrase names ONE part ("rtx 3070") and would price the
+        # whole thing as that part — without real part prices it stays at most "maybe".
         from_query = False
-        if estimate.market_price is None and verdict.search_query:
+        whole = plan is not None and plan.kind in scout_ai.BUNDLE_KINDS
+        if estimate.market_price is None and verdict.search_query and not whole:
             ai_estimate = await self._market_estimate(
                 listing, search, budget, query=verdict.search_query, defer=False
             )
@@ -1463,6 +1522,541 @@ class Monitor:
         except sqlite3.Error as exc:
             log.warning("Price history: can't store comparables: %s", exc)
 
+    # ------------------------------------------------------------- AI scout
+    # docs/design/AI_SCOUT.md. Stage A (_scout_read): a small text model reads the new ads in
+    # batches; stage B (_scout_plan_for): its reading is grounded in the ad text and priced from
+    # our own history; the free funnel (_triage) then may promote an ad the script dismissed,
+    # rank candidates by it, or give them a market price; stage C/D are the usual paid steps.
+    def _scout_begin_pass(self, n_searches: int) -> None:
+        self._scout_items = {}
+        self._scout_plans = {}
+        self._scout_hints_text = None
+        self._scout_searches_left = max(1, n_searches)
+        self._scout_deadline = None
+        if self.scout_enabled:
+            assert self._scout is not None
+            sc = self.config.ai.scout
+            seconds = max(1.0, self.config.general.interval_minutes) * 60 * max(0.0, min(1.0, sc.pass_share))
+            self._scout_deadline = self._scout.clock() + seconds
+
+    def _scout_mode(self) -> str:
+        """"all" while the model keeps up with the new ads, else "candidates" (only where the
+        script is blind); ai.scout.mode forces one of them."""
+        sc = self.config.ai.scout
+        mode = sc.mode
+        if mode == "auto" and self._scout is not None:
+            stats = self._scout.stats
+            capacity = stats.capacity_per_hour(sc.pass_share, sc.max_per_hour)
+            mode = "candidates" if capacity is not None and stats.seen_last_hour > capacity else "all"
+        if self._scout is not None:
+            self._scout.stats.mode = mode
+        return mode
+
+    def _scout_search_deadline(self) -> float | None:
+        """This search's share of the pass's scout time (time left over rolls on to the next)."""
+        if self._scout_deadline is None or self._scout is None:
+            return None
+        now = self._scout.clock()
+        left = max(0.0, self._scout_deadline - now)
+        return now + left / max(1, self._scout_searches_left)
+
+    def _scout_load(self, ad_ids: list[str]) -> None:
+        """Readings stored by earlier passes (an ad is read once)."""
+        missing = [a for a in ad_ids if a not in self._scout_items]
+        if not missing:
+            return
+        try:
+            stored = self.db.get_triage(missing)
+        except sqlite3.Error as exc:
+            log.warning("AI scout: stored readings unavailable: %s", exc)
+            return
+        for ad_id, data in stored.items():
+            try:
+                self._scout_items[ad_id] = TriageItem.model_validate(data)
+            except Exception:  # noqa: BLE001 - an old / broken row is simply read again
+                continue
+
+    async def _scout_read(self, search: SearchConfig, todo: list[Listing], fresh: set[str],
+                          summary: RunSummary) -> None:
+        """Stage A for one search: read the ads nobody has read yet, fresh first, then where the
+        script is blind; within this search's time share and the hourly cap. Never raises."""
+        if not self.scout_enabled or not todo:
+            return
+        engine = self._scout
+        assert engine is not None
+        self._scout_load([item.ad_id for item in todo])
+        engine.note_arrivals(len(fresh))
+        unread = [item for item in todo if item.ad_id not in self._scout_items]
+        mode = self._scout_mode()
+        queue = unread if mode == "all" else [item for item in unread if blind_spot(item)]
+        not_offered = len(unread) - len(queue)
+        queue.sort(key=lambda item: (item.ad_id not in fresh, -scout_priority(item), -_aware(item.first_seen).timestamp()))
+        deadline = self._scout_search_deadline()
+        self._scout_searches_left = max(1, self._scout_searches_left - 1)
+        summary.scout_overflow += not_offered
+        if not queue:
+            return
+        run = await self._scout_run(queue, deadline, {item.ad_id: search.category_name for item in queue}, summary)
+        if run is None:
+            return
+        by_id = {item.ad_id: item for item in queue}
+        if not _price_filtered(search):
+            self._scout_remember([by_id[a] for a in run.items if a in by_id and a in fresh])
+
+    async def _scout_run(self, queue: list[Listing], deadline: float | None, categories: dict[str, str],
+                         summary: RunSummary, *, rescue: bool = False) -> Any:
+        engine = self._scout
+        assert engine is not None
+        try:
+            run = await engine.triage(queue, deadline=deadline, categories=categories, hints=self._scout_hints(),
+                                      count_overflow=not rescue)
+        except Exception as exc:  # noqa: BLE001 - the scout never breaks a pass
+            log.exception("AI scout failed")
+            summary.scout_overflow += len(queue)
+            await self._scout_down(str(exc), summary)
+            return None
+        self._scout_items.update(run.items)
+        try:
+            self.db.save_triage([item.model_dump(mode="json") for item in run.items.values()])
+        except sqlite3.Error as exc:
+            log.warning("AI scout: readings not stored: %s", exc)
+        summary.scout_read += run.ai_count
+        summary.scout_overflow += 0 if rescue else len(run.overflow)
+        summary.scout_failed += len(run.failed)
+        summary.scout_calls += run.calls
+        summary.scout_seconds = round(summary.scout_seconds + run.seconds, 1)
+        if run.ai_count:
+            log.info("🔎 Разведчик прочитал %d объявл. за %.0f с (%d вызов.), не успел %d, не разобрал %d",
+                     run.ai_count, run.seconds, run.calls, len(run.overflow), len(run.failed))
+            self._scout_down_reported = False
+        if run.error:
+            await self._scout_down(run.error, summary)
+        return run
+
+    async def _scout_down(self, error: str, summary: RunSummary) -> None:
+        if self._scout_down_reported:
+            return
+        self._scout_down_reported = True
+        settings = self._scout_llm_settings()
+        why = ai_problem(settings.provider, settings.base_url, settings.model, error, server_ok=None)
+        await self._health("scout_down", f"⚠ Нейросеть-разведчик не отвечает — новые объявления смотрю обычным"
+                                         f" способом. {why}", summary)
+
+    def _scout_hints(self) -> str:
+        """The user's taste from feedback (hidden / bought / sold deals), a few lines in the prompt."""
+        if self._scout_hints_text is not None:
+            return self._scout_hints_text
+        text = ""
+        if self.config.ai.scout.learn_from_feedback:
+            try:
+                text = scout_feedback_hints(self.db.feedback_examples(limit=4))
+            except sqlite3.Error:
+                text = ""
+        self._scout_hints_text = text
+        return text
+
+    def _scout_plan_for(self, listing: Listing) -> Any:
+        """Stage B: the scout's reading of this ad, grounded and priced (cached per pass)."""
+        if not self.scout_enabled:
+            return None
+        if listing.ad_id not in self._scout_items:
+            self._scout_load([listing.ad_id])
+        item = self._scout_items.get(listing.ad_id)
+        if item is None or not item.is_ai:
+            return None
+        cached = self._scout_plans.get(listing.ad_id)
+        if cached is not None and cached[0] == len(listing.description):
+            return cached[1]
+        sc = self.config.ai.scout
+        try:
+            plan = scout_ai.plan(listing, item, self._scout_lookup(listing), bundle_discount=sc.bundle_discount,
+                                 pc_discount=sc.pc_discount, min_priced_share=sc.min_priced_share)
+        except Exception:  # noqa: BLE001 - a broken reading is no reading
+            log.exception("AI scout plan failed for %s", listing.ad_id)
+            return None
+        self._scout_plans[listing.ad_id] = (len(listing.description), plan)
+        return plan
+
+    def _scout_replan(self, listing: Listing, plan: Any) -> Any:
+        self._scout_plans.pop(listing.ad_id, None)
+        return self._scout_plan_for(listing) or plan
+
+    def _scout_lookup(self, listing: Listing) -> Callable[[ProductRef], PriceEstimate | None]:
+        """Market price of a product the scout named, from our own history only (no requests):
+        identity keys match like the script's ("same product and kind"), AI keys by attributes."""
+        pricing = self.config.pricing
+
+        def lookup(ref: ProductRef) -> PriceEstimate | None:
+            if not pricing.use_price_history:
+                return None
+            days = max(1, pricing.history_days)
+            since = utcnow() - timedelta(days=days)
+            try:
+                if ref.identity is not None:
+                    points: list[Any] = self.db.price_history_spans(ref.lookup, since, exclude_ad_id=listing.ad_id)
+                    key = ref.identity
+
+                    def fits(c: Comparable) -> bool:
+                        return comparable_fits(key, c)
+                else:
+                    rows = self.db.price_history_keyed(ref.lookup, since, exclude_ad_id=listing.ad_id)
+                    points = [(c, first, last) for c, first, last, stored in rows if ai_keys_compatible(ref.key, stored)]
+
+                    def fits(c: Comparable) -> bool:
+                        return not _severe_title(c.title)
+            except sqlite3.Error as exc:
+                log.warning("AI scout: price history of %r unavailable: %s", ref.key, exc)
+                return None
+            return estimate_from_history(ref.query, points, asking_price_discount=pricing.asking_price_discount,
+                                         min_points=pricing.history_min_points, days=days, fits=fits)
+
+        return lookup
+
+    def _scout_remember(self, listings: list[Listing]) -> None:
+        """Ads the scout identified where the script's identity knows nothing (typos, product only
+        in the text, products the regexes don't know): their prices go into the history under
+        the scout's key — the history grows for what the regexes can't read."""
+        rows: list[tuple[str, Listing]] = []
+        for listing in listings:
+            ident = listing_identity(listing)
+            if ident.key is not None and ident.category not in (None, "other"):
+                continue  # identity knows it: its own key is already stored
+            if history_key_for(listing) is None and ident.key is not None:
+                continue  # not a price signal (wanted, defect, missing parts, ...)
+            plan = self._scout_plan_for(listing)
+            if plan is None:
+                continue
+            from .pricing.estimator import history_worthy
+
+            if not history_worthy(listing):
+                continue
+            rows += scout_ai.record_rows(listing, plan)
+        if not rows:
+            return
+        try:
+            self.db.record_price_points(rows)
+        except sqlite3.Error as exc:
+            log.warning("AI scout: prices not stored: %s", exc)
+
+    def _deal_possible(self, listing: Listing, search: SearchConfig, estimate: PriceEstimate) -> bool:
+        return not market_says_no_deal(evaluate(listing, estimate, None, search, self.config.pricing))
+
+    def _scout_worth(self, listing: Listing, search: SearchConfig, plan: Any) -> bool:
+        return scout_ai.worth_a_look(plan, deal_math=lambda est: self._deal_possible(listing, search, est),
+                                     min_interest=self.config.ai.scout.min_interest)
+
+    @staticmethod
+    def _scout_sees_other(plan: Any, ident: Identity) -> bool:
+        """The scout's product differs from what the title's identity says (or it is a bundle
+        the script priced as one item)."""
+        if plan.kind in scout_ai.BUNDLE_KINDS:
+            return ident.kind not in ("bundle", "complete_pc")
+        if not plan.identified:
+            return False
+        if ident.key is None:
+            return True
+        if plan.ref.identity is None:  # an AI key beats only identity's catch-all reading of a title
+            return ident.category in (None, "other")
+        return plan.ref.identity.coarse_key() != ident.key.coarse_key()
+
+    def _scout_candidate(self, listing: Listing, plan: Any, skip: Evaluation, summary: RunSummary,
+                         counted: bool) -> _Candidate:
+        """A dismissed ad the scout brings back for the paid stage."""
+        if counted:
+            summary.scout_promoted += 1
+        log.info("   🔎 %s — %s → второй взгляд: %s", listing.title[:60], _price_label(listing), plan.reason_ru())
+        return _Candidate(listing, plan.estimate, plan.estimate, plan=plan, found_by=scout_ai.FOUND_BY_SCOUT,
+                          priority=plan.priority(listing), script_skip=skip)
+
+    def _scout_enrich(self, listing: Listing, search: SearchConfig, plan: Any, ident: Identity,
+                      known: PriceEstimate | None, hint: PriceEstimate | None, summary: RunSummary,
+                      counted: bool) -> Evaluation | _Candidate:
+        """A candidate of the script. The script knows the market: unchanged. It doesn't: the
+        scout's reading ranks it (junk last) and may give it a market price from history; a solid
+        price that says "no deal" ends it here, like the script's own early skip."""
+        if known is not None or not plan.item.is_ai:
+            return _Candidate(listing, known, hint, plan=plan)
+        est = plan.estimate if plan.usable else None
+        if est is None or not est.market_price:
+            return _Candidate(listing, None, hint, plan=plan, priority=plan.priority(listing))
+        found_by = scout_ai.FOUND_BY_SCOUT if self._scout_sees_other(plan, ident) else scout_ai.FOUND_BY_SCRIPT
+        if market_says_no_deal(evaluate(listing, est, None, search, self.config.pricing)):
+            # the scout never drops an ad on its own (a weak model may have read a cheaper variant):
+            # no deal by its price = the script's own way, ranked after the unknown ones
+            return _Candidate(listing, None, hint, priority=SCOUT_NO_DEAL_PRIORITY)
+        return _Candidate(listing, est, hint, plan=plan, found_by=found_by, priority=plan.priority(listing))
+
+    async def _scout_price(self, listing: Listing, search: SearchConfig, plan: Any,
+                           budget: _Budget | None) -> PriceEstimate | None:
+        """Paid stage, the history didn't know: comparables for what the SCOUT read — the product
+        (its exact key, or its German phrase for AI keys), or the two main parts of a bundle —
+        within the comparables budget (never deferred for this)."""
+        if plan.kind in scout_ai.BUNDLE_KINDS:
+            parts = scout_ai.unpriced_parts(plan)
+            for part in parts:
+                if part.ref is not None:
+                    part.estimate = await self._component_estimate(listing, part.ref, budget)
+            if not parts:
+                return None
+            sc = self.config.ai.scout
+            plan = scout_ai.reprice(plan, bundle_discount=sc.bundle_discount, pc_discount=sc.pc_discount,
+                                    min_priced_share=sc.min_priced_share)
+            return plan.estimate
+        if not plan.identified:
+            return None
+        if plan.ref.identity is not None:
+            est = await self._component_estimate(listing, plan.ref, budget)
+        elif plan.query and self._listing_target(listing) is None:
+            est = await self._market_estimate(listing, search, budget, query=plan.query, defer=False)
+        else:
+            return None
+        if est is not None and est.market_price and plan.item.qty > 1:
+            est = est.model_copy(update={"market_price": round(est.market_price * plan.item.qty, 2)})
+        return est if est is not None and est.market_price else None
+
+    async def _component_estimate(self, listing: Listing, ref: ProductRef, budget: _Budget | None) -> PriceEstimate | None:
+        """Market price of one product the scout named (identity key): history, cache, comparables."""
+        assert ref.identity is not None
+        target = _Target(ref.query, ref.identity, ref.identity.coarse_key())
+        est = self._history_estimate(listing, target)
+        if est is not None:
+            return est
+        cached = self._cached_comps(target)
+        if cached is not None:
+            return cached if cached.market_price else None
+        if budget is not None:
+            try:
+                if not budget.spend("comps_lookups"):
+                    return None
+            except _Deferred:
+                return None
+        try:
+            est = await self._comps_estimate(listing, target)
+        except RateBudgetExceeded:
+            if budget is not None:
+                budget.summary.comps_lookups -= 1
+            return None
+        return est if est.market_price else None
+
+    async def _scout_rescue(self, summary: RunSummary) -> list[DealView]:
+        """End of a pass, with the scout time left: a second look at recent ads the script
+        dismissed — the ones not read yet are read now; those whose (new or stored) reading
+        shows a possible deal go through the paid steps. Returns deals for a digest."""
+        if not self.scout_enabled or self._scout is None:
+            return []
+        sc = self.config.ai.scout
+        since = utcnow() - timedelta(hours=max(0.0, sc.backlog_hours))
+        try:
+            backlog = self.db.scout_backlog(since, min_interest=sc.min_interest, limit=200)
+        except sqlite3.Error as exc:
+            log.warning("AI scout backlog: %s", exc)
+            return []
+        if not backlog:
+            return []
+        self._scout_load([item.ad_id for item in backlog])
+        unread = [item for item in backlog if not (item.ad_id in self._scout_items and self._scout_items[item.ad_id].is_ai)]
+        if self._scout_mode() != "all":
+            unread = [item for item in unread if blind_spot(item)]
+        if unread and self._scout_deadline is not None and self._scout.clock() < self._scout_deadline:
+            unread.sort(key=lambda item: (-scout_priority(item), -_aware(item.first_seen).timestamp()))
+            await self._scout_run(unread, self._scout_deadline, {}, summary, rescue=True)
+        budget = self._budget_for(summary)
+        instant = self.config.notifications.mode == "instant"
+        found: list[tuple[_Candidate, SearchConfig]] = []
+        for listing in backlog:
+            ev = self.db.get_evaluation(listing.ad_id)
+            search = self.config.search_by_name(listing.search_name)
+            plan = self._scout_plan_for(listing)
+            if ev is None or search is None or plan is None or not self._rescuable(listing, ev, plan, search):
+                continue
+            summary.scout_promoted += 1
+            found.append((_Candidate(listing, plan.estimate, plan.estimate, plan=plan,
+                                     found_by=scout_ai.FOUND_BY_SCOUT, priority=plan.priority(listing),
+                                     script_skip=ev), search))
+        digest: list[DealView] = []
+        for cand, search in sorted(found, key=lambda pair: pair[0].discount):
+            budget.start_search()
+            budget.start_listing()
+            log.info("   🔎 второй взгляд: %s — %s", cand.listing.title[:60], _price_label(cand.listing))
+            try:
+                evaluation = await self._finish(cand, search, budget)
+            except (_Deferred, RateBudgetExceeded) as why:
+                if isinstance(why, RateBudgetExceeded):
+                    self._note_rate_limit(why, summary)
+                break  # the pass's budget is gone; the reading is stored, the next pass tries again
+            except BlockedError:
+                break
+            except Exception:  # noqa: BLE001
+                log.exception("AI scout rescue of %s failed", cand.listing.ad_id)
+                continue
+            deal = await self._after_evaluation(cand.listing, search, evaluation, summary, instant=instant)
+            if deal is not None:
+                digest.append(deal)
+        return digest
+
+    def _rescuable(self, listing: Listing, ev: Evaluation, plan: Any, search: SearchConfig) -> bool:
+        """Was this a dismissal the scout may overrule (kind veto / early skip, see _triage)?"""
+        if ev.found_by == scout_ai.FOUND_BY_SCOUT or ev.verdict != "skip":
+            return False
+        if ev.stage == "prefilter":
+            vetoed = next((kind for kind in SCOUT_OVERRULES if ev.reasons and ev.reasons[0].startswith(_KIND_SKIP_RU[kind])),
+                          None)
+            if vetoed is None or not _scout_may_overrule(vetoed, plan):
+                return False
+        elif ev.stage == "market":
+            if not self._scout_sees_other(plan, listing_identity(listing)):
+                return False
+        else:
+            return False
+        return self._scout_worth(listing, search, plan)
+
+    def _scout_save_stats(self, summary: RunSummary) -> None:
+        if self._scout is None:
+            return
+        sc = self.config.ai.scout
+        snap = self._scout.stats.snapshot(share=sc.pass_share, max_per_hour=sc.max_per_hour)
+        snap["saved_at"] = utcnow().isoformat()
+        try:
+            self.db.set_state(SCOUT_STATS_KEY, json.dumps(snap))
+        except (sqlite3.Error, AttributeError) as exc:
+            log.debug("AI scout stats not saved: %s", exc)
+
+    def scout_status(self) -> dict[str, Any]:
+        """For the UI (Настройки → Нейросеть, Состояние): on/off, endpoint, mode, "reads N of M new
+        ads per hour", speed, the vision queue."""
+        sc = self.config.ai.scout
+        enabled = bool(sc.enabled or self._injected["scout"])
+        settings = self._scout_llm_settings()
+        snap: dict[str, Any] = {}
+        if self._scout is not None:
+            snap = self._scout.stats.snapshot(share=sc.pass_share, max_per_hour=sc.max_per_hour)
+        else:
+            try:
+                state = self.db.get_state(SCOUT_STATS_KEY)
+                snap = json.loads(state[0]) if state and state[0] else {}
+            except (sqlite3.Error, ValueError, AttributeError):
+                snap = {}
+        try:
+            waiting = len(self.db.vision_queue())
+        except (sqlite3.Error, AttributeError):
+            waiting = 0
+        return scout_status_view(enabled=enabled, mode_setting=sc.mode, provider=settings.provider,
+                                 base_url=settings.base_url, model=settings.model, own_endpoint=bool(sc.base_url.strip()),
+                                 snap=snap, vision_waiting=waiting,
+                                 vision_wait_minutes=self.config.ai.vision_wait_minutes)
+
+    # ------------------------------------------------------------ vision queue
+    def _hold_for_vision(self, listing: Listing, search: SearchConfig, evaluation: Evaluation) -> None:
+        """A would-be deal whose photos the (offline) vision model couldn't check waits for it."""
+        if (evaluation.would_buy and evaluation.ai_checked is False and self.config.ai.vision_wait_minutes > 0
+                and self._evaluator is not None):
+            try:
+                self.db.queue_vision(listing.ad_id, search.name)
+            except sqlite3.Error as exc:
+                log.warning("Vision queue: %s", exc)
+
+    def _vision_hold(self, ad_id: str) -> bool:
+        wait = self.config.ai.vision_wait_minutes
+        if wait <= 0:
+            return False
+        try:
+            queued = self.db.vision_queued_at(ad_id)
+        except (sqlite3.Error, AttributeError):
+            return False
+        return queued is not None and utcnow() - _aware(queued) < timedelta(minutes=wait)
+
+    async def _drain_vision_queue(self, summary: RunSummary) -> None:
+        """Start of a pass: would-be deals held for the photo check. The vision model is back:
+        check them now; still off after ai.vision_wait_minutes: send them marked "фото не проверены"."""
+        try:
+            queue = self.db.vision_queue()
+        except (sqlite3.Error, AttributeError):
+            return
+        if not queue:
+            return
+        wait = timedelta(minutes=max(0.0, self.config.ai.vision_wait_minutes))
+        vision_up: bool | None = None
+        for ad_id, search_name, queued_at in queue:
+            ev, listing = self.db.get_evaluation(ad_id), self.db.get_listing(ad_id)
+            if ev is None or listing is None or ev.ai_checked is not False or not ev.would_buy:
+                self.db.unqueue_vision([ad_id])
+                continue
+            search = self.config.search_by_name(search_name) or SearchConfig(
+                name=search_name or listing.search_name or "—", purpose=ev.purpose)
+            expired = utcnow() - _aware(queued_at) >= wait
+            if not expired and self._evaluator is not None and vision_up is not False:
+                try:
+                    new = await self._conclude(listing, search, ev.estimate, self._source_for(listing), None,
+                                               ask_ai=True, plan=self._scout_plan_for(listing),
+                                               found_by=ev.found_by or scout_ai.FOUND_BY_SCRIPT)
+                except (BlockedError, RateBudgetExceeded, EbayAPIError):
+                    vision_up = False
+                    continue
+                except Exception:  # noqa: BLE001
+                    log.exception("Vision re-check of %s failed", ad_id)
+                    vision_up = False
+                    continue
+                summary.ai_calls += 1
+                if new.ai_checked is True:
+                    vision_up = True
+                    self.db.unqueue_vision([ad_id])
+                    log.info("📷 Фото проверены после ожидания: %s → %s", listing.title[:60], new.verdict)
+                    self._emit("deal_updated", self._deal_event(listing, search.name, new))
+                    await self._after_evaluation(listing, search, new, summary, instant=True, count=False)
+                    continue
+                vision_up = False
+            if expired:
+                self.db.unqueue_vision([ad_id])
+                log.info("📷 Нейросеть так и не проверила фото «%s» — присылаю с пометкой", listing.title[:60])
+                await self._after_evaluation(listing, search, ev, summary, instant=True, count=False)
+            else:
+                summary.vision_waiting += 1
+
+    # ---------------------------------------------------------- after a verdict
+    def _deal_event(self, listing: Listing, search_name: str, evaluation: Evaluation) -> dict[str, Any]:
+        """deal_found / deal_updated payload: the old keys, plus found_by, tier, the listing, the
+        evaluation and (when the web layer is installed) the deal card."""
+        payload: dict[str, Any] = {
+            "ad_id": listing.ad_id, "search_name": search_name, "title": listing.title,
+            "verdict": evaluation.verdict, "action": evaluation.action, "score": evaluation.score,
+            "found_by": evaluation.found_by,
+            "tier": deal_tier(evaluation, self.config.notifications.super_deals),
+            "listing": listing.model_dump(mode="json"),
+            "evaluation": evaluation.model_dump(mode="json"),
+        }
+        try:
+            from .web.api.presenters import deal_card
+
+            deal = self.db.get_deal_extras(listing.ad_id)
+            if deal is not None:
+                payload["card"] = deal_card(deal[0], deal[1], config=self.config)
+        except Exception:  # noqa: BLE001 - an event must never break monitoring
+            log.debug("deal card for the event failed", exc_info=True)
+        return payload
+
+    async def _after_evaluation(self, listing: Listing, search: SearchConfig, evaluation: Evaluation,
+                                summary: RunSummary, *, instant: bool, count: bool = True) -> DealView | None:
+        """Count, announce and alert one evaluated ad. «🔥 Супер-находка» goes out at once (past
+        the hourly cap and the digest mode); in digest mode other deals are returned for it."""
+        if count and evaluation.verdict == "buy":
+            summary.deals_found += 1
+            if evaluation.found_by == scout_ai.FOUND_BY_SCOUT:
+                summary.scout_deals += 1
+        if evaluation.verdict == "buy" or evaluation.action in DEAL_EVENT_ACTIONS:
+            self._emit("deal_found", self._deal_event(listing, search.name, evaluation))
+        if not self._should_notify(evaluation):
+            return None
+        deal = self.db.get_deal(listing.ad_id)
+        if deal is None:
+            return None
+        if deal_tier(evaluation, self.config.notifications.super_deals) == TIER_SUPER:
+            await self._alert(deal, summary, super_find=True)
+            return None
+        if instant:  # a good deal is gone in minutes: don't wait for the rest of the search
+            await self._alert(deal, summary)
+            return None
+        return deal
+
     # --------------------------------------------------------- notifications
     def _channels(self) -> list[str]:
         return [getattr(n, "name", "?") for n in self._notifiers or []]
@@ -1475,6 +2069,8 @@ class Monitor:
             return False
         unchecked = (evaluation.would_buy and evaluation.ai_checked is False and cfg.unchecked_deals
                      and "buy" in cfg.verdicts)
+        if unchecked and self._vision_hold(evaluation.ad_id):
+            return False  # waiting for the vision model (ai.vision_wait_minutes)
         if not unchecked and (evaluation.verdict not in cfg.verdicts or evaluation.score < cfg.min_score):
             return False
         deal = self.db.get_deal(evaluation.ad_id)
@@ -1485,9 +2081,15 @@ class Monitor:
             return not self.db.was_notified(evaluation.ad_id)
         return any(not self.db.was_notified(evaluation.ad_id, ch) for ch in channels)
 
-    async def _alert(self, deal: DealView, summary: RunSummary) -> None:
-        """Instant alert for one deal: repost check, then the hourly cap (overflow → digest later)."""
+    async def _alert(self, deal: DealView, summary: RunSummary, *, super_find: bool = False) -> None:
+        """Instant alert for one deal: repost check, then the hourly cap (overflow → digest later).
+        A «🔥 Супер-находка» skips the cap and gets its own headline."""
         if self._is_repost(deal.listing):
+            return
+        if super_find:
+            delivered = await self._notify([deal], summary, title=super_title(deal))
+            summary.notified += delivered
+            summary.super_deals += 1 if delivered else 0
             return
         if self._alert_cap_reached():
             self.db.queue_alert(deal.listing.ad_id)
@@ -1691,12 +2293,41 @@ class Monitor:
     async def _after_run(self, summary: RunSummary) -> None:
         """End of a pass: the AI health check, held-back alerts, the daily heartbeat."""
         if self._evaluator is not None and self._ai_failed and not self._ai_answered:
-            tail = (" Выгодные по цене объявления присылаю с пометкой «фото не проверены»."
-                    if self.config.notifications.unchecked_deals else "")
+            wait = self.config.ai.vision_wait_minutes
+            tail = ""
+            if self.config.notifications.unchecked_deals:
+                tail = (f" Выгодные по цене объявления жду до {wait:.0f} мин, потом присылаю с пометкой"
+                        " «фото не проверены»." if wait > 0 else
+                        " Выгодные по цене объявления присылаю с пометкой «фото не проверены».")
             hint = "Запусти приложение Ollama" if self.config.ai.provider == "ollama" else AI_DOWN_HINT_RU
             await self._health("ai_down", f"⚠ {AI_DOWN_RU}. {hint}." + tail, summary)
         await self._flush_alert_queue(summary)
         await self._maybe_heartbeat(summary)
+        await self._maybe_daily_top(summary)
+
+    async def _maybe_daily_top(self, summary: RunSummary) -> None:
+        """«Топ за день»: once a day at notifications.daily_top.hour (local time), the best deals
+        of the last 24 h per search as one message — including ones already sent."""
+        cfg = self.config.notifications.daily_top
+        if not cfg.enabled or not self._notifiers:
+            return
+        local = now_local()
+        today = local.date().isoformat()
+        state = self.db.get_state("daily_top")
+        if local.hour < cfg.hour or (state is not None and state[0] == today):
+            return
+        deals = self.db.top_deals_since(utcnow() - timedelta(days=1), verdicts=cfg.verdicts,
+                                        per_search=max(1, cfg.per_search))
+        self.db.set_state("daily_top", today)
+        if not deals:
+            return
+        title = f"Топ за день: {len(deals)} {_deals_word(len(deals))}"
+        for notifier in self._notifiers:
+            try:
+                await notifier.send(deals, title=title)
+            except Exception as exc:  # noqa: BLE001 - a digest never breaks a pass
+                log.warning("Топ за день через %s не ушёл: %s", getattr(notifier, "name", "?"), exc)
+        summary.health_alerts += 1
 
     async def _maybe_heartbeat(self, summary: RunSummary) -> None:
         """Once a day at notifications.heartbeat_hour (local time): "still alive" + 24 h stats."""
@@ -1751,6 +2382,41 @@ def _deals_word(n: int) -> str:
 def summary_buy_share(db: Database, listings: list[Listing]) -> float:
     verdicts = [ev.verdict for item in listings if (ev := db.get_evaluation(item.ad_id)) is not None]
     return sum(v == "buy" for v in verdicts) / len(verdicts) if verdicts else 0.0
+
+
+# kind vetoes the scout may overrule: only where hidden value is plausible AND the scout reads the
+# ad the same way (a PC priced by its parts, a laptop as an identified product). Never "part"
+# (missing components: "Switch nur Tablet"), accessories, defects, boxes, wanted/swap/service ads.
+SCOUT_OVERRULES = {"complete_pc": scout_ai.BUNDLE_KINDS, "laptop": frozenset({"single"})}
+SCOUT_NO_DEAL_PRIORITY = 0.9  # rank of a candidate the scout's price calls no deal (after the unknown ones)
+
+
+def _scout_may_overrule(kind: str, plan: Any) -> bool:
+    allowed = SCOUT_OVERRULES.get(kind)
+    if allowed is None or plan.kind not in allowed:
+        return False
+    return plan.kind != "single" or plan.identified
+
+
+def make_scout_llm(settings: LLMSettings) -> Any:
+    """The scout's text client: thinking off (Qwen3.x small models, docs/design/AI_MODELS.md §5)."""
+    if settings.provider in ("openai", "ollama"):
+        from .ai.client import VisionLLM
+
+        extra: dict[str, Any] = ({"think": False} if settings.provider == "ollama"
+                                 else {"chat_template_kwargs": {"enable_thinking": False}})
+        return VisionLLM(settings, extra_body=extra)
+    return make_llm(settings)
+
+
+def _capped_maybe(evaluation: Evaluation, warning: str) -> Evaluation:
+    """At most "maybe" (score ≤ 65), with the warning as a reason."""
+    update: dict[str, Any] = {"reasons": [*evaluation.reasons, warning], "score": min(evaluation.score, 65.0)}
+    if evaluation.verdict == "buy":
+        update["verdict"] = "maybe"
+        if evaluation.action == "buy":
+            update["action"] = "watch"
+    return evaluation.model_copy(update=update)
 
 
 def _cross_check(estimate: PriceEstimate, verdict: AIVerdict | None) -> PriceEstimate:

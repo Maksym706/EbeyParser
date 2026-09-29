@@ -27,13 +27,14 @@ You read second-hand ads from Kleinanzeigen.de and eBay.de for a student in Berl
 cheap things to resell. For EVERY ad return one object. Report only what the ad says; do not \
 guess prices. Keys:
 i: the ad number [i].
-k: kind: single (one product) | bundle (a product with extras, e.g. console + games) | \
-pc (whole computer: list its parts) | lot (Konvolut, Nachlass, box of mixed things) | \
-part (spare part) | acc (accessory, case, cable) | box (only packaging) | wanted (Suche, kaufe) | \
-swap (Tausch only) | service | defect (broken, for parts) | other (furniture, clothes, anything else).
+k: kind, default single (one product for sale). Others: bundle (a product with extras, e.g. console + \
+games) | pc (whole computer: list its parts) | lot (Konvolut, Nachlass, box of mixed things) | \
+part (spare part) | acc (accessory, case, cable) | box (nur OVP, leerer Karton) | wanted (Suche, Kaufe) | \
+swap (Tausche, nur Tausch) | service | defect (defekt, für Bastler, iCloud gesperrt) | other (furniture, \
+clothes, anything that is not electronics or tools).
 p: the exact product: brand model variant storage, e.g. "Apple iPhone 13 Pro 256GB", \
-"NVIDIA RTX 3080 10GB". Fix typos ("Iphne" -> "iPhone"). Use the text, not only the title. \
-"" if no model is named.
+"NVIDIA RTX 3080 10GB". Copy model numbers and sizes exactly as the ad writes them; fix typos \
+("Iphne" -> "iPhone"). Use the text, not only the title. "" if no model is named.
 n: how many of p (1 if one).
 c: for bundle, pc and lot: the valuable items inside with model names, e.g. ["RTX 3070", \
 "Ryzen 5 3600", "2x DualSense Controller"]. [] otherwise.
@@ -47,7 +48,7 @@ x: risk tags: scam (prepayment, only shipping, WhatsApp, too good) | defect | lo
 s: interest 0-10 for reselling: 9-10 valuable item hidden or far too cheap; 6-8 known \
 valuable product, resellable; 3-5 ordinary; 0-2 junk, wanted, swap, service, broken, scam.
 r: reason in Russian, at most 8 words.
-Answer ONLY with JSON: {"items": [{...}, ...]}.
+Answer ONLY with minified JSON on one line (no line breaks, no indentation): {"items":[{...},...]}.
 
 Example ads:
 [0] Titel: Alter Rechner | Preis: 150 € VB | Text: PC von meinem Sohn, i7 8700k, Grafikkarte \

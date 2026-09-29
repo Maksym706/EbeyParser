@@ -237,6 +237,93 @@ async def ai_test(body: AiTestIn | None = None, ctx: ApiContext = Depends(get_ct
     return result
 
 
+@router.post("/ai/scout/test", summary="Проверить нейросеть-разведчик: 4 объявления-примера (текст), скорость и качество")
+async def ai_scout_test(body: AiTestIn | None = None, ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
+    """Runs the scout's batch triage on built-in sample ads (a PC with a hidden RTX 3070, a typo,
+    a wanted ad, a pram) against the given or configured scout endpoint. save=true stores the
+    endpoint as ai.scout.* and switches the scout on."""
+    from ...ai.triage import TriageEngine, check_sample, sample_ads
+    from ...config import LLMSettings
+
+    body = body or AiTestIn()
+    ai, sc = ctx.config.ai, ctx.config.ai.scout
+    own = bool(sc.base_url.strip())
+    provider = body.provider or (sc.provider if own else ai.provider)
+    base_url = (body.base_url if body.base_url is not None else (sc.base_url if own else ai.base_url)).strip()
+    if provider == "ollama" and not base_url:
+        base_url = OLLAMA_URL
+    elif provider == "openai" and not base_url:
+        base_url = LMSTUDIO_URL
+    model = (body.model or sc.model).strip()
+    suggested = None
+    if not model:  # no scout model chosen: the catalog's best triage model installed on that server
+        try:
+            probe = _llm(ctx, LLMSettings(provider=provider, base_url=base_url, model=ai.model, max_images=0,
+                                          timeout_seconds=20))
+            try:
+                health = await asyncio.wait_for(probe.health(), timeout=20)
+            finally:
+                await probe.aclose()
+            from ...ai.model_catalog import best_installed
+
+            suggested = best_installed(list(health.get("models") or []), task="triage")
+        except Exception:  # noqa: BLE001 - only a suggestion
+            suggested = None
+        model = suggested or ai.model.strip()
+    if not model:
+        raise validation_error({"model": "укажи модель, например qwen3.5-2b"})
+    settings = LLMSettings(provider=provider, base_url=base_url, model=model,
+                           api_key=body.api_key if body.api_key is not None else (sc.api_key or ai.api_key),
+                           timeout_seconds=body.timeout_seconds, temperature=sc.temperature,
+                           max_tokens=sc.max_tokens, max_images=0)
+    result: dict[str, Any] = {"ok": False, "provider": provider, "base_url": base_url, "model": model,
+                              "seconds": None, "sec_per_ad": None, "per_hour": None, "answered": 0, "total": 4,
+                              "hidden_gpu": False, "typo_fixed": False, "wanted_seen": False, "items": [],
+                              "message_ru": "", "error_ru": "", "saved": False, "suggested_model": suggested}
+    try:
+        llm = _llm(ctx, settings)
+    except Exception as exc:  # noqa: BLE001
+        human = humanize(exc, "ai", host=base_url)
+        result["error_ru"] = result["message_ru"] = human.message_ru
+        return result
+    try:
+        engine = TriageEngine(llm, model=model, batch_size=4, min_batch=1, max_batch=4,
+                              max_tokens=settings.max_tokens, max_per_hour=0)
+        started = time.monotonic()
+        run = await engine.triage(sample_ads())
+        seconds = time.monotonic() - started
+    finally:
+        try:
+            await llm.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+    if run.error:
+        result["error_ru"] = result["message_ru"] = ai_problem(provider, base_url, model, run.error, server_ok=None)
+        return result
+    result.update(check_sample(run))
+    result["seconds"] = rnd(seconds, 1)
+    if result["answered"]:
+        per_ad = seconds / max(1, result["answered"])
+        result["sec_per_ad"] = rnd(per_ad, 2)
+        result["per_hour"] = int(3600 * sc.pass_share / per_ad) if per_ad > 0 else None
+    quality = sum(bool(result[k]) for k in ("hidden_gpu", "typo_fixed", "wanted_seen"))
+    result["ok"] = result["answered"] >= 3 and quality >= 2
+    if not result["answered"]:
+        result["message_ru"] = ("Модель ответила, но не так, как нужно — выбери другую модель (например Qwen2.5 3B"
+                                " Instruct) или увеличь её контекст до 8192")
+    elif result["ok"]:
+        result["message_ru"] = (f"Разведчик работает: {result['answered']} из 4 примеров за {seconds:.0f} с"
+                                + (f", успеет ≈ {result['per_hour']} объявлений в час" if result["per_hour"] else ""))
+    else:
+        result["message_ru"] = ("Модель отвечает, но читает объявления плохо (не нашла видеокарту в старом ПК или"
+                                " опечатку) — возьми модель побольше")
+    if result["ok"] and body.save:
+        ctx.write_values({"ai.scout.enabled": True, "ai.scout.provider": provider, "ai.scout.base_url": base_url,
+                          "ai.scout.model": model}, reason="ai")
+        result["saved"] = True
+    return result
+
+
 async def _sample_check(llm: Any, settings: Any, result: dict[str, Any]) -> None:
     from ...ai.evaluator import AIEvaluator
 
