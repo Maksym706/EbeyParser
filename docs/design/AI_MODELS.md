@@ -2,7 +2,8 @@
 
 Status: research and hands-on benchmark done on **2026-09-29**. The machine-readable version is
 `ebeyparser/ai/model_catalog.py` (`recommend(ram_gb, vram_gb, arm)`), tested in `tests/test_model_catalog.py`.
-Related: `docs/design/AI_SCOUT.md` (the triage pipeline that uses these models).
+Related: `docs/design/AI_SCOUT.md` (the triage pipeline that uses these models); free cloud models (NVIDIA Nemotron on
+OpenRouter / the NVIDIA API catalog / OmniRoute) instead of or next to these: `docs/design/CLOUD_AI.md`.
 
 **Rule zero: small models never produce prices.** They read, classify and flag. Every euro comes from our own price
 history (see AI_SCOUT.md §1). Section 7 lists the other risks.

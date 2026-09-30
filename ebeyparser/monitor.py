@@ -1119,7 +1119,7 @@ class Monitor:
         # 4: comparables, only when neither reference nor history knew the market
         if estimate is None and plan is not None and plan.usable:
             ident = listing_identity(listing)
-            if plan.estimate is not None and plan.estimate.market_price:
+            if plan.estimate is not None and plan.estimate.market_price and self._scout_price_fits(plan, ident):
                 estimate = plan.estimate  # the history knows the scout's product by now
             elif self._scout_sees_other(plan, ident) or found_by == scout_ai.FOUND_BY_SCOUT:
                 estimate = await self._scout_price(listing, search, plan, budget)
@@ -1830,6 +1830,16 @@ class Monitor:
         return scout_ai.worth_a_look(plan, deal_math=lambda est: self._deal_possible(listing, search, est),
                                      min_interest=self.config.ai.scout.min_interest)
 
+    @classmethod
+    def _scout_price_fits(cls, plan: Any, ident: Identity) -> bool:
+        """May the scout's market price stand for this ad? Not when the title names the product more
+        exactly than the scout's reading ("DeWalt DCD796 solo" read as the kit): then the ad's own
+        product is priced (comparables), never the kit's history."""
+        if plan.kind in scout_ai.BUNDLE_KINDS or ident.key is None or cls._scout_sees_other(plan, ident):
+            return True
+        mine = plan.ref.identity if plan.ref is not None else None
+        return mine is not None and mine.coarse_key() == ident.key.coarse_key()
+
     @staticmethod
     def _scout_sees_other(plan: Any, ident: Identity) -> bool:
         """The scout's product differs from what the title's identity says (or it is a bundle
@@ -1842,7 +1852,12 @@ class Monitor:
             return True
         if plan.ref.identity is None:  # an AI key beats only identity's catch-all reading of a title
             return ident.category in (None, "other")
-        return plan.ref.identity.coarse_key() != ident.key.coarse_key()
+        mine, title = plan.ref.identity, ident.key
+        if (mine.family, mine.model) == (title.family, title.model) and set(mine.variant) < set(title.variant):
+            # the scout only dropped words the title has ("DeWalt DCD796 solo" read as "DeWalt DCD796"):
+            # the title is the more exact reading — a solo tool never takes the kit's price
+            return False
+        return mine.coarse_key() != title.coarse_key()
 
     def _scout_candidate(self, listing: Listing, plan: Any, skip: Evaluation, summary: RunSummary,
                          counted: bool) -> _Candidate:

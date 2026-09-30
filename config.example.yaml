@@ -194,6 +194,20 @@ ai:
   # provider: ollama
   # base_url: http://localhost:11434
   # model: qwen3.5:9b-q4_K_M     # ollama pull qwen3.5:9b-q4_K_M
+  # ── Бесплатная нейросеть в облаке (docs/design/CLOUD_AI.md) — проще настроить в «Настройки → Нейросеть» ──
+  # Ключ — только в .env (OPENROUTER_API_KEY / NVIDIA_API_KEY / OMNIROUTE_API_KEY), не здесь.
+  # cloud: openrouter            # openrouter | nvidia | omniroute | custom; пусто = нейросеть на этом компьютере
+  # base_url: https://openrouter.ai/api/v1
+  # model: nvidia/nemotron-nano-12b-v2-vl:free       # фото; разведчику — scout.model ниже
+  # rpm: 0                       # запросов в минуту; 0 = само (OpenRouter 20, NVIDIA 40)
+  # daily_limit: 0               # запросов в день; 0 = само (OpenRouter 50, после покупки $10 — 1000)
+  # fallback:                    # «Облако + компьютер про запас»: когда лимит кончился — модель на этом ПК
+  #   enabled: true
+  #   provider: openai
+  #   base_url: http://localhost:1234/v1
+  #   model: qwen/qwen3.5-9b
+  cloud_send_ebay: false        # объявления с eBay в облако не отправлять (правила eBay API)
+  thinking: auto                # «размышления» модели: auto = выключены для фото и разведчика (быстрее)
 
   # Необязательно: «второе мнение» от Claude (облако, платно) — только для лучших находок.
   # Нужен ключ ANTHROPIC_API_KEY в .env и пакет:  pip install anthropic
@@ -222,6 +236,7 @@ ai:
     max_per_hour: 600           # не больше N объявлений в час (чтобы слабый процессор не задыхался)
     pass_share: 0.5             # не больше этой доли интервала проверок на чтение
     min_interest: 0             # «интерес» 0–10 у маленьких моделей почти случаен: решают цены; 0 = не отсеивать
+    # облако: model: nvidia/nemotron-3-super-120b-a12b:free — читает по 16–20 объявлений за запрос
 
 # ─── eBay (официальный API) ──────────────────────────────────────────────────
 # developer.ebay.com/my/keys → Production keyset: App ID → EBAY_CLIENT_ID, Cert ID → EBAY_CLIENT_SECRET (в .env).
