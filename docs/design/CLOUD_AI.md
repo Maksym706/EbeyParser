@@ -206,39 +206,51 @@ check. eBay ads never go to the cloud (§7).
 
 Seed 1 and seed 2, 400 stream ads each, about 2 simulated hours:
 
-| Profile | Scout quality | Precision | Recall (s1 / s2) | Gems bought (s1) | Traps bought | Scout read / not reached (s1) | Cloud requests · 429s · photos refused (s1) |
+| Profile | Scout quality | Precision (s1 / s2) | Recall (s1 / s2) | Gems bought (s1 / s2) | Traps bought | Scout read / not reached (s1) | Cloud requests · 429s · photos refused (s1) |
 |---|---|---|---|---|---|---|---|
-| no scout, local GPU photos | — | 100 % | 74 % / S2_SCRIPT | 23/47 | 0 | — | — |
-| local GPU 7B | oracle | 100 % | 84 % / S2_GPU_O | 36/47 | 0 | 467 / 1 | — |
-| local GPU 7B | noisy | 100 % | 79 % / S2_GPU_N | 35/47 | 0 | 468 / 0 | — |
-| weak local CPU 3B | weak | 100 % | 68 % / S2_WEAK | 27/47 | 0 | 305 / 396 | — |
-| OpenRouter free, 50/day | oracle | 100 % | 19 % / S2_F50_O | 8/47 | 0 | 105 / 737 | 50 · 2 · 139 |
-| OpenRouter free, 50/day | noisy | 100 % | 18 % / S2_F50_N | 8/47 | 0 | 107 / 735 | 50 · 2 · 136 |
-| OpenRouter free, 1000/day | oracle | 100 % | 74 % / S2_F1K_O | 30/47 | 0 | 383 / 358 | 182 · 13 · 65 |
-| OpenRouter free, 1000/day | noisy | 100 % | 60 % / S2_F1K_N | 25/47 | 0 | 374 / 349 | 177 · 13 · 69 |
-| NVIDIA, 40/min, no daily cap | oracle | 100 % | 80 % / S2_NV_O | 36/47 | 0 | 436 / 29 | 227 · 8 · 20 |
-| NVIDIA, 40/min, no daily cap | noisy | 100 % | 72 % / S2_NV_N | 34/47 | 0 | 436 / 37 | 239 · 8 · 20 |
+| no scout, local GPU photos | — | 100 / 100 % | 74 / 73 % | 23/47 · 26/48 | 0 | — | — |
+| local GPU 7B | oracle | 100 / 100 % | 84 / 83 % | 36/47 · 39/48 | 0 | 467 / 1 | — |
+| local GPU 7B | noisy | 100 / 100 % | 79 / 78 % | 34/47 · 35/48 | 0 | 468 / 0 | — |
+| weak local CPU 3B | weak | 100 / 100 % | 68 / 73 % | 27/47 · 29/48 | 0 | 305 / 396 | — |
+| OpenRouter free, 50/day | oracle | 100 / 100 % | 19 / 13 % | 8/47 · 8/48 | 0 | 105 / 737 | 50 · 2 · 139 |
+| OpenRouter free, 50/day | noisy | 100 / 100 % | 18 / 12 % | 8/47 · 7/48 | 0 | 107 / 735 | 50 · 2 · 136 |
+| OpenRouter free, 1000/day | oracle | 100 / 100 % | 74 / 61 % | 30/47 · 21/48 | 0 | 383 / 358 | 182 · 13 · 65 |
+| OpenRouter free, 1000/day | noisy | 100 / 100 % | 60 / 55 % | 25/47 · 19/48 | 0 | 374 / 349 | 177 · 13 · 69 |
+| NVIDIA, 40/min, no daily cap | oracle | 100 / 100 % | 80 / 79 % | 36/47 · 37/48 | 0 | 436 / 29 | 227 · 8 · 20 |
+| NVIDIA, 40/min, no daily cap | noisy | 100 / 100 % | 72 / 72 % | 34/47 · 33/48 | 0 | 436 / 37 | 239 · 8 · 20 |
 
 What this shows:
 
-* **Precision stays 100 % and no trap is ever bought in any profile.** A missing photo check caps
-  a deal at «maybe» («фото не проверены»); it never promotes one.
+* **Precision stays 100 % and no trap is ever bought in any profile, on both seeds.** A missing photo
+  check caps a deal at «maybe» («фото не проверены»); it never promotes one.
+* The cloud profile exposed a pricing hole in the scout itself, and it is fixed. A noisy scout had
+  read «DeWalt DCD796 Schlagbohrschrauber **solo**» as the kit, and the kit's history price made
+  the bare tool a «buy».
+  * Now a scout reading that only *drops* variant words of the title never counts as another
+    product (`Monitor._scout_sees_other`).
+  * Its history price never replaces the ad's own when the title is more exact
+    (`Monitor._scout_price_fits`).
+  * The local profiles keep 100 % with it.
 * **NVIDIA** is close to a local GPU. The gap is mostly the eBay rule: 20 eBay photo checks are
   never sent to the cloud.
-* **OpenRouter at 1000/day** matches the script-only baseline and beats the weak local CPU model
-  for gems (30 vs 27 gems bought, oracle). Upstream 429s with longer Retry-After values stop a
-  pass's scout and photo checks early. Those ads are read by later passes (the rescue), and the
-  held deals are re-checked from `vision_queue`.
-* **OpenRouter at 50/day** runs out within the first simulated hours on a category-scan
-  workload: about 160 photo-check candidates in 2 hours against 50 requests a day. Recall of
-  «покупать» collapses. The would-be deals still reach the user, marked «фото не проверены», but
-  the vague gems the photo model would have identified are lost. **Buy the $10 of credits once,
-  use NVIDIA, or choose «Облако + компьютер про запас».**
+* **OpenRouter at 1000/day** is on par with the script-only baseline or somewhat below it, and
+  better than the weak local CPU model for gems on seed 1. What costs recall is the free endpoints'
+  upstream 429s:
+  * A long Retry-After stops a pass's scout, which leaves 290–360 ads not reached, and stops its
+    photo checks early.
+  * Those ads are read by later passes (the rescue).
+  * The held deals are re-checked from `vision_queue`.
+* **OpenRouter at 50/day** runs out within the first simulated hours on a category-scan workload:
+  about 160 photo-check candidates in 2 hours against 50 requests a day, so recall of «покупать»
+  collapses.
+  * The would-be deals still reach the user, marked «фото не проверены».
+  * The vague gems that the photo model would have identified are lost.
+  * **Buy the $10 of credits once, use NVIDIA, or choose «Облако + компьютер про запас».**
 * The simulation is pessimistic for the cloud. It compresses a pass into LLM time only, so a 30 s
   Retry-After blocks the rest of a simulated pass. A real pass lasts minutes (page delays), so
   such a pause usually ends before the next search.
 
-Reproduce: `scratchpad` script or
+Reproduce:
 `python -m ebeyparser.benchmark_gems --seed 1 --n 400 --modes oracle,noisy --hardware cloud_free1000`.
 
 ## 7. Privacy and eBay
