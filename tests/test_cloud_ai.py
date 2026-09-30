@@ -583,7 +583,7 @@ async def test_the_photo_check_turns_thinking_off_on_every_runtime() -> None:
     body, req = await _first_body(LLMSettings(provider="openai", base_url=OR_URL, model="nvidia/nemotron-nano-12b-v2-vl:free",
                                               api_key="sk-or-test"))
     assert body["reasoning"] == {"enabled": False} and "chat_template_kwargs" not in body
-    assert req.headers["x-title"] == "EbeyParser" and req.headers["http-referer"].startswith("http://localhost")
+    assert req.headers["x-title"] == "EbeyParser" and req.headers["http-referer"] == "https://github.com/Maksym706/EbeyParser"
     assert body["max_tokens"] >= cloud.CLOUD_VISION_MAX_TOKENS
     body, _ = await _first_body(LLMSettings(provider="openai", base_url=NV_URL, api_key="nvapi-test",
                                             model="nvidia/llama-3.3-nemotron-super-49b-v1"))
