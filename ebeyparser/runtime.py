@@ -59,7 +59,9 @@ def file_logging(log_dir: Path) -> Iterator[Path | None]:
         handler = None
     root = logging.getLogger()
     if handler is not None:
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+        from .timefmt import LocalFormatter
+
+        handler.setFormatter(LocalFormatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
         root.addHandler(handler)
     try:
         yield path if handler is not None else None
@@ -207,6 +209,9 @@ def disable_quick_edit() -> bool:
 # ------------------------------------------------------------- dependencies
 PILLOW_WARNING = ("Pillow не установлен — фото уходят в нейросеть в полном размере, это медленно:"
                   " pip install -e .")
+# the same for the web UI (no commands there)
+PILLOW_WARNING_RU = ("Не хватает модуля для уменьшения фото — нейросеть будет работать медленнее. "
+                     "Переустанови программу, чтобы это исправить")
 
 
 def pillow_missing() -> bool:
@@ -219,6 +224,15 @@ def pillow_missing() -> bool:
 
 
 # -------------------------------------------------------------- one-time hints
+def remembered(data_dir: str | Path, key: str) -> bool:
+    """Was `key` already marked by once() for this data folder? (Does not mark it.)"""
+    try:
+        path = Path(data_dir) / ".hints"
+        return path.is_file() and key in path.read_text(encoding="utf-8").split()
+    except OSError:
+        return False
+
+
 def once(data_dir: str | Path, key: str) -> bool:
     """True the first time `key` is asked for this data folder (remembered in data/.hints)."""
     path = Path(data_dir) / ".hints"
@@ -259,11 +273,13 @@ def onedrive_warning(data_dir: Path) -> str | None:
 
 __all__ = [
     "PILLOW_WARNING",
+    "PILLOW_WARNING_RU",
     "AlreadyRunningError",
     "InstanceLock",
     "disable_quick_edit",
     "once",
     "pillow_missing",
+    "remembered",
     "file_logging",
     "force_utf8_console",
     "http_state_path",

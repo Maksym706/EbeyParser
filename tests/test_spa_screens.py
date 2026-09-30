@@ -1,0 +1,167 @@
+"""Static checks for the SPA screens Лента / Сделка / Мои сделки / Поиски / Состояние
+(ebeyparser/web/app/js/screens + js/features): every screen module has a default export,
+every icon it names exists, no CLI / config-file advice leaks into the UI, colours come from
+design tokens; plus the pure deal helpers (decision, offer rounding, German message) run
+under Node when it is installed."""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from ebeyparser.web.spa import SPA_DIR
+
+JS = SPA_DIR / "js"
+SCREENS = ["feed", "deal", "pipeline", "searches", "health"]
+FILES = sorted(
+    [JS / "screens" / f"{name}.js" for name in SCREENS]
+    + [p for sub in ("feed", "searches", "health") for p in (JS / "screens" / sub).glob("*.js")]
+    + list((JS / "features").glob("*.js"))
+)
+ICON_RE = re.compile(r"""(?:\bname|\bicon|iconRight)(?:=|:\s?)\$?\{?"([a-z0-9-]+)\"""")
+ICON_DEF_RE = re.compile(r'^\s+"([a-z0-9-]+)":', re.M)
+
+
+def _icons() -> set[str]:
+    names = set(ICON_DEF_RE.findall((JS / "ui" / "icons.js").read_text(encoding="utf-8")))
+    # additive registrations: Frontend B's extras, «Сборки» (features/projects-common.js), the AI scout (features/scout.js)
+    for extra in ("icons-extra.js", "projects-common.js", "scout.js"):
+        names |= set(ICON_DEF_RE.findall((JS / "features" / extra).read_text(encoding="utf-8")))
+    return names
+
+
+def test_files_found() -> None:
+    assert len(FILES) >= 15
+
+
+@pytest.mark.parametrize("name", SCREENS)
+def test_screen_modules_have_default_export(name: str) -> None:
+    text = (JS / "screens" / f"{name}.js").read_text(encoding="utf-8")
+    assert re.search(r"^export default function \w+\(", text, re.M), name
+    assert "ScreenPlaceholder" not in text
+
+
+def test_every_named_icon_exists() -> None:
+    known = _icons()
+    missing: dict[str, list[str]] = {}
+    for path in FILES:
+        for icon in ICON_RE.findall(path.read_text(encoding="utf-8")):
+            if icon not in known:
+                missing.setdefault(path.name, []).append(icon)
+    assert not missing, f"icons missing from ui/icons.js and features/icons-extra.js: {missing}"
+
+
+@pytest.mark.parametrize("pattern", [r"python -m", r"config\.yaml", r"\.env\b", r"ebeyparser (run|setup|check)"])
+def test_no_cli_advice_in_ui(pattern: str) -> None:
+    for path in FILES:
+        assert not re.search(pattern, path.read_text(encoding="utf-8")), f"{path.name} mentions {pattern}"
+
+
+def test_screen_styles_use_tokens() -> None:
+    css = (SPA_DIR / "css" / "screens.css").read_text(encoding="utf-8")
+    # the photo lightbox is always dark and slider thumbs are white in both themes (brief §6.8.4)
+    hexes = {h.lower() for h in re.findall(r"#[0-9a-fA-F]{3,8}\b", css)}
+    assert hexes <= {"#fff"}, hexes
+
+
+def _coarse_rules(css: str) -> str:
+    """The bodies of every `@media (pointer: coarse…)` block (touch devices only)."""
+    out = []
+    for m in re.finditer(r"@media [^{]*\(pointer: coarse\)[^{]*\{", css):
+        depth, i = 1, m.end()
+        while depth and i < len(css):
+            depth += {"{": 1, "}": -1}.get(css[i], 0)
+            i += 1
+        out.append(css[m.end():i])
+    return "\n".join(out)
+
+
+def test_small_controls_get_44px_on_touch_only() -> None:
+    """Touch targets that were under 44 px on tablets / phones: the settings side menu (38), the run-errors
+    count in the Состояние table (26 wide), the composer's «сегодня / завтра / в выходные» (28). The
+    desktop sizes stay; only coarse pointers get the bigger (or extended) targets."""
+    settings = (SPA_DIR / "css" / "settings.css").read_text(encoding="utf-8")
+    screens = (SPA_DIR / "css" / "screens.css").read_text(encoding="utf-8")
+    assert re.search(r"\.settings-nav__link \{[^}]*min-height: 38px", settings)  # desktop density kept
+    assert re.search(r"\.settings-nav__link \{\s*min-height: 44px;", _coarse_rules(settings))
+    touch = _coarse_rules(screens)
+    assert re.search(r"\.mini-seg button,\s*\.addon \{[^}]*height: 44px", touch)
+    assert re.search(r"\.mini-seg button \{[^}]*height: 28px", screens)
+    assert re.search(r"\.addon \{[^}]*height: 28px", screens)
+    # the table pill stays compact; its ::after reaches 44 × 44 (32 + 2 × 6 wide, 28 + 2 × 8 tall)
+    assert re.search(r"\.rtable \.runerr \{[^}]*min-width: 32px;[^}]*min-height: 28px", touch)
+    assert re.search(r"\.rtable \.runerr::after \{[^}]*inset: -8px -6px", touch)
+
+
+def test_compact_controls_get_invisible_44px_hit_areas_on_touch() -> None:
+    """The second sweep (every screen at 390 / 820, touch): the rail's logo (30) and «Демо-данные» (24),
+    the top search (36), the «Мои сделки» tile «?» (20), ChipInput's «×» (18) and suggestions (26), and
+    the «Сборки» phone rows whose compact 32 px links beat the shared 44 px .linkish rule. The look stays
+    compact where it should; an invisible pseudo-element makes the finger's target ≥ 44 × 44."""
+    css = {name: (SPA_DIR / "css" / f"{name}.css").read_text(encoding="utf-8") for name in ("shell", "screens", "projects")}
+    shell, screens, projects = (_coarse_rules(css[n]) for n in ("shell", "screens", "projects"))
+    # the rail: ::before (its ::after is the tooltip) centred, at least 44 × 44
+    assert re.search(r"\.sidebar__brand::before,\s*\.sidebar__demo::before \{[^}]*width: max\(100%, 44px\);"
+                     r"[^}]*height: max\(100%, 44px\)", shell)
+    assert re.search(r"\.topsearch \{\s*height: 44px;", shell)
+    assert re.search(r"\.sidebar\.is-collapsed \.sidebar__demo \{[^}]*width: 32px", css["shell"])  # compact look
+    # 20 px «?» + 2 × 12 = 44
+    assert re.search(r"\.tile__help::after \{[^}]*inset: -12px;", screens)
+    # «×»: 32 + 2 × 6 = 44; suggestions 34 (inside the border) + 2 × 5 = 44, 8 px apart
+    assert re.search(r"\.chipin__chip button \{[^}]*width: 32px;[^}]*height: 32px", screens)
+    assert re.search(r"\.chipin__chip button::after \{[^}]*inset: -6px;", screens)
+    assert re.search(r"\.chipin__add \{[^}]*height: 36px", screens)
+    assert re.search(r"\.chipin__add::after \{[^}]*inset: -5px -1px;", screens)  # 1 px border: padding box
+    assert re.search(r"\.chipin,\s*\.chipin__sugg \{\s*gap: 8px;", screens)
+    assert re.search(r"\.scard__name::after \{\s*z-index: 1;", screens)  # over the status badge under it
+    # «Сборки»: the phone rows keep 32 px links (overriding screens.css .linkish), the ::after keeps 44 px
+    assert re.search(r"\.pj-tslot__foot \.linkish \{\s*min-height: 32px;", css["projects"])
+    assert re.search(r"\.pj-hint__btn::after,[^{]*\.pj-screen \.linkish::after,[^{]*\{[^}]*"
+                     r"width: max\(100%, 44px\);[^}]*height: max\(100%, 44px\)", projects)
+    assert re.search(r"\.pj-tslot__foot \{\s*row-gap: 12px;", projects)  # 32 + 12 = 44: the areas never overlap
+
+
+NODE_SCRIPT = r"""
+const dm = await import(process.argv[2] + "/features/deal-model.js");
+const m = await import(process.argv[2] + "/features/messages.js");
+const haggle = { action: "haggle", price: 360, offer_price: 293, max_buy_price: 330, profit: 35, profit_at_offer: 95,
+                 negotiable: true, title: "iPhone 13 128GB Mitternacht, Top Zustand mit OVP!!!", score: 74 };
+const out = {
+  haggle: dm.decide(haggle),
+  bid: dm.decide({ action: "bid", price: 180, max_buy_price: 260, score: 81,
+                   auction: { bid_count: 5, ends_at: new Date(Date.now() + 3 * 3600e3).toISOString() } }),
+  personal: dm.decide({ purpose: "personal", action: "buy", price: 470, profit: 80, market_price: 550 }),
+  offers: [dm.humanOffer(293), dm.humanOffer(87), dm.humanOffer(1234)],
+  template: m.defaultTemplate(haggle),
+  message: m.quickMessage(haggle),
+  title: m.shortTitle({ ai: { product: "NVIDIA GeForce RTX 3090 24GB (Gigabyte Gaming OC)" } }),
+  flags: dm.explainFlags({ red_flags: ["Nur Tausch", "Vorkasse gewünscht"] }).map((f) => [f.text, f.scam]),
+  type: dm.productType({ title: "Gigabyte RTX 3090 Gaming OC" }),
+};
+console.log(JSON.stringify(out));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js not installed")
+def test_deal_helpers_under_node(tmp_path: Path) -> None:
+    script = tmp_path / "check.mjs"
+    script.write_text(NODE_SCRIPT, encoding="utf-8")
+    run = subprocess.run(["node", str(script), JS.as_posix()], capture_output=True, text=True, timeout=60)
+    assert run.returncode == 0, run.stderr
+    out = json.loads(run.stdout)
+    assert out["haggle"]["verb"] == "Торгуйся" and out["haggle"]["tone"] == "haggle"
+    assert "Предложи 290" in out["haggle"]["pill"] and out["haggle"]["badge"] == "Торг · 74"
+    assert out["bid"]["title"].startswith("Аукцион: ставь максимум 260")
+    assert out["personal"]["kind"] == "personal" and "Экономия 80" in out["personal"]["pill"]
+    assert out["offers"] == [290, 85, 1230]
+    assert out["template"] == "offer"
+    assert "Ich würde 290 € bieten" in out["message"] and out["message"].endswith("Viele Grüße")
+    assert "iCloud" in out["message"]  # phone add-on
+    assert out["title"] == "NVIDIA GeForce RTX 3090 24GB"
+    assert out["flags"][0] == ["Vorkasse gewünscht", True]
+    assert out["type"] == "gpu"

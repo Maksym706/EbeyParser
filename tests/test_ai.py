@@ -496,7 +496,7 @@ async def test_evaluator_fallback_on_connection_error(caplog):
     with caplog.at_level("WARNING", logger="ebeyparser.ai.evaluator"):
         v = await evaluator.evaluate(make_listing(), [JPEG])
     assert v.verdict == "maybe" and v.confidence == 0.0
-    assert "недоступна" in v.reasoning
+    assert "Ollama не отвечает" in v.reasoning and "ollama serve" not in v.reasoning  # plain Russian for the UI
     assert v.model == "qwen2.5vl:7b"
     assert any("AI check failed" in r.message for r in caplog.records)
 
@@ -530,7 +530,8 @@ async def test_evaluator_unexpected_exception_does_not_raise():
 
     cfg = AIConfig()
     v = await AIEvaluator(Broken(), cfg).evaluate(make_listing(), [])  # type: ignore[arg-type]
-    assert v.verdict == "maybe" and v.confidence == 0.0 and "boom" in v.reasoning
+    assert v.verdict == "maybe" and v.confidence == 0.0 and "Нейросеть" in v.reasoning
+    assert "RuntimeError" not in v.reasoning  # the technical text only goes to the log
 
 
 # --------------------------------------------------------------------------- model name resolution

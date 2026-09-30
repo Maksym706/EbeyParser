@@ -341,6 +341,13 @@ def test_whatsapp_or_prepay_bait_is_severe_only_when_cheap():
     assert FLAG_BAIT not in fair.red_flags
 
 
+def test_email_or_telegram_contact_is_bait_only_when_cheap():
+    for text in ("Bei Interesse bitte an max.muster@gmail.com schreiben.", "Schreib mir auf Telegram, bin selten hier."):
+        cheap = evaluate(listing(price=300, description=text), market(600), None, RESALE, PRICING)
+        assert cheap.verdict == "skip" and FLAG_BAIT in cheap.red_flags, text
+        assert evaluate(listing(price=420, description=text), market(600), None, RESALE, PRICING).verdict != "skip"
+
+
 # B — missing parts --------------------------------------------------------------------------
 
 

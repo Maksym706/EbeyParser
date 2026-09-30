@@ -13,6 +13,7 @@ from email.utils import formataddr, formatdate, make_msgid, parseaddr
 
 from ..config import EmailConfig
 from ..models import DealView
+from ..errors_ru import humanize
 from .base import NotifyError
 from .render import email_subject, render_email_html, render_text
 
@@ -68,10 +69,13 @@ class EmailNotifier:
         sender = (cfg.from_addr or cfg.username).strip()
         name, addr = parseaddr(sender)
         if not addr or "@" not in addr:
-            raise NotifyError("E-mail: не указан адрес отправителя (from_addr или username).")
+            raise NotifyError("E-mail: не указан адрес отправителя (from_addr или username).",
+                              message_ru="Укажи адрес почты, с которого слать письма", code="email_from",
+                              service="email")
         recipients = [a.strip() for a in cfg.to_addrs if a.strip()]
         if not recipients:
-            raise NotifyError("E-mail: не указаны получатели (to_addrs).")
+            raise NotifyError("E-mail: не указаны получатели (to_addrs).", message_ru="Укажи, куда слать письма",
+                              code="email_to", service="email")
 
         subject = " ".join((title or email_subject(deals)).split())  # no CR/LF in headers
         msg = EmailMessage()
@@ -103,7 +107,9 @@ class EmailNotifier:
         name, addr = parseaddr(sender)
         recipients = [a.strip() for a in cfg.to_addrs if a.strip()]
         if not addr or "@" not in addr or not recipients:
-            raise NotifyError("E-mail: не указан отправитель или получатели.")
+            raise NotifyError("E-mail: не указан отправитель или получатели.",
+                              message_ru="Почта настроена не до конца: укажи свой адрес и куда слать письма",
+                              code="not_configured", service="email")
         first = " ".join(text.splitlines()[0].split())
         msg = EmailMessage()
         msg["Subject"] = "EbeyParser: " + (first[:90] + "…" if len(first) > 90 else first)
@@ -131,7 +137,9 @@ class EmailNotifier:
         except NotifyError:
             raise
         except Exception as exc:  # noqa: BLE001 - everything becomes a readable NotifyError
-            raise NotifyError(self._explain(exc)) from exc
+            human = humanize(exc, "email", host=cfg.smtp_host)
+            raise NotifyError(self._explain(exc), message_ru=human.message_ru, code=human.code,
+                              service="email") from exc
         finally:
             if smtp is not None:
                 try:

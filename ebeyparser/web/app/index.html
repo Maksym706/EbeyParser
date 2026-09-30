@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#0b0d11" />
+    <meta name="description" content="EbeyParser — находит выгодные объявления на Kleinanzeigen и eBay" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="EbeyParser" />
+    <title>EbeyParser</title>
+    <link rel="icon" href="/app/icons/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/app/icons/apple-touch-icon.png" />
+    <link rel="manifest" href="/app/manifest.webmanifest" />
+    <script>
+      // Apply the saved theme before the first paint (no flash of the wrong colours).
+      (function () {
+        var pref = "system";
+        try {
+          pref = localStorage.getItem("ebp-theme") || "system";
+        } catch (e) {}
+        var light = pref === "light" || (pref !== "dark" && window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches);
+        document.documentElement.dataset.theme = light ? "light" : "dark";
+        if (light) document.querySelector('meta[name="theme-color"]').setAttribute("content", "#f6f7f9");
+      })();
+    </script>
+    <script type="importmap">
+      {
+        "imports": {
+          "preact": "/app/vendor/preact.module.js",
+          "preact/hooks": "/app/vendor/preact-hooks.module.js",
+          "htm": "/app/vendor/htm.module.js",
+          "uqr": "/app/vendor/uqr.module.js"
+        }
+      }
+    </script>
+    <link rel="modulepreload" href="/app/vendor/preact.module.js" />
+    <link rel="modulepreload" href="/app/vendor/preact-hooks.module.js" />
+    <link rel="modulepreload" href="/app/vendor/htm.module.js" />
+    <link rel="stylesheet" href="/app/css/tokens.css" />
+    <link rel="stylesheet" href="/app/css/base.css" />
+    <link rel="stylesheet" href="/app/css/components.css" />
+    <link rel="stylesheet" href="/app/css/shell.css" />
+    <link rel="stylesheet" href="/app/css/onboarding.css" />
+    <link rel="stylesheet" href="/app/css/settings.css" />
+    <link rel="stylesheet" href="/app/css/screens.css" />
+    <link rel="stylesheet" href="/app/css/projects.css" />
+    <link rel="stylesheet" href="/app/css/scout.css" />
+    <link rel="stylesheet" href="/app/css/cloud.css" />
+    <script type="module" src="/app/js/main.js"></script>
+  </head>
+  <body>
+    <div id="app">
+      <div class="splash" aria-busy="true">
+        <div class="splash__bar"><span></span></div>
+      </div>
+    </div>
+    <noscript>
+      <p style="padding: 24px; font-family: system-ui, sans-serif">
+        Для работы EbeyParser нужен включённый JavaScript. Можно открыть <a href="/classic">классический вид</a>.
+      </p>
+    </noscript>
+  </body>
+</html>

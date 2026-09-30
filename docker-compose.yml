@@ -1,36 +1,85 @@
-# 24/7 запуск:  docker compose up -d
-# Затем скачай модель:  docker compose exec ollama ollama pull qwen2.5vl:7b
-services:
-  ollama:
-    image: ollama/ollama:latest
-    restart: unless-stopped
-    volumes:
-      - ollama:/root/.ollama
-    # Раскомментируй, если есть видеокарта NVIDIA (нужен nvidia-container-toolkit):
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
+# EbeyParser 24/7 on a Linux home server (amd64 or arm64: mini-PC, old laptop, Raspberry Pi 5).
+#
+#   docker compose up -d                   the program (web panel + checks + Telegram)
+#   docker compose --profile ai up -d      + a small local AI on the CPU (Ollama): it reads every ad
+#   docker compose logs ebeyparser         the link for the phone: «Открой http://<IP>:8000/?token=…» + QR
+#
+# Everything else (city, categories, Telegram, the photo model on the gaming PC) is set up in the
+# web panel. Sized for a 4–8 GB box; with 16 GB put OLLAMA_MEM_LIMIT=6g into .env for the 4B model.
+# More: README → «Установка на домашний сервер (24/7)».
+name: ebeyparser
 
+x-logging: &logging  # Docker keeps the console output: at most 3 × 10 MB per service
+  driver: json-file
+  options: {max-size: "10m", max-file: "3"}
+
+services:
   ebeyparser:
     build: .
+    image: ebeyparser:local
     restart: unless-stopped
-    depends_on:
-      - ollama
-    env_file: .env
+    init: true
+    stop_grace_period: 30s
+    # The server's own network: the panel is at http://<server-IP>:8000 and at its Tailscale address,
+    # the program prints those real addresses, and reaches the gaming PC's LM Studio by LAN IP or
+    # Tailscale name. Access still needs the key from the log (or only this server: «access local»).
+    network_mode: host
+    extra_hosts: ["ollama:127.0.0.1"]  # the Ollama below (host network, 127.0.0.1 only)
     environment:
-      # inside Docker the AI runs in the "ollama" container, not LM Studio on the host
-      AI_PROVIDER: ollama
-      AI_BASE_URL: http://ollama:11434
-      AI_MODEL: qwen2.5vl:7b
+      TZ: Europe/Berlin
+      EBEYPARSER_OLLAMA_URL: http://ollama:11434  # with the `ai` profile the scout switches itself on
+      OLLAMA_MEM_LIMIT: ${OLLAMA_MEM_LIMIT:-3584m}
     volumes:
-      - ./config.yaml:/app/config.yaml
-      - ./data:/app/data
-    ports:
-      - "8000:8000"
+      - ebeyparser-data:/app/data  # config.yaml, .env (keys), database, log; backup: panel → Данные
+    mem_limit: ${APP_MEM_LIMIT:-512m}  # it uses ~100 MB
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    depends_on:
+      ollama: {condition: service_healthy, required: false}  # only with the `ai` profile
+    logging: *logging
+
+  # ---- profile `ai`: the scout model on this server's CPU -------------------------------------
+  ollama:
+    image: ollama/ollama:${OLLAMA_VERSION:-latest}
+    profiles: [ai]
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      OLLAMA_HOST: 127.0.0.1:11434  # not reachable from the network (Ollama has no password)
+      OLLAMA_KEEP_ALIVE: 24h  # keep the scout loaded: loading costs seconds of CPU every time
+      OLLAMA_MAX_LOADED_MODELS: "2"  # scout + embedding model together
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_CONTEXT_LENGTH: "8192"  # a batch of 8–16 ads + the answer
+    volumes:
+      - ollama-models:/root/.ollama
+    mem_limit: ${OLLAMA_MEM_LIMIT:-3584m}
+    cpu_shares: 512  # when the CPU is busy the web panel and the checks go first
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging: *logging
+
+  # One-shot: download the catalog's picks for this box (Qwen3.5 2B or 4B by RAM and
+  # OLLAMA_MEM_LIMIT, Qwen3-Embedding 0.6B). Already downloaded = done in seconds.
+  ollama-pull:
+    image: ebeyparser:local
+    pull_policy: never  # the image the `ebeyparser` service builds
+    profiles: [ai]
+    restart: "no"
+    network_mode: host
+    extra_hosts: ["ollama:127.0.0.1"]
+    environment:
+      OLLAMA_MEM_LIMIT: ${OLLAMA_MEM_LIMIT:-3584m}
+    command: ["python", "-m", "ebeyparser", "server-models", "--pull", "--ollama", "http://ollama:11434",
+              "--wait", "180", "--never-fail"]
+    healthcheck: {disable: true}
+    depends_on:
+      ollama: {condition: service_healthy}
+    logging: *logging
 
 volumes:
-  ollama:
+  ebeyparser-data:
+  ollama-models:

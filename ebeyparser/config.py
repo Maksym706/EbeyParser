@@ -94,6 +94,8 @@ class GeneralConfig(BaseModel):
     max_requests_per_hour: int = 150
     block_cooldown_hours: list[float] = Field(default_factory=lambda: [1.0, 2.0, 4.0, 12.0])
     baseline_first_run: bool = True  # first pass of a NEW search only learns prices, no alerts
+    # the user's time zone: every time in messages / the web UI / the log ("пауза до 21:34")
+    timezone: str = "Europe/Berlin"
 
     @field_validator("request_delay_seconds", mode="before")
     @classmethod
@@ -126,6 +128,13 @@ class PricingConfig(BaseModel):
 
 
 AIProvider = Literal["ollama", "openai", "anthropic"]
+# A free cloud endpoint (docs/design/CLOUD_AI.md): "" = a local server (LM Studio / Ollama / llama.cpp),
+# the default. The cloud ones are OpenAI-compatible (provider "openai"); their key lives in .env
+# (OPENROUTER_API_KEY / NVIDIA_API_KEY / OMNIROUTE_API_KEY / CLOUD_API_KEY), never in config.yaml.
+CloudKind = Literal["", "openrouter", "nvidia", "omniroute", "custom"]
+# The model's reasoning ("thinking"): "auto" = off for the photo check and the scout (answers in
+# seconds instead of minutes, all max_tokens go to the JSON), the model's default elsewhere.
+ThinkingMode = Literal["auto", "off", "on"]
 
 
 class LLMSettings(BaseModel):
@@ -142,6 +151,26 @@ class LLMSettings(BaseModel):
     temperature: float = 0.2  # ignored for Claude
     max_tokens: int = 700  # cap on the model's answer (a looping 7B model otherwise runs to the timeout)
     image_max_side: int = 1024  # photos are downscaled to this many px (needs Pillow; otherwise sent as is)
+    thinking: ThinkingMode = "auto"
+    # free cloud AI (docs/design/CLOUD_AI.md); "" keeps the local behaviour
+    cloud: CloudKind = ""
+    rpm: int = 0  # requests per minute; 0 = auto (the provider preset or the key's own limits)
+    daily_limit: int = 0  # requests per UTC day; 0 = auto (OpenRouter: 50, 1000 once $10 of credits were bought)
+
+
+class FallbackConfig(BaseModel):
+    """A local model that takes over while the cloud is limited (free quota used up, 429s) or
+    down. Empty / disabled = the usual "AI down" paths (the scout falls back to the script, photo
+    checks wait in the vision queue)."""
+
+    enabled: bool = False
+    provider: Literal["ollama", "openai"] = "openai"
+    base_url: str = ""
+    model: str = ""
+
+    @property
+    def usable(self) -> bool:
+        return self.enabled and bool(self.base_url.strip()) and bool(self.model.strip())
 
 
 class SecondOpinionConfig(LLMSettings):
@@ -156,11 +185,62 @@ class SecondOpinionConfig(LLMSettings):
     max_per_run: int = 10  # hard cap on paid calls per monitoring pass
 
 
+ScoutMode = Literal["auto", "all", "candidates"]
+
+
+class ScoutConfig(LLMSettings):
+    """The AI scout (docs/design/AI_SCOUT.md): a small TEXT model reads EVERY new ad in batches
+    (title, price, snippet) and says what it really is — product, bundle contents, hidden value,
+    risks, interest 0..10. It never guesses prices: those come from our own price history.
+
+    Its own endpoint: an always-on 2-4B model on the home server's CPU (llama.cpp / Ollama /
+    LM Studio), while `ai` (the vision model) may live on a gaming PC that is only sometimes on.
+    Empty base_url + model = use the `ai` endpoint and model for the scout too."""
+
+    enabled: bool = False
+    provider: AIProvider = "openai"
+    base_url: str = ""  # "" = the ai endpoint; e.g. http://127.0.0.1:8080/v1 (llama.cpp server)
+    model: str = ""  # "" = ai.model; e.g. "qwen3.5:2b-q4_K_M" (Ollama) or "qwen/qwen3.5-2b" (LM Studio)
+    timeout_seconds: float = 180.0
+    temperature: float = 0.1
+    max_tokens: int = 1800  # one batch answer; the engine also caps it per batch size
+    # "auto": every new ad while the model keeps up, else only the ads where the script is blind
+    # (no product found, PCs, bundles, lots); "all": always every ad; "candidates": only those
+    mode: ScoutMode = "auto"
+    # ads per model call, adapted between min_batch and max_batch; 0 = by the model's size
+    # (docs/design/AI_MODELS.md §5): 5 for ~2B models (they lose track in longer batches), 10 for 4B+
+    batch_size: int = 0
+    min_batch: int = 2
+    max_batch: int = 0  # 0 = by the model's size: 5 for ~2B, 16 for 4B+
+    max_per_hour: int = 600  # hard cap of ads per hour (a 4-core CPU must stay usable)
+    pass_share: float = 0.5  # at most this share of general.interval_minutes per pass goes to the scout
+    # The model's interest 0..10 is only a weak signal (a 2B barely tells deals from junk): the scout
+    # promotes an ad by a grounded product and real prices. An ad it rates below this is not
+    # promoted; 0 = interest never filters (only orders equal candidates).
+    min_interest: int = 0
+    backlog_hours: float = 6.0  # ads not reached in their pass are still read later (rescue) this long
+    bundle_discount: float = 0.15  # a bundle sells for the sum of its parts minus this
+    pc_discount: float = 0.25  # parting out a PC: more work, lower price
+    min_priced_share: float = 0.5  # share of a bundle's model-numbered parts that must have a market price
+    learn_from_feedback: bool = True  # hidden / bought / sold deals become hints in the prompt
+    # the scout's local stand-in while its cloud endpoint is limited; empty = ai.fallback's server
+    fallback: FallbackConfig = Field(default_factory=FallbackConfig)
+
+
 class AIConfig(LLMSettings):
     enabled: bool = False
     run_for: Literal["promising", "all"] = "promising"  # "promising" = skip obvious junk to save time
     min_prefilter_score: float = 20.0
+    # The vision model may be offline (the PC is off): a would-be deal waits this long for the photo
+    # check, then goes out marked "фото не проверены" (notifications.unchecked_deals). 0 = at once.
+    vision_wait_minutes: float = 45.0
     second_opinion: SecondOpinionConfig = Field(default_factory=SecondOpinionConfig)
+    scout: ScoutConfig = Field(default_factory=ScoutConfig)
+    # «Облако + компьютер про запас»: the local model for photos while the cloud is limited or down
+    fallback: FallbackConfig = Field(default_factory=FallbackConfig)
+    # eBay's API license forbids passing its content to third parties / AI training: eBay ads never
+    # go to a cloud endpoint unless this is switched on (they use the fallback or the script path)
+    cloud_send_ebay: bool = False
 
 
 class EbayConfig(BaseModel):
@@ -204,7 +284,29 @@ class TelegramConfig(BaseModel):
     chat_id: str = ""
 
 
+class SuperDealsConfig(BaseModel):
+    """«🔥 Супер-находка»: an exceptional deal (big profit AND ROI, sure market, photos checked,
+    no warnings) is sent at once, past the hourly cap and the digest mode, with its own headline."""
+
+    enabled: bool = True
+    min_profit: float = 120.0  # EUR net profit at the asking price
+    min_roi: float = 0.8  # 80 % return
+    min_score: float = 85.0
+
+
+class DailyTopConfig(BaseModel):
+    """«Топ за день»: once a day at `hour` (general.timezone) the best `per_search` deals of the
+    last 24 h per search, as one message (also the ones already sent)."""
+
+    enabled: bool = False
+    hour: int = 20
+    per_search: int = 3
+    verdicts: list[Literal["buy", "maybe"]] = Field(default_factory=lambda: ["buy", "maybe"])
+
+
 class NotificationsConfig(BaseModel):
+    super_deals: SuperDealsConfig = Field(default_factory=SuperDealsConfig)
+    daily_top: DailyTopConfig = Field(default_factory=DailyTopConfig)
     min_score: float = 70.0
     verdicts: list[Literal["buy", "maybe", "skip"]] = Field(default_factory=lambda: ["buy"])
     mode: Literal["instant", "digest"] = "instant"  # digest = one message per run

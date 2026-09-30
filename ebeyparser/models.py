@@ -13,8 +13,9 @@ from pydantic import BaseModel, Field
 Purpose = Literal["resale", "personal"]
 Source = Literal["kleinanzeigen", "ebay"]
 Verdict = Literal["buy", "maybe", "skip"]
-DealStatus = Literal["new", "starred", "contacted", "bought", "ignored"]
-DEAL_STATUSES: tuple[str, ...] = ("new", "starred", "contacted", "bought", "ignored")
+# pipeline Избранное (starred) → Написал (contacted) → Купил (bought) → Продал (sold); ignored = hidden
+DealStatus = Literal["new", "starred", "contacted", "bought", "sold", "ignored"]
+DEAL_STATUSES: tuple[str, ...] = ("new", "starred", "contacted", "bought", "sold", "ignored")
 
 
 def utcnow() -> datetime:
@@ -132,6 +133,10 @@ class Evaluation(BaseModel):
     # AI enabled but unavailable, and the math alone says "buy": stored as "maybe", still sent
     # (notifications.unchecked_deals) marked "⚠ ФОТО НЕ ПРОВЕРЕНЫ ИИ — проверь сам"
     would_buy: bool = False
+    # who found it: "script" (keywords / identity / price history) or "ai_scout" (only the AI scout's
+    # reading made it a candidate or gave it its market price: the «Нашла нейросеть» badge);
+    # "" = evaluated before the scout existed
+    found_by: Literal["", "script", "ai_scout"] = ""
     fees: float = 0.0  # selling fees when reselling
     shipping_cost: float = 0.0
     expected_profit: float | None = None  # resale: net profit; personal: savings vs market
@@ -165,7 +170,8 @@ class RunSummary(BaseModel):
     evaluated: int = 0
     deals_found: int = 0  # verdict == "buy"
     notified: int = 0
-    errors: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)  # plain Russian, shown in the web UI as is
+    error_details: list[str] = Field(default_factory=list)  # the technical text behind them (for «Подробнее»)
     # funnel (v0.2): how much work the pass did and what it saved
     prefiltered: int = 0  # dropped by free checks (keywords, wanted ad, below min price)
     early_skips: int = 0  # market known without requests and no deal -> no ad page / AI
@@ -177,3 +183,14 @@ class RunSummary(BaseModel):
     expired: int = 0  # deferred too long (general PENDING_MAX_AGE): given up, marked as expired
     queued_alerts: int = 0  # deals held back by notifications.max_alerts_per_hour (sent later as a digest)
     health_alerts: int = 0  # "AI down" / "site blocked" / heartbeat messages sent
+    # AI scout (docs/design/AI_SCOUT.md): ads the text model read, ads it didn't reach (script path),
+    # unusable answers (script fallback), model calls and seconds, dismissed ads it brought back
+    scout_read: int = 0
+    scout_overflow: int = 0
+    scout_failed: int = 0
+    scout_calls: int = 0
+    scout_seconds: float = 0.0
+    scout_promoted: int = 0
+    scout_deals: int = 0  # "buy" deals found by the scout
+    super_deals: int = 0  # «🔥 Супер-находка» alerts
+    vision_waiting: int = 0  # would-be deals waiting for the (offline) vision model

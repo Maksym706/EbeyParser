@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 from collections import OrderedDict
 import logging
 import random
@@ -26,17 +27,22 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
+from .ai import cloud as cloud_ai
+from .ai import scout as scout_ai
 from .ai.claude import make_llm
 from .ai.evaluator import AIEvaluator, same_variant_comparables
 from .ai.prompts import MAX_PROMPT_COMPARABLES, prompt_comparables
-from .config import AppConfig, GeneralConfig, SearchConfig
+from .ai.triage import (TriageEngine, TriageItem, blind_spot, expected_sec_per_ad, scout_priority,
+                        too_small_for_triage)
+from .config import AppConfig, GeneralConfig, LLMSettings, SearchConfig
 from .db import Database
 from .models import AIVerdict, Comparable, DealView, Evaluation, Listing, PriceEstimate, RunSummary, utcnow
 from .notify.base import build_notifiers
+from .notify.render import super_title
 from .pricing.estimator import (
     below_min_price,
     comparable_fits,
@@ -52,12 +58,18 @@ from .pricing.estimator import (
     prefilter,
     prefilter_score,
 )
+from .pricing.ai_key import ProductRef, ai_keys_compatible
 from .pricing.identity import Identity, ProductKey, identify
+from .pricing.tiers import TIER_SUPER, deal_tier
 from .pricing.text import SEVERE_FLAGS, detect_red_flags, is_model_key, make_search_query, normalize
-from .scraper.ebay_api import EbayAPIError, EbayBrowseClient
+from .errors_ru import AI_DOWN_RU, ai_problem, budget_message, humanize
+from .scraper.ebay_api import EBAY_NOT_CONNECTED_RU, EbayAPIError, EbayBrowseClient
 from .scraper.ebay_sold import EbaySoldScraper
 from .scraper.http import BlockedError, PoliteClient, RateBudgetExceeded
+from .scraper.kleinanzeigen import BASE_URL as KA_BASE_URL
 from .scraper.kleinanzeigen import KleinanzeigenScraper, PageLayoutError
+from .timefmt import apply_config as apply_timezone
+from .timefmt import at_label, now_local, when_label
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +107,14 @@ _BUDGET_LIMITS = {
 _BUDGET_RU = {"comps_lookups": "поисков аналогов", "details_fetched": "страниц объявлений", "ai_calls": "вызовов ИИ"}
 # price filter inside a pasted Kleinanzeigen URL: /preis:100:400/ or ?minPrice=100
 _URL_PRICE_FILTER_RE = re.compile(r"preis:\d|preis::\d|[?&](?:minPrice|maxPrice)=\d", re.IGNORECASE)
+# Event hooks (web UI live updates): on_event(kind, data) with kind one of run_started,
+# run_finished, deal_found, health_alert, monitor_paused, monitor_resumed.
+EventHook = Callable[[str, dict[str, Any]], Any]
+PAUSED_STATE_KEY = "monitor:paused"  # kv_state: "1" = passes are skipped (survives restarts)
+SCOUT_STATS_KEY = "scout:stats"  # kv_state: the AI scout's last throughput snapshot (JSON)
+scout_feedback_hints = scout_ai.feedback_hints
+scout_status_view = scout_ai.status_view
+DEAL_EVENT_ACTIONS = frozenset({"buy", "haggle", "bid"})
 
 
 class AlreadyRunningError(RuntimeError):
@@ -108,13 +128,22 @@ class _Candidate:
     listing: Listing
     estimate: PriceEstimate | None  # reference / history market price; None = look up comparables
     hint: PriceEstimate | None = None  # any price known so far (only to rank candidates)
+    # AI scout (docs/design/AI_SCOUT.md): its priced reading of the ad, who made it a candidate,
+    # its rank when the market is unknown, and what the script alone would have stored
+    plan: Any = None  # ai.scout.ScoutPlan
+    found_by: str = "script"
+    priority: float | None = None
+    script_skip: Evaluation | None = None
 
     @property
     def discount(self) -> float:
-        """Buy cost / market price: lower = more promising. Free ads first."""
+        """Buy cost / market price: lower = more promising. Free ads first. Without a market
+        price the AI scout's interest decides (junk after everything else)."""
         listing = self.listing
         if listing.is_free:
             return 0.0
+        if self.priority is not None and (self.estimate is None or self.found_by == scout_ai.FOUND_BY_SCOUT):
+            return self.priority
         est = self.estimate or self.hint
         if listing.price is None or listing.price <= 1 or est is None or not est.market_price:
             return UNKNOWN_DISCOUNT
@@ -228,10 +257,12 @@ class Monitor:
         second_evaluator: AIEvaluator | None = None,
         notifiers: list[Any] | None = None,
         web_base_url: str | None = None,
+        scout: TriageEngine | None = None,
     ):
         self.config = config
         self.db = db
         self.web_base_url = web_base_url
+        apply_timezone(config)
         self._client: PoliteClient | None = None
         self._scraper = scraper
         self._ebay = ebay
@@ -248,30 +279,107 @@ class Monitor:
             "evaluator": evaluator is not None,
             "second": second_evaluator is not None,
             "notifiers": notifiers is not None,
+            "scout": scout is not None,
         }
+        # AI scout (docs/design/AI_SCOUT.md): a small text model reads every new ad first
+        self._scout = scout
+        self._scout_llm: Any = None
+        # a cloud scout's local stand-in (ai.scout.fallback / ai.fallback) with its own batch sizes
+        self._scout_local: TriageEngine | None = None
+        self._scout_local_llm: Any = None
+        self._scout_items: dict[str, TriageItem] = {}  # this pass: ad id -> the scout's reading
+        self._scout_plans: dict[str, Any] = {}  # ad id -> ai.scout.ScoutPlan (priced reading)
+        self._scout_deadline: float | None = None  # engine clock: end of this pass's scout time
+        self._scout_searches_left = 0
+        self._scout_hints_text: str | None = None
+        self._scout_down_reported = False
+        self._scout_small_warned = False
         self._second_calls = 0
         self._rate_limited: dict[str, datetime] = {}  # host -> retry_at, this pass
         self._budget: _Budget | None = None
         self._comps_cache: OrderedDict[str, tuple[float, PriceEstimate]] = OrderedDict()
         self._ai_answered = 0  # AI calls of this pass that got a real answer ...
         self._ai_failed = 0  # ... and that failed (LM Studio down)
+        self._ai_limited = 0  # ... and that the free cloud quota did not allow (docs/design/CLOUD_AI.md)
+        self._ai_limited_ru = ""
+        cloud_ai.registry().attach(db)  # cloud quota counters survive restarts (kv_state)
         self._upkeep_done = False
         self._ebay_blocked = False
         self._running = False
         self.last_summary: RunSummary | None = None
         self.next_run_at = None
+        self.on_event: list[EventHook] = []  # live-update hooks, see EventHook
+        self._wake: asyncio.Event | None = None  # interrupts run_forever's wait (pause/resume)
+        self._event_alerts: dict[str, datetime] = {}  # health_alert events: kind -> last emitted
+        self._paused = self._load_paused()
+        self.progress: dict[str, Any] | None = None  # current pass: search N of M (run_progress)
+        self._stage_cb: Callable[[str, str], Any] | None = None  # single-ad check: step reporter
 
     # ------------------------------------------------------------ lifecycle
     @property
     def is_running(self) -> bool:
         return self._running
 
+    @property
+    def paused(self) -> bool:
+        """Automatic passes are skipped while paused (a manual run_once still works)."""
+        return self._paused
+
+    def pause(self) -> None:
+        """Skip automatic passes until resume(); the current pass (if any) finishes. Persisted."""
+        if self._paused:
+            return
+        self._paused = True
+        self._store_paused()
+        self.next_run_at = None
+        self._poke()
+        self._emit("monitor_paused", {"paused": True})
+
+    def resume(self) -> None:
+        """Automatic passes again; an overdue pass starts right away."""
+        if not self._paused:
+            return
+        self._paused = False
+        self._store_paused()
+        self._poke()
+        self._emit("monitor_resumed", {"paused": False})
+
+    def _load_paused(self) -> bool:
+        try:
+            state = self.db.get_state(PAUSED_STATE_KEY)
+        except (sqlite3.Error, AttributeError):
+            return False
+        return bool(state and state[0] == "1")
+
+    def _store_paused(self) -> None:
+        try:
+            self.db.set_state(PAUSED_STATE_KEY, "1" if self._paused else "0")
+        except (sqlite3.Error, AttributeError) as exc:
+            log.warning("Pause state not saved: %s", exc)
+
+    def _poke(self) -> None:
+        if self._wake is not None:
+            self._wake.set()
+
+    def _emit(self, kind: str, data: dict[str, Any]) -> None:
+        """Call every on_event hook; a failing hook never breaks monitoring."""
+        for hook in list(self.on_event):
+            try:
+                result = hook(kind, data)
+                if inspect.isawaitable(result):
+                    asyncio.ensure_future(result)
+            except Exception:  # noqa: BLE001
+                log.exception("Event hook failed (%s)", kind)
+
     def update_config(self, config: AppConfig) -> None:
         """Apply a new config; network/AI components are rebuilt lazily."""
         old_general = self.config.general
         self.config = config
+        apply_timezone(config)
         self._comps_cache.clear()
-        if self._client is not None and _request_settings(old_general) != _request_settings(config.general):
+        # compare with what the client was built from: the web UI changes the shared config in place
+        built_from = getattr(self, "_client_settings", None) or _request_settings(old_general)
+        if self._client is not None and built_from != _request_settings(config.general):
             self._client = _close_soon(self._client)  # new delays / limits / user agent
             if not self._injected["scraper"]:
                 self._scraper = None
@@ -287,6 +395,73 @@ class Monitor:
             self._second_llm = _close_soon(self._second_llm)
         if not self._injected["ebay_api"]:
             self._ebay_api = _close_soon(self._ebay_api)
+        if not self._injected["scout"]:
+            self._scout = None
+            self._scout_llm = _close_soon(self._scout_llm)
+            self._scout_local = None
+            self._scout_local_llm = _close_soon(self._scout_local_llm)
+
+    def _scout_llm_settings(self) -> LLMSettings:
+        """The scout's endpoint: its own (the always-on small model) or, left empty, the ai one."""
+        return scout_llm_settings(self.config)
+
+    def _scout_fallback(self) -> LLMSettings | None:
+        return scout_fallback_settings(self.config)
+
+    def _vision_fallback(self) -> LLMSettings | None:
+        return vision_fallback_settings(self.config)
+
+    def _scout_quota(self, engine: Any = None) -> Any:
+        """The cloud quota of the scout's (main) endpoint, or None for a local scout."""
+        engine = engine if engine is not None else self._scout
+        llm = getattr(engine, "llm", None) if engine is not None else None
+        quota = getattr(llm, "quota", None)
+        if quota is not None or engine is not None:
+            return quota
+        return cloud_ai.registry().for_settings(self._scout_llm_settings())
+
+    def _scout_pick(self, *, ebay: bool) -> Any:
+        """The engine for these ads: the cloud one while it may be called, its local stand-in while
+        the cloud is limited — and for eBay ads, which never go to the cloud (eBay's API license,
+        ai.cloud_send_ebay). None = the script path."""
+        primary, local = self._scout, self._scout_local
+        quota = self._scout_quota()
+        if quota is None:
+            return primary
+        if ebay and not self.config.ai.cloud_send_ebay:
+            return local
+        if local is not None and quota.blocked("triage") is not None:
+            return local
+        return primary
+
+    def _vision_llm(self) -> Any:
+        """The photo check's client (the evaluator's own, also when a test injects one)."""
+        return getattr(self._evaluator, "llm", None) or self._llm
+
+    def _vision_policy(self, listing: Listing) -> str:
+        """May the photo model see this ad? "" = yes; "local" = only the local stand-in (an eBay
+        ad and a cloud endpoint); "none" = no model may (an eBay ad, the cloud without a stand-in)."""
+        if listing.source != "ebay" or self.config.ai.cloud_send_ebay:
+            return ""
+        llm = self._vision_llm()
+        if not getattr(llm, "cloud", ""):
+            return ""
+        return "local" if isinstance(llm, cloud_ai.CloudRouter) else "none"
+
+    def _scout_too_small(self) -> bool:
+        """No triage with a model under ~2B (docs/design/AI_MODELS.md §4: the 0.8B renumbered and
+        copied ads). The user's model stays as configured; the status says why the scout is idle."""
+        model = self._scout_llm_settings().model
+        if not too_small_for_triage(model):
+            return False
+        if not self._scout_small_warned:
+            self._scout_small_warned = True
+            log.warning("AI scout: %s is too small for reading ads (under 2B) — the scout stays off", model)
+        return True
+
+    @property
+    def scout_enabled(self) -> bool:
+        return self._scout is not None and (self._injected["scout"] or self.config.ai.scout.enabled)
 
     def _ensure_components(self) -> None:
         if self._client is None and not (self._injected["scraper"] and self._injected["ebay"]):
@@ -294,6 +469,7 @@ class Monitor:
             self._client = PoliteClient.from_config(
                 self.config.general, state_path=self.config.data_path / "http_state.json"
             )
+            self._client_settings = _request_settings(self.config.general)
         if self._scraper is None:
             self._scraper = KleinanzeigenScraper(self._client, debug_dir=self.config.data_path / "debug")
         if self._ebay is None:
@@ -304,22 +480,36 @@ class Monitor:
             )
         ai = self.config.ai
         if self._evaluator is None and ai.enabled and not self._injected["evaluator"]:
-            self._llm = make_llm(ai)
+            self._llm = make_llm(ai, purpose="vision", fallback=self._vision_fallback())
             self._evaluator = AIEvaluator(self._llm, ai)
         so = ai.second_opinion
         if self._second is None and so.enabled and not self._injected["second"]:
             try:
-                self._second_llm = make_llm(so)
+                self._second_llm = make_llm(so, purpose="second_opinion")
                 self._second = AIEvaluator(self._second_llm, so)
             except Exception as exc:  # e.g. anthropic package missing
                 log.warning("Second opinion disabled: %s", exc)
+        sc = ai.scout
+        if self._scout is None and sc.enabled and not self._injected["scout"] and not self._scout_too_small():
+            try:
+                settings = self._scout_llm_settings()
+                self._scout_llm = make_scout_llm(settings)
+                self._scout = TriageEngine.from_config(self._scout_llm, sc.model_copy(
+                    update={"model": settings.model, "max_tokens": settings.max_tokens}))
+                local = self._scout_fallback()
+                if local is not None:
+                    self._scout_local_llm = make_scout_llm(local)
+                    self._scout_local = TriageEngine.from_config(self._scout_local_llm,
+                                                                 sc.model_copy(update={"model": local.model}))
+            except Exception as exc:  # e.g. anthropic package missing: the script path works as before
+                log.warning("AI scout disabled: %s", exc)
         if self._notifiers is None:
             self._notifiers = build_notifiers(
                 self.config.notifications, web_base_url=self.web_base_url
             )
 
     async def aclose(self) -> None:
-        for name in ("_llm", "_second_llm", "_ebay_api"):
+        for name in ("_llm", "_second_llm", "_scout_llm", "_scout_local_llm", "_ebay_api"):
             obj = getattr(self, name)
             if obj is not None:
                 await obj.aclose()
@@ -337,9 +527,9 @@ class Monitor:
         base = {"provider": ai.provider, "base_url": ai.base_url, "model": ai.model}
         if not ai.enabled:
             return {**base, "ok": False, "enabled": False, "model_available": False,
-                    "error": "ИИ выключен в конфиге (ai.enabled: false)"}
+                    "error": "Нейросеть выключена в настройках"}
         try:
-            llm = self._llm or make_llm(ai)
+            llm = self._llm or make_llm(ai, purpose="vision", fallback=self._vision_fallback())
         except Exception as exc:
             return {**base, "ok": False, "enabled": True, "model_available": False, "error": str(exc)}
         try:
@@ -353,7 +543,20 @@ class Monitor:
 
     # --------------------------------------------------------------- running
     async def run_forever(self, stop: asyncio.Event) -> None:
+        """A pass every general.interval_minutes (±10 %) until `stop`; passes are skipped while
+        paused, and after resume() an overdue pass starts at once."""
+        due: datetime | None = None
         while not stop.is_set():
+            if self._paused:
+                self.next_run_at = None
+                await self._idle(stop, None)
+                continue
+            if due is not None:
+                left = (due - utcnow()).total_seconds()
+                if left > 0:
+                    self.next_run_at = due
+                    await self._idle(stop, left)
+                    continue
             try:
                 await self.run_once()
             except AlreadyRunningError:
@@ -362,12 +565,42 @@ class Monitor:
                 log.exception("Monitoring run crashed")
             interval = max(1.0, self.config.general.interval_minutes) * 60
             interval *= random.uniform(0.9, 1.1)  # don't hit the site on an exact beat
-            self.next_run_at = utcnow() + timedelta(seconds=interval)
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=interval)
-            except asyncio.TimeoutError:
-                pass
+            due = self._after_cooldown(utcnow() + timedelta(seconds=interval))
+            self.next_run_at = due
         self.next_run_at = None
+
+    def kleinanzeigen_cooldown_end(self) -> datetime | None:
+        """When Kleinanzeigen's block cooldown ends (None = not cooling down)."""
+        client = self._client
+        if client is None:
+            return None
+        try:
+            remaining = client.cooldown_remaining(KA_BASE_URL)
+        except Exception:  # noqa: BLE001 - a test double without the method
+            return None
+        return utcnow() + timedelta(seconds=remaining) if remaining > 0 else None
+
+    def _after_cooldown(self, due: datetime) -> datetime:
+        """Only Kleinanzeigen searches and the site asked for a pause: the next pass right after
+        the pause, not a pass that would only meet it (the UI says "продолжу в 21:34")."""
+        end = self.kleinanzeigen_cooldown_end()
+        enabled = [s for s in self.config.searches if s.enabled]
+        if end is None or end <= due or not enabled or any(s.source != "kleinanzeigen" for s in enabled):
+            return due
+        return end + timedelta(seconds=random.uniform(30, 120))
+
+    async def _idle(self, stop: asyncio.Event, timeout: float | None) -> None:
+        """Wait for `stop`, a pause/resume poke or `timeout` seconds (None = no timeout)."""
+        if self._wake is None:
+            self._wake = asyncio.Event()
+        wake = self._wake
+        waiters = [asyncio.ensure_future(stop.wait()), asyncio.ensure_future(wake.wait())]
+        try:
+            await asyncio.wait(waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
+        wake.clear()
 
     async def run_once(self) -> RunSummary:
         if self._running:
@@ -375,71 +608,84 @@ class Monitor:
         searches = [s for s in self.config.searches if s.enabled]
         if not searches:
             summary = RunSummary(finished_at=utcnow())
-            summary.errors.append("Нет активных поисков — добавь их на странице «Поиски» или в config.yaml")
+            _add_error(summary, "Нет активных поисков — добавь их на странице «Поиски»")
             self.last_summary = summary
+            self._emit("run_finished", summary.model_dump(mode="json"))
             return summary
 
         self._running = True
         self._ebay_blocked = False
         self._rate_limited = {}
         self._second_calls = 0
-        self._ai_answered = self._ai_failed = 0
+        self._ai_answered = self._ai_failed = self._ai_limited = 0
         summary = self.db.start_run()
         digest: list[DealView] = []
+        self._emit("run_started", {"run_id": summary.id, "started_at": summary.started_at.isoformat(),
+                                   "searches": len(searches)})
         try:
             self._ensure_components()
+            await self._cloud_probe()
             self._upkeep()
             self._prune_history()
+            self._scout_begin_pass(len(searches))
             await self._retry_deliveries(summary)
+            await self._drain_vision_queue(summary)
             for search in searches:
                 summary.searches += 1
+                self.progress = {"run_id": summary.id, "index": summary.searches, "total": len(searches),
+                                 "search_name": search.name, "started_at": summary.started_at.isoformat()}
+                self._emit("run_progress", dict(self.progress))
                 seen_before = summary.listings_seen
                 try:
                     deals = await self._process_search(search, summary)
                 except BlockedError as exc:
                     if getattr(exc, "cooling_down", False):  # no request was sent this time
-                        summary.errors.append(f"Kleinanzeigen: пауза после блокировки{_minutes_left(exc)}")
+                        _add_error(summary, f"Kleinanzeigen попросил паузу — продолжу сам{_until_text(exc)}"
+                                   if _until_text(exc) else "Kleinanzeigen попросил паузу — продолжу сам позже",
+                                   f"{exc}{_minutes_left(exc)}")
                         log.info("Kleinanzeigen still cooling down after a block: %s", exc)
                     else:
-                        summary.errors.append(
-                            f"Kleinanzeigen ограничил запросы ({exc}). Проверка остановлена — "
-                            "увеличь general.interval_minutes и request_delay_seconds."
-                        )
+                        _add_error(summary, "Kleinanzeigen временно ограничил запросы — делаю паузу и продолжу сам"
+                                   f"{_until_text(exc)}. Чтобы это случалось реже, проверяй реже", str(exc))
                         log.warning("Blocked by Kleinanzeigen: %s", exc)
-                        await self._health("blocked", f"⚠ Kleinanzeigen ограничил запросы, пауза{_until_text(exc)}."
-                                           " Проверки продолжатся сами.", summary)
+                        await self._health("blocked", f"⚠ Kleinanzeigen попросил паузу — продолжу сам{_until_text(exc)}."
+                                           " Ничего делать не нужно.", summary)
                     break
                 except RateBudgetExceeded as exc:  # our own hourly cap: not a block, try next pass
                     self._note_rate_limit(exc, summary)
                     continue
                 except PageLayoutError as exc:
                     log.warning("Search %r: %s", search.name, exc)
-                    summary.errors.append(f"{search.name}: {exc}")
+                    _add_error(summary, f"{search.name}: {exc.message_ru}", str(exc))
                     await self._check_search_health(search, 0, summary, error=str(exc))
                     continue
                 except EbayAPIError as exc:
                     log.warning("Search %r: %s", search.name, exc)
-                    summary.errors.append(f"{search.name}: {exc}")
+                    _add_exc(summary, search.name, exc, "ebay")
                     continue
                 except httpx.HTTPError as exc:
                     log.warning("Search %r: network error %s", search.name, exc)
-                    summary.errors.append(f"{search.name}: ошибка сети — {exc}")
+                    _add_exc(summary, search.name, exc, search.source)
                     continue
                 except Exception as exc:
                     log.exception("Search %r failed", search.name)
-                    summary.errors.append(f"{search.name}: {exc}")
+                    _add_exc(summary, search.name, exc, search.source)
                     continue
                 await self._check_search_health(search, summary.listings_seen - seen_before, summary)
                 digest.extend(deals)  # instant mode: already sent while evaluating
+            digest.extend(await self._scout_rescue(summary))
             digest = [d for d in digest if not self._is_repost(d.listing)]
             if digest:
                 summary.notified += await self._notify(digest, summary)
             await self._after_run(summary)
         finally:
             summary.finished_at = utcnow()
+            self._scout_save_stats(summary)
             self.db.finish_run(summary)
             self.last_summary = summary
             self._running = False
+            self.progress = None
+            self._emit("run_finished", summary.model_dump(mode="json"))
         log.info(
             "Run finished: %d new, %d evaluated (%d early skips, %d from history), %d deals, %d notified,"
             " %d deferred; %d comps lookups, %d ad pages, %d AI calls; %d errors",
@@ -454,7 +700,8 @@ class Monitor:
         if search_or_listing.source == "ebay":
             if self._ebay_api is None:
                 raise EbayAPIError(
-                    "Для поиска по eBay заполни ebay.client_id и ebay.client_secret в config.yaml/.env"
+                    "Для поиска по eBay заполни ebay.client_id и ebay.client_secret в config.yaml/.env",
+                    message_ru=EBAY_NOT_CONNECTED_RU, code="ebay_not_connected",
                 )
             return self._ebay_api
         assert self._scraper is not None
@@ -473,6 +720,7 @@ class Monitor:
         todo: list[Listing] = []
         price_dropped: set[str] = set()
         rechecks: set[str] = set()
+        fresh: set[str] = set()  # first seen in this pass
         new_here = 0
         for listing in listings:
             listing.search_name = search.name
@@ -480,6 +728,7 @@ class Monitor:
             self.db.upsert_listing(listing)
             if previous is None:
                 new_here += 1
+                fresh.add(listing.ad_id)
                 todo.append(listing)
                 continue
             stored = self.db.get_listing(listing.ad_id) or listing
@@ -515,8 +764,8 @@ class Monitor:
 
         # deferred ads that have dropped off the result pages since
         on_page = {listing.ad_id for listing in listings}
-        backlog = [l for l in self._pending(search, baseline_at) if l.ad_id not in on_page]
-        todo = sorted(backlog + todo, key=lambda l: _aware(l.first_seen))  # oldest first
+        backlog = [item for item in self._pending(search, baseline_at) if item.ad_id not in on_page]
+        todo = sorted(backlog + todo, key=lambda item: _aware(item.first_seen))  # oldest first
         log.info("🔎 %s: объявлений %d, новых %d, к оценке %d%s", search.name, len(listings), new_here,
                  len(todo) - len(rechecks), f" (из очереди {len(backlog)})" if backlog else "")
 
@@ -524,6 +773,9 @@ class Monitor:
         budget.start_search()
         instant = self.config.notifications.mode == "instant"
         to_notify: list[DealView] = []
+
+        # phase 0 — the AI scout reads the new ads (bounded time; what it doesn't reach goes the usual way)
+        await self._scout_read(search, todo, fresh, summary)
 
         # phase 1 — free: filters, reference price / price history, early "no deal"
         candidates: list[_Candidate] = []
@@ -533,7 +785,7 @@ class Monitor:
                 outcome = self._triage(listing, search, budget, recheck=recheck)
             except Exception as exc:
                 log.exception("Evaluating %s failed", listing.ad_id)
-                summary.errors.append(f"{search.name} / {listing.title[:40]}: {exc}")
+                _add_exc(summary, f"{search.name} / {listing.title[:40]}", exc, search.source)
                 continue
             if isinstance(outcome, _Candidate):
                 candidates.append(outcome)
@@ -562,22 +814,15 @@ class Monitor:
                 raise
             except Exception as exc:
                 log.exception("Evaluating %s failed", listing.ad_id)
-                summary.errors.append(f"{search.name} / {listing.title[:40]}: {exc}")
+                _add_exc(summary, f"{search.name} / {listing.title[:40]}", exc, search.source)
                 continue
             summary.evaluated += 1
             why = f" — {evaluation.reasons[0]}" if evaluation.verdict == "skip" and evaluation.reasons else ""
             log.info("         → %s, балл %.0f%s%s", _VERDICT_RU.get(evaluation.verdict, evaluation.verdict),
                      evaluation.score, _profit_note(evaluation), why)
-            if evaluation.verdict == "buy":
-                summary.deals_found += 1
-            if self._should_notify(evaluation):
-                deal = self.db.get_deal(listing.ad_id)
-                if deal is None:
-                    continue
-                if instant:  # a good deal is gone in minutes: don't wait for the rest of the search
-                    await self._alert(deal, summary)
-                else:
-                    to_notify.append(deal)
+            deal = await self._after_evaluation(listing, search, evaluation, summary, instant=instant)
+            if deal is not None:
+                to_notify.append(deal)
 
         evaluated_here = summary.evaluated - evaluated_before
         if evaluated_here >= 6 and summary_buy_share(self.db, todo) >= 0.7:
@@ -586,7 +831,7 @@ class Monitor:
                 " Проверь цены вручную."
             )
             log.warning(warning)
-            summary.errors.append(warning)
+            _add_error(summary, warning)
         self._log_funnel(search, summary, before, evaluated_here)
         return to_notify
 
@@ -613,7 +858,7 @@ class Monitor:
             return
         self._rate_limited[host] = getattr(exc, "retry_at", None) or utcnow()
         log.info("Hourly request budget: %s", exc)
-        summary.errors.append(f"Отложено до следующей проверки: {exc}")
+        _add_error(summary, f"Часть объявлений отложена до следующей проверки. {budget_message(exc)}", str(exc))
 
     def _expire_backlog(self, search: SearchConfig, baseline_at: datetime | None, summary: RunSummary) -> None:
         """Deferred ads the budgets never reached within PENDING_MAX_AGE: give up on them
@@ -689,7 +934,7 @@ class Monitor:
         searches — a list cut at max_price drags medians down."""
         if _price_filtered(search):
             return 0
-        rows = [(key, l) for l in listings if (key := history_key_for(l))]
+        rows = [(key, item) for item in listings if (key := history_key_for(item))]
         if not rows:
             return 0
         try:
@@ -726,7 +971,9 @@ class Monitor:
         price history, early "no deal". Returns the stored evaluation, or the candidate for
         the paid part. `recheck`: an earlier early skip seen again — not counted twice."""
         counted = not recheck
+        plan = self._scout_plan_for(listing)  # the AI scout's priced reading (None: not read / off)
         keep, reasons = prefilter(listing, search)
+        kind_vetoed = False
         if keep:
             floor = search.min_price if search.min_price is not None else self.config.general.min_listing_price
             too_cheap = below_min_price(listing, floor)
@@ -736,11 +983,16 @@ class Monitor:
         if keep:
             veto = self._kind_veto(ident, search)
             if veto:
-                keep, reasons = False, [veto]
+                keep, reasons, kind_vetoed = False, [veto], True
         if not keep:
+            skip = self._skip_evaluation(listing, search, reasons)
+            # "alter PC mit RTX 3080": the script drops the kind, the scout priced its parts
+            if (kind_vetoed and plan is not None and _scout_may_overrule(ident.kind, plan)
+                    and self._scout_worth(listing, search, plan)):
+                return self._scout_candidate(listing, plan, skip, budget.summary, counted)
             if counted:
                 budget.summary.prefiltered += 1
-            return self._save_skip(listing, search, reasons)
+            return self._save(skip)
 
         known = self._reference_estimate(listing, search)
         if known is None:
@@ -753,12 +1005,19 @@ class Monitor:
                 if not self._may_skip_early(known, ident):
                     known = None  # thin/unclear history says "no deal": check comparables first
                 else:
+                    skip = best.model_copy(update={"reasons": no_deal_reasons(best), "stage": "market"})
+                    # the title reads as one product, the scout saw another (or a bundle) worth more
+                    if (plan is not None and self._scout_sees_other(plan, ident)
+                            and self._scout_worth(listing, search, plan)):
+                        return self._scout_candidate(listing, plan, skip, budget.summary, counted)
                     if counted:
                         budget.summary.early_skips += 1
                         budget.summary.history_hits += known.source == "history"
-                    return self._save(best.model_copy(update={"reasons": no_deal_reasons(best), "stage": "market"}))
+                    return self._save(skip)
             if known is not None and known.source == "history" and counted:
                 budget.summary.history_hits += 1
+        if plan is not None:
+            return self._scout_enrich(listing, search, plan, ident, known, hint, budget.summary, counted)
         return _Candidate(listing, known, hint)
 
     def _may_skip_early(self, est: PriceEstimate, ident: Identity) -> bool:
@@ -827,6 +1086,7 @@ class Monitor:
         if the market is still unknown) → local AI. Raises _Deferred when a budget is used up."""
         self._ensure_components()
         listing, estimate = cand.listing, cand.estimate
+        plan, found_by = cand.plan, cand.found_by
         source = self._source_for(listing)
         pricing = self.config.pricing
 
@@ -845,39 +1105,84 @@ class Monitor:
             if not keep:
                 budget.summary.prefiltered += 1
                 return self._save_skip(listing, search, reasons)
+        if plan is not None:  # the full text may change the scout's picture ("ohne Grafikkarte")
+            plan = self._scout_replan(listing, plan)
+            if found_by == scout_ai.FOUND_BY_SCOUT and not self._scout_worth(listing, search, plan):
+                if cand.script_skip is not None:
+                    return self._save(cand.script_skip)  # back to what the script alone decided
+                plan, found_by, estimate = None, scout_ai.FOUND_BY_SCRIPT, None  # the script's own way
+            elif found_by == scout_ai.FOUND_BY_SCOUT:
+                estimate = plan.estimate
+                if plan.kind in scout_ai.BUNDLE_KINDS and scout_ai.unpriced_parts(plan):
+                    estimate = await self._scout_price(listing, search, plan, budget) or estimate
 
         # 4: comparables, only when neither reference nor history knew the market
+        if estimate is None and plan is not None and plan.usable:
+            ident = listing_identity(listing)
+            if plan.estimate is not None and plan.estimate.market_price and self._scout_price_fits(plan, ident):
+                estimate = plan.estimate  # the history knows the scout's product by now
+            elif self._scout_sees_other(plan, ident) or found_by == scout_ai.FOUND_BY_SCOUT:
+                estimate = await self._scout_price(listing, search, plan, budget)
+            if estimate is not None and (found_by == scout_ai.FOUND_BY_SCOUT or self._scout_sees_other(plan, ident)):
+                found_by = scout_ai.FOUND_BY_SCOUT
         if estimate is None:
             estimate = await self._market_estimate(listing, search, budget, use_history=False)
         best = evaluate(listing, estimate, None, search, pricing)
         if market_says_no_deal(best):  # the AI can't turn this into a deal
-            return self._save(best.model_copy(update={"stage": "full"}))
+            return self._save(best.model_copy(update={"stage": "full", "found_by": found_by}))
 
         # 5: local AI
         wants_ai = self._wants_ai(listing, estimate, search) and budget.spend("ai_calls")
         return await self._conclude(listing, search, estimate, source, budget if wants_ai else None,
-                                    ask_ai=wants_ai)
+                                    ask_ai=wants_ai, plan=plan, found_by=found_by)
 
     async def _conclude(
         self, listing: Listing, search: SearchConfig, estimate: PriceEstimate, source: Any,
-        budget: _Budget | None, *, ask_ai: bool,
+        budget: _Budget | None, *, ask_ai: bool, plan: Any = None, found_by: str = "script",
     ) -> Evaluation:
-        """AI verdict (if asked) → final evaluation → second opinion → store."""
+        """AI verdict (if asked) → final evaluation → second opinion → store. `plan`: the AI
+        scout's priced reading (a PC / bundle it priced by parts is no veto for the photo check)."""
         verdict = None
         from_ai_query = False
         if ask_ai:
-            verdict, estimate, from_ai_query = await self._ask_ai(listing, search, estimate, source, budget)
-        vague = not from_ai_query and self._listing_target(listing) is None
+            verdict, estimate, from_ai_query = await self._ask_ai(listing, search, estimate, source, budget,
+                                                                  plan=plan)
+            verdict = scout_ai.vision_for_plan(verdict, plan)
+        scout_knows = plan is not None and plan.usable and (plan.identified or plan.estimate is not None)
+        vague = not from_ai_query and not scout_knows and self._listing_target(listing) is None
         evaluation = evaluate(listing, estimate, verdict, search, self.config.pricing, ai_expected=ask_ai,
                               vague=vague)
+        warning = scout_ai.vision_disagrees(verdict, plan)
+        if warning:
+            evaluation = _capped_maybe(evaluation, warning)
         evaluation = await self._maybe_second_opinion(listing, search, estimate, evaluation, source)
-        return self._save(evaluation.model_copy(update={"stage": "full"}))
+        update: dict[str, Any] = {"stage": "full", "found_by": found_by}
+        if found_by == scout_ai.FOUND_BY_SCOUT and plan is not None and plan.reason_ru():
+            reasons = list(evaluation.reasons)
+            reasons.insert(min(1, len(reasons)), f"🔎 {scout_ai.FOUND_BY_LABEL_RU[found_by]}: {plan.reason_ru()}")
+            update["reasons"] = reasons
+        evaluation = self._save(evaluation.model_copy(update=update))
+        self._hold_for_vision(listing, search, evaluation)
+        return evaluation
 
     # ------------------------------------------------------------ evaluation
-    async def evaluate_listing(self, listing: Listing, search: SearchConfig) -> Evaluation:
+    async def evaluate_listing(self, listing: Listing, search: SearchConfig, *,
+                               progress: Callable[[str, str], Any] | None = None) -> Evaluation:
         """Full pipeline for one ad — no budgets, no shortcuts (single-ad check);
-        stores the listing + evaluation."""
-        return await self._evaluate(listing, search, None)
+        stores the listing + evaluation. `progress(stage, text_ru)` hears about each step."""
+        previous, self._stage_cb = self._stage_cb, progress or self._stage_cb
+        try:
+            return await self._evaluate(listing, search, None)
+        finally:
+            self._stage_cb = previous
+
+    def _stage(self, stage: str, text_ru: str) -> None:
+        if self._stage_cb is None:
+            return
+        try:
+            self._stage_cb(stage, text_ru)
+        except Exception:  # noqa: BLE001 - a progress reporter never breaks a check
+            log.exception("progress callback failed")
 
     async def _evaluate(self, listing: Listing, search: SearchConfig, budget: _Budget | None = None) -> Evaluation:
         """Every step for one ad: prefilter → ad page → prefilter on the full text →
@@ -889,8 +1194,11 @@ class Monitor:
             listing, keep, reasons = await self._load_detail(listing, search, source)
         if not keep:
             return self._save_skip(listing, search, reasons)
+        self._stage("market", "Ищу цены похожих…")
         estimate = await self._market_estimate(listing, search, budget)
         ask_ai = self._wants_ai(listing, estimate, search)
+        if ask_ai:
+            self._stage("ai", "Нейросеть смотрит фото…")
         return await self._conclude(listing, search, estimate, source, budget, ask_ai=ask_ai)
 
     def _save(self, evaluation: Evaluation) -> Evaluation:
@@ -898,10 +1206,14 @@ class Monitor:
         return evaluation
 
     def _save_skip(self, listing: Listing, search: SearchConfig, reasons: list[str]) -> Evaluation:
-        return self._save(Evaluation(
+        return self._save(self._skip_evaluation(listing, search, reasons))
+
+    @staticmethod
+    def _skip_evaluation(listing: Listing, search: SearchConfig, reasons: list[str]) -> Evaluation:
+        return Evaluation(
             ad_id=listing.ad_id, purpose=search.purpose, buy_price=listing.price,
-            verdict="skip", action="skip", score=0.0, reasons=reasons, stage="prefilter",
-        ))
+            verdict="skip", action="skip", score=0.0, reasons=reasons, stage="prefilter", found_by="script",
+        )
 
     async def _load_detail(self, listing: Listing, search: SearchConfig, source: Any) -> tuple[Listing, bool, list[str]]:
         """Open the ad page (full text, all photos) and re-run the prefilter on it.
@@ -927,28 +1239,40 @@ class Monitor:
 
     async def _ask_ai(
         self, listing: Listing, search: SearchConfig, estimate: PriceEstimate, source: Any,
-        budget: _Budget | None,
+        budget: _Budget | None, *, plan: Any = None,
     ) -> tuple[AIVerdict, PriceEstimate, bool]:
         """Local AI verdict. The model sees a few comparables (never our market price — it
         guesses its own blind) and says which of them are the same variant. The third value:
-        the market price now comes from the AI's own search query."""
+        the market price now comes from the AI's own search query. A bundle priced by its
+        parts shows no comparables (the parts are not "the same variant" as the whole)."""
         assert self._evaluator is not None
-        images = await self._images(listing, source, self.config.ai.max_images)
-        shown = prompt_comparables(None, _comparables_for_ai(estimate))
-        verdict = await self._evaluator.evaluate(
-            listing, images, purpose=search.purpose,
-            estimate=estimate if estimate.market_price is not None else None,
-            target_price=search.target_price,
-            **self._comparables_kwarg(self._evaluator, shown),
-        )
+        policy = self._vision_policy(listing)  # eBay ads never go to a cloud endpoint
+        images = [] if policy == "none" else await self._images(listing, source, self.config.ai.max_images)
+        by_parts = plan is not None and plan.kind in scout_ai.BUNDLE_KINDS and estimate is plan.estimate
+        shown = [] if by_parts else prompt_comparables(None, _comparables_for_ai(estimate))
+        with cloud_ai.local_only("ebay" if policy else ""):
+            verdict = await self._evaluator.evaluate(
+                listing, images, purpose=search.purpose,
+                estimate=estimate if estimate.market_price is not None else None,
+                target_price=search.target_price,
+                **self._comparables_kwarg(self._evaluator, shown),
+            )
+        limited = getattr(self._vision_llm(), "last_limited", None)
         if verdict.confidence > 0:
             self._ai_answered += 1
+        elif limited is not None:  # the free cloud quota / the eBay rule, not a broken server
+            if getattr(limited, "reason", "") != "ebay":
+                self._ai_limited += 1
+                self._ai_limited_ru = getattr(limited, "message_ru", "") or str(limited)
         else:
             self._ai_failed += 1
         estimate = self._variant_checked(estimate, same_variant_comparables(verdict, shown) if shown else None)
-        # The model often identifies the product better than the raw title does.
+        # The model often identifies the product better than the raw title does. Not for a PC /
+        # bundle / lot the scout read: its phrase names ONE part ("rtx 3070") and would price the
+        # whole thing as that part — without real part prices it stays at most "maybe".
         from_query = False
-        if estimate.market_price is None and verdict.search_query:
+        whole = plan is not None and plan.kind in scout_ai.BUNDLE_KINDS
+        if estimate.market_price is None and verdict.search_query and not whole:
             ai_estimate = await self._market_estimate(
                 listing, search, budget, query=verdict.search_query, defer=False
             )
@@ -1013,13 +1337,23 @@ class Monitor:
         return final.model_copy(update={"ai": evaluation.ai or final.ai, "ai_second": second})
 
     async def evaluate_url(
-        self, url: str, *, purpose: str = "resale", target_price: float | None = None
+        self, url: str, *, purpose: str = "resale", target_price: float | None = None,
+        progress: Callable[[str, str], Any] | None = None,
     ) -> DealView:
-        """Check a single ad by its link ("should I buy this?")."""
+        """Check a single ad by its link ("should I buy this?"). `progress(stage, text_ru)`
+        hears about each step: fetch, market, ai."""
         ad_id = ad_id_from_url(url)
         if not ad_id:
             raise ValueError("Не похоже на ссылку на объявление Kleinanzeigen или eBay")
+        previous, self._stage_cb = self._stage_cb, progress or self._stage_cb
+        try:
+            return await self._evaluate_url(url, ad_id, purpose=purpose, target_price=target_price)
+        finally:
+            self._stage_cb = previous
+
+    async def _evaluate_url(self, url: str, ad_id: str, *, purpose: str, target_price: float | None) -> DealView:
         self._ensure_components()
+        self._stage("fetch", "Открываю объявление…")
         source_name = "ebay" if ad_id.startswith("ebay-") else "kleinanzeigen"
         search = SearchConfig(
             name="Ручная проверка", source=source_name, purpose=purpose, target_price=target_price  # type: ignore[arg-type]
@@ -1230,8 +1564,13 @@ class Monitor:
         return estimate
 
     def _cache_comps(self, key: str, estimate: PriceEstimate) -> None:
-        self._comps_cache[key] = (time.monotonic(), estimate)
+        now = time.monotonic()
+        self._comps_cache[key] = (now, estimate)
         self._comps_cache.move_to_end(key)
+        # oldest first (every write moves to the end): expired estimates are never read again, so
+        # don't keep up to COMPS_CACHE_MAX of them (tens of MB of comparables) on a small home server
+        while self._comps_cache and now - next(iter(self._comps_cache.values()))[0] >= COMPS_CACHE_TTL:
+            self._comps_cache.popitem(last=False)
         while len(self._comps_cache) > COMPS_CACHE_MAX:
             self._comps_cache.popitem(last=False)
 
@@ -1256,6 +1595,624 @@ class Monitor:
         except sqlite3.Error as exc:
             log.warning("Price history: can't store comparables: %s", exc)
 
+    # ------------------------------------------------------------- AI scout
+    # docs/design/AI_SCOUT.md. Stage A (_scout_read): a small text model reads the new ads in
+    # batches; stage B (_scout_plan_for): its reading is grounded in the ad text and priced from
+    # our own history; the free funnel (_triage) then may promote an ad the script dismissed,
+    # rank candidates by it, or give them a market price; stage C/D are the usual paid steps.
+    def _scout_begin_pass(self, n_searches: int) -> None:
+        self._scout_items = {}
+        self._scout_plans = {}
+        self._scout_hints_text = None
+        self._scout_searches_left = max(1, n_searches)
+        self._scout_deadline = None
+        if self.scout_enabled:
+            assert self._scout is not None
+            sc = self.config.ai.scout
+            seconds = max(1.0, self.config.general.interval_minutes) * 60 * max(0.0, min(1.0, sc.pass_share))
+            self._scout_deadline = self._scout.clock() + seconds
+
+    def _scout_mode(self) -> str:
+        """"all" while the model keeps up with the new ads, else "candidates" (only where the
+        script is blind); ai.scout.mode forces one of them."""
+        sc = self.config.ai.scout
+        mode = sc.mode
+        quota = self._scout_quota() if self._scout is not None else None
+        if mode == "auto" and quota is not None and quota.quota_low():
+            mode = "candidates"  # the free cloud quota runs low: only where the script is blind, until the reset
+        elif mode == "auto" and self._scout is not None:
+            stats = self._scout.stats
+            capacity = stats.capacity_per_hour(sc.pass_share, sc.max_per_hour)
+            mode = "candidates" if capacity is not None and stats.seen_last_hour > capacity else "all"
+        if self._scout is not None:
+            self._scout.stats.mode = mode
+        return mode
+
+    def _scout_search_deadline(self) -> float | None:
+        """This search's share of the pass's scout time (time left over rolls on to the next)."""
+        if self._scout_deadline is None or self._scout is None:
+            return None
+        now = self._scout.clock()
+        left = max(0.0, self._scout_deadline - now)
+        return now + left / max(1, self._scout_searches_left)
+
+    def _scout_load(self, ad_ids: list[str]) -> None:
+        """Readings stored by earlier passes (an ad is read once)."""
+        missing = [a for a in ad_ids if a not in self._scout_items]
+        if not missing:
+            return
+        try:
+            stored = self.db.get_triage(missing)
+        except sqlite3.Error as exc:
+            log.warning("AI scout: stored readings unavailable: %s", exc)
+            return
+        for ad_id, data in stored.items():
+            try:
+                self._scout_items[ad_id] = TriageItem.model_validate(data)
+            except Exception:  # noqa: BLE001 - an old / broken row is simply read again
+                continue
+
+    async def _scout_read(self, search: SearchConfig, todo: list[Listing], fresh: set[str],
+                          summary: RunSummary) -> None:
+        """Stage A for one search: read the ads nobody has read yet, fresh first, then where the
+        script is blind; within this search's time share and the hourly cap. Never raises."""
+        if not self.scout_enabled or not todo:
+            return
+        engine = self._scout_pick(ebay=search.source == "ebay")
+        if engine is None:  # eBay ads, a cloud scout without a local stand-in: the script path
+            return
+        assert self._scout is not None
+        self._scout_load([item.ad_id for item in todo])
+        self._scout.note_arrivals(len(fresh))
+        unread = [item for item in todo if item.ad_id not in self._scout_items]
+        mode = self._scout_mode()
+        queue = unread if mode == "all" else [item for item in unread if blind_spot(item)]
+        not_offered = len(unread) - len(queue)
+        queue.sort(key=lambda item: (item.ad_id not in fresh, -scout_priority(item), -_aware(item.first_seen).timestamp()))
+        deadline = self._scout_search_deadline()
+        self._scout_searches_left = max(1, self._scout_searches_left - 1)
+        summary.scout_overflow += not_offered
+        if not queue:
+            return
+        run = await self._scout_run(queue, deadline, {item.ad_id: search.category_name for item in queue}, summary,
+                                    engine=engine)
+        if run is None:
+            return
+        by_id = {item.ad_id: item for item in queue}
+        if not _price_filtered(search):
+            self._scout_remember([by_id[a] for a in run.items if a in by_id and a in fresh])
+
+    async def _scout_run(self, queue: list[Listing], deadline: float | None, categories: dict[str, str],
+                         summary: RunSummary, *, rescue: bool = False, engine: Any = None) -> Any:
+        engine = engine if engine is not None else self._scout
+        assert engine is not None
+        try:
+            run = await engine.triage(queue, deadline=deadline, categories=categories, hints=self._scout_hints(),
+                                      count_overflow=not rescue)
+        except Exception as exc:  # noqa: BLE001 - the scout never breaks a pass
+            log.exception("AI scout failed")
+            summary.scout_overflow += len(queue)
+            await self._scout_down(str(exc), summary, engine)
+            return None
+        self._scout_items.update(run.items)
+        try:
+            self.db.save_triage([item.model_dump(mode="json") for item in run.items.values()])
+        except sqlite3.Error as exc:
+            log.warning("AI scout: readings not stored: %s", exc)
+        summary.scout_read += run.ai_count
+        summary.scout_overflow += 0 if rescue else len(run.overflow)
+        summary.scout_failed += len(run.failed)
+        summary.scout_calls += run.calls
+        summary.scout_seconds = round(summary.scout_seconds + run.seconds, 1)
+        if run.ai_count:
+            log.info("🔎 Разведчик прочитал %d объявл. за %.0f с (%d вызов.), не успел %d, не разобрал %d",
+                     run.ai_count, run.seconds, run.calls, len(run.overflow), len(run.failed))
+            self._scout_down_reported = False
+        if run.error:
+            await self._scout_down(run.error, summary, engine)
+        return run
+
+    async def _scout_down(self, error: str, summary: RunSummary, engine: Any = None) -> None:
+        limited = getattr(getattr(engine or self._scout, "llm", None), "last_limited", None)
+        if limited is not None and str(limited) == error:
+            # the free cloud quota, not a broken server: the Состояние tile shows it, no alert
+            log.info("AI scout: %s", error)
+            return
+        if self._scout_down_reported:
+            return
+        self._scout_down_reported = True
+        settings = self._scout_llm_settings()
+        why = ai_problem(settings.provider, settings.base_url, settings.model, error, server_ok=None)
+        await self._health("scout_down", f"⚠ Нейросеть-разведчик не отвечает — новые объявления смотрю обычным"
+                                         f" способом. {why}", summary)
+
+    def _scout_hints(self) -> str:
+        """The user's taste from feedback (hidden / bought / sold deals), a few lines in the prompt."""
+        if self._scout_hints_text is not None:
+            return self._scout_hints_text
+        text = ""
+        if self.config.ai.scout.learn_from_feedback:
+            try:
+                private = bool(cloud_ai.cloud_kind(self._scout_llm_settings()))  # a cloud scout: titles only
+                text = scout_feedback_hints(self.db.feedback_examples(limit=4), private=private)
+            except sqlite3.Error:
+                text = ""
+        self._scout_hints_text = text
+        return text
+
+    def _scout_plan_for(self, listing: Listing) -> Any:
+        """Stage B: the scout's reading of this ad, grounded and priced (cached per pass)."""
+        if not self.scout_enabled:
+            return None
+        if listing.ad_id not in self._scout_items:
+            self._scout_load([listing.ad_id])
+        item = self._scout_items.get(listing.ad_id)
+        if item is None or not item.is_ai:
+            return None
+        cached = self._scout_plans.get(listing.ad_id)
+        if cached is not None and cached[0] == len(listing.description):
+            return cached[1]
+        sc = self.config.ai.scout
+        try:
+            plan = scout_ai.plan(listing, item, self._scout_lookup(listing), bundle_discount=sc.bundle_discount,
+                                 pc_discount=sc.pc_discount, min_priced_share=sc.min_priced_share)
+        except Exception:  # noqa: BLE001 - a broken reading is no reading
+            log.exception("AI scout plan failed for %s", listing.ad_id)
+            return None
+        self._scout_plans[listing.ad_id] = (len(listing.description), plan)
+        return plan
+
+    def _scout_replan(self, listing: Listing, plan: Any) -> Any:
+        self._scout_plans.pop(listing.ad_id, None)
+        return self._scout_plan_for(listing) or plan
+
+    def _scout_lookup(self, listing: Listing) -> Callable[[ProductRef], PriceEstimate | None]:
+        """Market price of a product the scout named, from our own history only (no requests):
+        identity keys match like the script's ("same product and kind"), AI keys by attributes."""
+        pricing = self.config.pricing
+
+        def lookup(ref: ProductRef) -> PriceEstimate | None:
+            if not pricing.use_price_history:
+                return None
+            days = max(1, pricing.history_days)
+            since = utcnow() - timedelta(days=days)
+            try:
+                if ref.identity is not None:
+                    points: list[Any] = self.db.price_history_spans(ref.lookup, since, exclude_ad_id=listing.ad_id)
+                    key = ref.identity
+
+                    def fits(c: Comparable) -> bool:
+                        return comparable_fits(key, c)
+                else:
+                    rows = self.db.price_history_keyed(ref.lookup, since, exclude_ad_id=listing.ad_id)
+                    points = [(c, first, last) for c, first, last, stored in rows if ai_keys_compatible(ref.key, stored)]
+
+                    def fits(c: Comparable) -> bool:
+                        return not _severe_title(c.title)
+            except sqlite3.Error as exc:
+                log.warning("AI scout: price history of %r unavailable: %s", ref.key, exc)
+                return None
+            return estimate_from_history(ref.query, points, asking_price_discount=pricing.asking_price_discount,
+                                         min_points=pricing.history_min_points, days=days, fits=fits)
+
+        return lookup
+
+    def _scout_remember(self, listings: list[Listing]) -> None:
+        """Ads the scout identified where the script's identity knows nothing (typos, product only
+        in the text, products the regexes don't know): their prices go into the history under
+        the scout's key — the history grows for what the regexes can't read."""
+        rows: list[tuple[str, Listing]] = []
+        for listing in listings:
+            ident = listing_identity(listing)
+            if ident.key is not None and ident.category not in (None, "other"):
+                continue  # identity knows it: its own key is already stored
+            if history_key_for(listing) is None and ident.key is not None:
+                continue  # not a price signal (wanted, defect, missing parts, ...)
+            plan = self._scout_plan_for(listing)
+            if plan is None:
+                continue
+            from .pricing.estimator import history_worthy
+
+            if not history_worthy(listing):
+                continue
+            rows += scout_ai.record_rows(listing, plan)
+        if not rows:
+            return
+        try:
+            self.db.record_price_points(rows)
+        except sqlite3.Error as exc:
+            log.warning("AI scout: prices not stored: %s", exc)
+
+    def _deal_possible(self, listing: Listing, search: SearchConfig, estimate: PriceEstimate) -> bool:
+        return not market_says_no_deal(evaluate(listing, estimate, None, search, self.config.pricing))
+
+    def _scout_worth(self, listing: Listing, search: SearchConfig, plan: Any) -> bool:
+        return scout_ai.worth_a_look(plan, deal_math=lambda est: self._deal_possible(listing, search, est),
+                                     min_interest=self.config.ai.scout.min_interest)
+
+    @classmethod
+    def _scout_price_fits(cls, plan: Any, ident: Identity) -> bool:
+        """May the scout's market price stand for this ad? Not when the title names the product more
+        exactly than the scout's reading ("DeWalt DCD796 solo" read as the kit): then the ad's own
+        product is priced (comparables), never the kit's history."""
+        if plan.kind in scout_ai.BUNDLE_KINDS or ident.key is None or cls._scout_sees_other(plan, ident):
+            return True
+        mine = plan.ref.identity if plan.ref is not None else None
+        return mine is not None and mine.coarse_key() == ident.key.coarse_key()
+
+    @staticmethod
+    def _scout_sees_other(plan: Any, ident: Identity) -> bool:
+        """The scout's product differs from what the title's identity says (or it is a bundle
+        the script priced as one item)."""
+        if plan.kind in scout_ai.BUNDLE_KINDS:
+            return ident.kind not in ("bundle", "complete_pc")
+        if not plan.identified:
+            return False
+        if ident.key is None:
+            return True
+        if plan.ref.identity is None:  # an AI key beats only identity's catch-all reading of a title
+            return ident.category in (None, "other")
+        mine, title = plan.ref.identity, ident.key
+        if (mine.family, mine.model) == (title.family, title.model) and set(mine.variant) < set(title.variant):
+            # the scout only dropped words the title has ("DeWalt DCD796 solo" read as "DeWalt DCD796"):
+            # the title is the more exact reading — a solo tool never takes the kit's price
+            return False
+        return mine.coarse_key() != title.coarse_key()
+
+    def _scout_candidate(self, listing: Listing, plan: Any, skip: Evaluation, summary: RunSummary,
+                         counted: bool) -> _Candidate:
+        """A dismissed ad the scout brings back for the paid stage."""
+        if counted:
+            summary.scout_promoted += 1
+        log.info("   🔎 %s — %s → второй взгляд: %s", listing.title[:60], _price_label(listing), plan.reason_ru())
+        return _Candidate(listing, plan.estimate, plan.estimate, plan=plan, found_by=scout_ai.FOUND_BY_SCOUT,
+                          priority=plan.priority(listing), script_skip=skip)
+
+    def _scout_enrich(self, listing: Listing, search: SearchConfig, plan: Any, ident: Identity,
+                      known: PriceEstimate | None, hint: PriceEstimate | None, summary: RunSummary,
+                      counted: bool) -> Evaluation | _Candidate:
+        """A candidate of the script. The script knows the market: unchanged. It doesn't: the
+        scout's reading ranks it (junk last) and may give it a market price from history; a solid
+        price that says "no deal" ends it here, like the script's own early skip."""
+        if known is not None or not plan.item.is_ai:
+            return _Candidate(listing, known, hint, plan=plan)
+        est = plan.estimate if plan.usable else None
+        if est is None or not est.market_price:
+            return _Candidate(listing, None, hint, plan=plan, priority=plan.priority(listing))
+        found_by = scout_ai.FOUND_BY_SCOUT if self._scout_sees_other(plan, ident) else scout_ai.FOUND_BY_SCRIPT
+        if market_says_no_deal(evaluate(listing, est, None, search, self.config.pricing)):
+            # the scout never drops an ad on its own (a weak model may have read a cheaper variant):
+            # no deal by its price = the script's own way, ranked after the unknown ones
+            return _Candidate(listing, None, hint, priority=SCOUT_NO_DEAL_PRIORITY)
+        return _Candidate(listing, est, hint, plan=plan, found_by=found_by, priority=plan.priority(listing))
+
+    async def _scout_price(self, listing: Listing, search: SearchConfig, plan: Any,
+                           budget: _Budget | None) -> PriceEstimate | None:
+        """Paid stage, the history didn't know: comparables for what the SCOUT read — the product
+        (its exact key, or its German phrase for AI keys), or the two main parts of a bundle —
+        within the comparables budget (never deferred for this)."""
+        if plan.kind in scout_ai.BUNDLE_KINDS:
+            parts = scout_ai.unpriced_parts(plan)
+            for part in parts:
+                if part.ref is not None:
+                    part.estimate = await self._component_estimate(listing, part.ref, budget)
+            if not parts:
+                return None
+            sc = self.config.ai.scout
+            plan = scout_ai.reprice(plan, bundle_discount=sc.bundle_discount, pc_discount=sc.pc_discount,
+                                    min_priced_share=sc.min_priced_share)
+            return plan.estimate
+        if not plan.identified:
+            return None
+        if plan.ref.identity is not None:
+            est = await self._component_estimate(listing, plan.ref, budget)
+        elif plan.query and self._listing_target(listing) is None:
+            est = await self._market_estimate(listing, search, budget, query=plan.query, defer=False)
+        else:
+            return None
+        if est is not None and est.market_price and plan.item.qty > 1:
+            est = est.model_copy(update={"market_price": round(est.market_price * plan.item.qty, 2)})
+        return est if est is not None and est.market_price else None
+
+    async def _component_estimate(self, listing: Listing, ref: ProductRef, budget: _Budget | None) -> PriceEstimate | None:
+        """Market price of one product the scout named (identity key): history, cache, comparables."""
+        assert ref.identity is not None
+        target = _Target(ref.query, ref.identity, ref.identity.coarse_key())
+        est = self._history_estimate(listing, target)
+        if est is not None:
+            return est
+        cached = self._cached_comps(target)
+        if cached is not None:
+            return cached if cached.market_price else None
+        if budget is not None:
+            try:
+                if not budget.spend("comps_lookups"):
+                    return None
+            except _Deferred:
+                return None
+        try:
+            est = await self._comps_estimate(listing, target)
+        except RateBudgetExceeded:
+            if budget is not None:
+                budget.summary.comps_lookups -= 1
+            return None
+        return est if est.market_price else None
+
+    async def _scout_rescue(self, summary: RunSummary) -> list[DealView]:
+        """End of a pass, with the scout time left: a second look at recent ads the script
+        dismissed — the ones not read yet are read now; those whose (new or stored) reading
+        shows a possible deal go through the paid steps. Returns deals for a digest."""
+        if not self.scout_enabled or self._scout is None:
+            return []
+        sc = self.config.ai.scout
+        since = utcnow() - timedelta(hours=max(0.0, sc.backlog_hours))
+        try:
+            backlog = self.db.scout_backlog(since, min_interest=sc.min_interest, limit=200)
+        except sqlite3.Error as exc:
+            log.warning("AI scout backlog: %s", exc)
+            return []
+        if not backlog:
+            return []
+        self._scout_load([item.ad_id for item in backlog])
+        unread = [item for item in backlog if not (item.ad_id in self._scout_items and self._scout_items[item.ad_id].is_ai)]
+        if self._scout_mode() != "all":
+            unread = [item for item in unread if blind_spot(item)]
+        if unread and self._scout_deadline is not None and self._scout.clock() < self._scout_deadline:
+            unread.sort(key=lambda item: (-scout_priority(item), -_aware(item.first_seen).timestamp()))
+            for ebay in (False, True):  # eBay ads never go to a cloud scout (its local stand-in or none)
+                group = [item for item in unread if (item.source == "ebay") == ebay]
+                engine = self._scout_pick(ebay=ebay) if group else None
+                if engine is not None and self._scout.clock() < self._scout_deadline:
+                    await self._scout_run(group, self._scout_deadline, {}, summary, rescue=True, engine=engine)
+        budget = self._budget_for(summary)
+        instant = self.config.notifications.mode == "instant"
+        found: list[tuple[_Candidate, SearchConfig]] = []
+        for listing in backlog:
+            ev = self.db.get_evaluation(listing.ad_id)
+            search = self.config.search_by_name(listing.search_name)
+            plan = self._scout_plan_for(listing)
+            if ev is None or search is None or plan is None or not self._rescuable(listing, ev, plan, search):
+                continue
+            summary.scout_promoted += 1
+            found.append((_Candidate(listing, plan.estimate, plan.estimate, plan=plan,
+                                     found_by=scout_ai.FOUND_BY_SCOUT, priority=plan.priority(listing),
+                                     script_skip=ev), search))
+        digest: list[DealView] = []
+        for cand, search in sorted(found, key=lambda pair: pair[0].discount):
+            budget.start_search()
+            budget.start_listing()
+            log.info("   🔎 второй взгляд: %s — %s", cand.listing.title[:60], _price_label(cand.listing))
+            try:
+                evaluation = await self._finish(cand, search, budget)
+            except (_Deferred, RateBudgetExceeded) as why:
+                if isinstance(why, RateBudgetExceeded):
+                    self._note_rate_limit(why, summary)
+                break  # the pass's budget is gone; the reading is stored, the next pass tries again
+            except BlockedError:
+                break
+            except Exception:  # noqa: BLE001
+                log.exception("AI scout rescue of %s failed", cand.listing.ad_id)
+                continue
+            deal = await self._after_evaluation(cand.listing, search, evaluation, summary, instant=instant)
+            if deal is not None:
+                digest.append(deal)
+        return digest
+
+    def _rescuable(self, listing: Listing, ev: Evaluation, plan: Any, search: SearchConfig) -> bool:
+        """Was this a dismissal the scout may overrule (kind veto / early skip, see _triage)?"""
+        if ev.found_by == scout_ai.FOUND_BY_SCOUT or ev.verdict != "skip":
+            return False
+        if ev.stage == "prefilter":
+            vetoed = next((kind for kind in SCOUT_OVERRULES if ev.reasons and ev.reasons[0].startswith(_KIND_SKIP_RU[kind])),
+                          None)
+            if vetoed is None or not _scout_may_overrule(vetoed, plan):
+                return False
+        elif ev.stage == "market":
+            if not self._scout_sees_other(plan, listing_identity(listing)):
+                return False
+        else:
+            return False
+        return self._scout_worth(listing, search, plan)
+
+    def _scout_snapshot(self) -> dict[str, Any]:
+        """The scout's throughput: the main engine's, plus what its local stand-in read."""
+        assert self._scout is not None
+        sc = self.config.ai.scout
+        snap = self._scout.stats.snapshot(share=sc.pass_share, max_per_hour=sc.max_per_hour)
+        if self._scout_local is not None:
+            local = self._scout_local.stats.snapshot(share=sc.pass_share, max_per_hour=sc.max_per_hour)
+            for key in ("triaged_last_hour", "failed_last_hour"):
+                snap[key] = int(snap.get(key) or 0) + int(local.get(key) or 0)
+            if (local.get("last_ok_at") or 0) > (snap.get("last_ok_at") or 0):
+                snap["last_ok_at"] = local["last_ok_at"]
+        return snap
+
+    def _scout_save_stats(self, summary: RunSummary) -> None:
+        if self._scout is None:
+            return
+        snap = self._scout_snapshot()
+        snap["saved_at"] = utcnow().isoformat()
+        try:
+            self.db.set_state(SCOUT_STATS_KEY, json.dumps(snap))
+        except (sqlite3.Error, AttributeError) as exc:
+            log.debug("AI scout stats not saved: %s", exc)
+
+    def scout_status(self) -> dict[str, Any]:
+        """For the UI (Настройки → Нейросеть, Состояние): on/off, endpoint, mode, "reads N of M new
+        ads per hour", speed, the vision queue."""
+        sc = self.config.ai.scout
+        enabled = bool(sc.enabled or self._injected["scout"])
+        settings = self._scout_llm_settings()
+        snap: dict[str, Any] = {}
+        if self._scout is not None:
+            snap = self._scout_snapshot()
+        else:
+            try:
+                state = self.db.get_state(SCOUT_STATS_KEY)
+                snap = json.loads(state[0]) if state and state[0] else {}
+            except (sqlite3.Error, ValueError, AttributeError):
+                snap = {}
+        try:
+            waiting = len(self.db.vision_queue())
+        except (sqlite3.Error, AttributeError):
+            waiting = 0
+        too_small = enabled and not self._injected["scout"] and too_small_for_triage(settings.model)
+        quota = self._scout_quota() if enabled else None
+        cloud = quota.snapshot(fallback_configured=self._scout_fallback() is not None) if quota is not None else None
+        return scout_status_view(enabled=enabled, mode_setting=sc.mode, provider=settings.provider,
+                                 base_url=settings.base_url, model=settings.model, own_endpoint=bool(sc.base_url.strip()),
+                                 snap=snap, vision_waiting=waiting,
+                                 vision_wait_minutes=self.config.ai.vision_wait_minutes,
+                                 expected_sec_per_ad=self._scout_expected_speed(settings),
+                                 pass_share=sc.pass_share, max_per_hour=sc.max_per_hour, too_small=too_small,
+                                 cloud=cloud, fallback=bool(cloud and cloud.get("fallback_active")))
+
+    def cloud_status(self) -> dict[str, Any]:
+        """Free cloud AI for /health and /monitor: usage today / limit, 429s, the local stand-in,
+        the next reset — one row per endpoint (the scout and the photo check may share one)."""
+        return cloud_ai.cloud_view(cloud_roles(self.config), send_ebay=self.config.ai.cloud_send_ebay)
+
+    async def _cloud_probe(self) -> None:
+        """Once a day: the OpenRouter account's limits (GET /key costs no quota) — 50 or 1000 a day."""
+        for llm in (self._llm, self._scout_llm):
+            primary = getattr(llm, "primary", llm)
+            quota = getattr(primary, "quota", None)
+            if quota is None or not quota.probe_stale() or not hasattr(primary, "probe_key"):
+                continue
+            try:
+                await asyncio.wait_for(primary.probe_key(), timeout=10)
+            except Exception as exc:  # noqa: BLE001 - only a hint for the day's budget
+                log.info("Cloud key check skipped: %s", exc)
+                quota.probe["checked_at"] = quota.wall() - cloud_ai.PROBE_MAX_AGE + 3600  # again in an hour
+
+    @staticmethod
+    def _scout_expected_speed(settings: LLMSettings) -> float | None:
+        """The model research's seconds per ad for this model on this machine's tier (an endpoint
+        elsewhere: the weak always-on server, T0) — shown until the scout has measured its own."""
+        from .ai.hardware import detect_host, is_local_url
+        from .ai.model_catalog import tier_for
+
+        tier = "T0"
+        if is_local_url(settings.base_url):
+            host = detect_host(gpu=False)
+            if host.get("ram_gb"):
+                tier = tier_for(float(host["ram_gb"]), 0.0)
+                if tier == "T1" and (host.get("cores") or 0) < 6:  # 16 GB on a 4-core mini-PC: still T0 speed
+                    tier = "T0"
+        return expected_sec_per_ad(settings.model, tier) or expected_sec_per_ad(settings.model, "T0")
+
+    # ------------------------------------------------------------ vision queue
+    def _hold_for_vision(self, listing: Listing, search: SearchConfig, evaluation: Evaluation) -> None:
+        """A would-be deal whose photos the (offline) vision model couldn't check waits for it."""
+        if (evaluation.would_buy and evaluation.ai_checked is False and self.config.ai.vision_wait_minutes > 0
+                and self._evaluator is not None and self._vision_policy(listing) != "none"):
+            try:
+                self.db.queue_vision(listing.ad_id, search.name)
+            except sqlite3.Error as exc:
+                log.warning("Vision queue: %s", exc)
+
+    def _vision_hold(self, ad_id: str) -> bool:
+        wait = self.config.ai.vision_wait_minutes
+        if wait <= 0:
+            return False
+        try:
+            queued = self.db.vision_queued_at(ad_id)
+        except (sqlite3.Error, AttributeError):
+            return False
+        return queued is not None and utcnow() - _aware(queued) < timedelta(minutes=wait)
+
+    async def _drain_vision_queue(self, summary: RunSummary) -> None:
+        """Start of a pass: would-be deals held for the photo check. The vision model is back:
+        check them now; still off after ai.vision_wait_minutes: send them marked "фото не проверены"."""
+        try:
+            queue = self.db.vision_queue()
+        except (sqlite3.Error, AttributeError):
+            return
+        if not queue:
+            return
+        wait = timedelta(minutes=max(0.0, self.config.ai.vision_wait_minutes))
+        vision_up: bool | None = None
+        for ad_id, search_name, queued_at in queue:
+            ev, listing = self.db.get_evaluation(ad_id), self.db.get_listing(ad_id)
+            if ev is None or listing is None or ev.ai_checked is not False or not ev.would_buy:
+                self.db.unqueue_vision([ad_id])
+                continue
+            search = self.config.search_by_name(search_name) or SearchConfig(
+                name=search_name or listing.search_name or "—", purpose=ev.purpose)
+            expired = utcnow() - _aware(queued_at) >= wait
+            if not expired and self._evaluator is not None and vision_up is not False:
+                try:
+                    new = await self._conclude(listing, search, ev.estimate, self._source_for(listing), None,
+                                               ask_ai=True, plan=self._scout_plan_for(listing),
+                                               found_by=ev.found_by or scout_ai.FOUND_BY_SCRIPT)
+                except (BlockedError, RateBudgetExceeded, EbayAPIError):
+                    vision_up = False
+                    continue
+                except Exception:  # noqa: BLE001
+                    log.exception("Vision re-check of %s failed", ad_id)
+                    vision_up = False
+                    continue
+                summary.ai_calls += 1
+                if new.ai_checked is True:
+                    vision_up = True
+                    self.db.unqueue_vision([ad_id])
+                    log.info("📷 Фото проверены после ожидания: %s → %s", listing.title[:60], new.verdict)
+                    self._emit("deal_updated", self._deal_event(listing, search.name, new))
+                    await self._after_evaluation(listing, search, new, summary, instant=True, count=False)
+                    continue
+                vision_up = False
+            if expired:
+                self.db.unqueue_vision([ad_id])
+                log.info("📷 Нейросеть так и не проверила фото «%s» — присылаю с пометкой", listing.title[:60])
+                await self._after_evaluation(listing, search, ev, summary, instant=True, count=False)
+            else:
+                summary.vision_waiting += 1
+
+    # ---------------------------------------------------------- after a verdict
+    def _deal_event(self, listing: Listing, search_name: str, evaluation: Evaluation) -> dict[str, Any]:
+        """deal_found / deal_updated payload: the old keys, plus found_by, tier, the listing, the
+        evaluation and (when the web layer is installed) the deal card."""
+        payload: dict[str, Any] = {
+            "ad_id": listing.ad_id, "search_name": search_name, "title": listing.title,
+            "verdict": evaluation.verdict, "action": evaluation.action, "score": evaluation.score,
+            "found_by": evaluation.found_by,
+            "tier": deal_tier(evaluation, self.config.notifications.super_deals),
+            "listing": listing.model_dump(mode="json"),
+            "evaluation": evaluation.model_dump(mode="json"),
+        }
+        try:
+            from .web.api.presenters import deal_card
+
+            deal = self.db.get_deal_extras(listing.ad_id)
+            if deal is not None:
+                payload["card"] = deal_card(deal[0], deal[1], config=self.config)
+        except Exception:  # noqa: BLE001 - an event must never break monitoring
+            log.debug("deal card for the event failed", exc_info=True)
+        return payload
+
+    async def _after_evaluation(self, listing: Listing, search: SearchConfig, evaluation: Evaluation,
+                                summary: RunSummary, *, instant: bool, count: bool = True) -> DealView | None:
+        """Count, announce and alert one evaluated ad. «🔥 Супер-находка» goes out at once (past
+        the hourly cap and the digest mode); in digest mode other deals are returned for it."""
+        if count and evaluation.verdict == "buy":
+            summary.deals_found += 1
+            if evaluation.found_by == scout_ai.FOUND_BY_SCOUT:
+                summary.scout_deals += 1
+        if evaluation.verdict == "buy" or evaluation.action in DEAL_EVENT_ACTIONS:
+            self._emit("deal_found", self._deal_event(listing, search.name, evaluation))
+        if not self._should_notify(evaluation):
+            return None
+        deal = self.db.get_deal(listing.ad_id)
+        if deal is None:
+            return None
+        if deal_tier(evaluation, self.config.notifications.super_deals) == TIER_SUPER:
+            await self._alert(deal, summary, super_find=True)
+            return None
+        if instant:  # a good deal is gone in minutes: don't wait for the rest of the search
+            await self._alert(deal, summary)
+            return None
+        return deal
+
     # --------------------------------------------------------- notifications
     def _channels(self) -> list[str]:
         return [getattr(n, "name", "?") for n in self._notifiers or []]
@@ -1268,6 +2225,8 @@ class Monitor:
             return False
         unchecked = (evaluation.would_buy and evaluation.ai_checked is False and cfg.unchecked_deals
                      and "buy" in cfg.verdicts)
+        if unchecked and self._vision_hold(evaluation.ad_id):
+            return False  # waiting for the vision model (ai.vision_wait_minutes)
         if not unchecked and (evaluation.verdict not in cfg.verdicts or evaluation.score < cfg.min_score):
             return False
         deal = self.db.get_deal(evaluation.ad_id)
@@ -1278,9 +2237,15 @@ class Monitor:
             return not self.db.was_notified(evaluation.ad_id)
         return any(not self.db.was_notified(evaluation.ad_id, ch) for ch in channels)
 
-    async def _alert(self, deal: DealView, summary: RunSummary) -> None:
-        """Instant alert for one deal: repost check, then the hourly cap (overflow → digest later)."""
+    async def _alert(self, deal: DealView, summary: RunSummary, *, super_find: bool = False) -> None:
+        """Instant alert for one deal: repost check, then the hourly cap (overflow → digest later).
+        A «🔥 Супер-находка» skips the cap and gets its own headline."""
         if self._is_repost(deal.listing):
+            return
+        if super_find:
+            delivered = await self._notify([deal], summary, title=super_title(deal))
+            summary.notified += delivered
+            summary.super_deals += 1 if delivered else 0
             return
         if self._alert_cap_reached():
             self.db.queue_alert(deal.listing.ad_id)
@@ -1355,11 +2320,13 @@ class Monitor:
                     await notifier.send(todo)  # notifiers build an informative subject themselves
             except Exception as exc:
                 log.warning("Notifier %s failed: %s", name, exc)
-                summary.errors.append(f"Уведомление ({name}): {exc}")
+                human = humanize(exc, name)
+                _add_error(summary, f"Уведомление через {_channel_label(name)} не ушло: {human.message_ru}",
+                           human.details)
                 for deal in todo:
-                    self.db.note_delivery_failure(deal.listing.ad_id, name, str(exc))
-                await self._health(f"notify:{name}", f"⚠ Не удалось отправить уведомление через {name}: {exc}."
-                                   " Повторю при следующих проверках.", summary, exclude={name})
+                    self.db.note_delivery_failure(deal.listing.ad_id, name, human.message_ru)
+                await self._health(f"notify:{name}", f"⚠ Не удалось отправить уведомление через {_channel_label(name)}:"
+                                   f" {human.message_ru}. Повторю при следующих проверках.", summary, exclude={name})
                 continue
             for deal in todo:
                 self.db.mark_notified(deal.listing.ad_id, name)
@@ -1382,8 +2349,9 @@ class Monitor:
             try:
                 await notifier.send(deals)
             except Exception as exc:
+                log.info("Retry via %s failed: %s", channel, exc)
                 for deal in deals:
-                    tries = self.db.note_delivery_failure(deal.listing.ad_id, channel, str(exc))
+                    tries = self.db.note_delivery_failure(deal.listing.ad_id, channel, humanize(exc, channel).message_ru)
                     if tries >= MAX_DELIVERY_ATTEMPTS:
                         log.warning("Уведомление о %s через %s так и не ушло (%d попыток)", deal.listing.ad_id,
                                     channel, tries)
@@ -1418,6 +2386,7 @@ class Monitor:
                       every: timedelta | None = None) -> bool:
         """A service message ("AI down", "site blocks us", ...) through every channel that can
         send one; the same kind at most once per 6 hours (persisted)."""
+        self._emit_health(kind, text, every or HEALTH_ALERT_EVERY)
         if not self.config.notifications.health_alerts or not self._notifiers:
             return False
         key = f"alert:{kind}"
@@ -1429,6 +2398,18 @@ class Monitor:
             self.db.set_state(key, text)
             summary.health_alerts += 1
         return sent
+
+    def _emit_health(self, kind: str, text: str, every: timedelta) -> None:
+        """health_alert event for the web UI (even without notification channels), the same
+        kind at most once per `every` per process."""
+        last = self._event_alerts.get(kind)
+        now = utcnow()
+        if last is not None and now - last < every:
+            return
+        self._event_alerts[kind] = now
+        # text: as sent to Telegram / e-mail; text_ru: for a UI toast (it has its own icon, no "⚠")
+        self._emit("health_alert", {"kind": kind, "text": text, "text_ru": text.lstrip("⚠️ ").strip(),
+                                    "at": now.isoformat(), "at_label": when_label(now)})
 
     async def _send_text(self, text: str, *, exclude: set[str] | None = None) -> bool:
         sent = False
@@ -1458,8 +2439,8 @@ class Monitor:
         if streak < 2:
             return
         if error:
-            text = (f"⚠ Поиск «{search.name}»: страница Kleinanzeigen не распознаётся уже {streak} проверки"
-                    f" подряд ({error[:120]}). Возможно, сайт изменился.")
+            text = (f"⚠ Поиск «{search.name}»: страницу Kleinanzeigen не получается разобрать уже {streak} проверки"
+                    " подряд — возможно, сайт изменился. Если так и останется, обнови программу.")
         else:
             text = (f"⚠ Поиск «{search.name}» уже {streak} проверки подряд не находит ни одного объявления —"
                     " проверь ссылку и фильтры.")
@@ -1468,19 +2449,53 @@ class Monitor:
     async def _after_run(self, summary: RunSummary) -> None:
         """End of a pass: the AI health check, held-back alerts, the daily heartbeat."""
         if self._evaluator is not None and self._ai_failed and not self._ai_answered:
-            tail = (" Выгодные по цене объявления присылаю с пометкой «фото не проверены»."
-                    if self.config.notifications.unchecked_deals else "")
-            await self._health("ai_down", "⚠ Нейросеть недоступна — сделки не проверяются. Запущен ли LM Studio?"
-                               + tail, summary)
+            wait = self.config.ai.vision_wait_minutes
+            tail = ""
+            if self.config.notifications.unchecked_deals:
+                tail = (f" Выгодные по цене объявления жду до {wait:.0f} мин, потом присылаю с пометкой"
+                        " «фото не проверены»." if wait > 0 else
+                        " Выгодные по цене объявления присылаю с пометкой «фото не проверены».")
+            hint = "Запусти приложение Ollama" if self.config.ai.provider == "ollama" else AI_DOWN_HINT_RU
+            await self._health("ai_down", f"⚠ {AI_DOWN_RU}. {hint}." + tail, summary)
+        elif self._evaluator is not None and self._ai_limited and not self._ai_answered:
+            wait = self.config.ai.vision_wait_minutes
+            tail = (f" Выгодные по цене объявления жду до {wait:.0f} мин, потом присылаю с пометкой «фото не проверены»."
+                    if wait > 0 else " Выгодные по цене объявления присылаю с пометкой «фото не проверены».")
+            await self._health("cloud_quota", f"⚠ {self._ai_limited_ru.rstrip('.')}." + tail, summary)
         await self._flush_alert_queue(summary)
         await self._maybe_heartbeat(summary)
+        await self._maybe_daily_top(summary)
+
+    async def _maybe_daily_top(self, summary: RunSummary) -> None:
+        """«Топ за день»: once a day at notifications.daily_top.hour (local time), the best deals
+        of the last 24 h per search as one message — including ones already sent."""
+        cfg = self.config.notifications.daily_top
+        if not cfg.enabled or not self._notifiers:
+            return
+        local = now_local()
+        today = local.date().isoformat()
+        state = self.db.get_state("daily_top")
+        if local.hour < cfg.hour or (state is not None and state[0] == today):
+            return
+        deals = self.db.top_deals_since(utcnow() - timedelta(days=1), verdicts=cfg.verdicts,
+                                        per_search=max(1, cfg.per_search))
+        self.db.set_state("daily_top", today)
+        if not deals:
+            return
+        title = f"Топ за день: {len(deals)} {_deals_word(len(deals))}"
+        for notifier in self._notifiers:
+            try:
+                await notifier.send(deals, title=title)
+            except Exception as exc:  # noqa: BLE001 - a digest never breaks a pass
+                log.warning("Топ за день через %s не ушёл: %s", getattr(notifier, "name", "?"), exc)
+        summary.health_alerts += 1
 
     async def _maybe_heartbeat(self, summary: RunSummary) -> None:
         """Once a day at notifications.heartbeat_hour (local time): "still alive" + 24 h stats."""
         hour = self.config.notifications.heartbeat_hour
         if hour is None or not self._notifiers:
             return
-        local = datetime.now().astimezone()
+        local = now_local()  # general.timezone, not the host's (UTC in Docker)
         today = local.date().isoformat()
         state = self.db.get_state("heartbeat")
         if local.hour < hour or (state is not None and state[0] == today):
@@ -1497,6 +2512,25 @@ class Monitor:
             summary.health_alerts += 1
 
 
+AI_DOWN_HINT_RU = "Открой LM Studio → Developer → Start Server"
+_CHANNEL_LABELS = {"telegram": "Telegram", "email": "почту"}
+
+
+def _channel_label(name: str) -> str:
+    return _CHANNEL_LABELS.get(name, name)
+
+
+def _add_error(summary: RunSummary, text: str, details: str = "") -> None:
+    """A run error for the web UI (plain Russian) + its technical text (for «Подробнее»)."""
+    summary.errors.append(text)
+    summary.error_details.append(details or text)
+
+
+def _add_exc(summary: RunSummary, prefix: str, exc: BaseException, service: str = "") -> None:
+    human = humanize(exc, service)
+    _add_error(summary, f"{prefix}: {human.message_ru}", human.details)
+
+
 def _deals_word(n: int) -> str:
     n = abs(n)
     if n % 10 == 1 and n % 100 != 11:
@@ -1507,8 +2541,95 @@ def _deals_word(n: int) -> str:
 
 
 def summary_buy_share(db: Database, listings: list[Listing]) -> float:
-    verdicts = [ev.verdict for l in listings if (ev := db.get_evaluation(l.ad_id)) is not None]
+    verdicts = [ev.verdict for item in listings if (ev := db.get_evaluation(item.ad_id)) is not None]
     return sum(v == "buy" for v in verdicts) / len(verdicts) if verdicts else 0.0
+
+
+# kind vetoes the scout may overrule: only where hidden value is plausible AND the scout reads the
+# ad the same way (a PC priced by its parts, a laptop as an identified product). Never "part"
+# (missing components: "Switch nur Tablet"), accessories, defects, boxes, wanted/swap/service ads.
+SCOUT_OVERRULES = {"complete_pc": scout_ai.BUNDLE_KINDS, "laptop": frozenset({"single"})}
+SCOUT_NO_DEAL_PRIORITY = 0.9  # rank of a candidate the scout's price calls no deal (after the unknown ones)
+
+
+def _scout_may_overrule(kind: str, plan: Any) -> bool:
+    allowed = SCOUT_OVERRULES.get(kind)
+    if allowed is None or plan.kind not in allowed:
+        return False
+    return plan.kind != "single" or plan.identified
+
+
+def scout_llm_settings(config: AppConfig) -> LLMSettings:
+    """The scout's endpoint: its own (the always-on small model) or, left empty, the ai one
+    (a cloud endpoint's kind and limits included)."""
+    ai, sc = config.ai, config.ai.scout
+    own = bool(sc.base_url.strip())
+    src = sc if own else ai
+    settings = LLMSettings(
+        provider=sc.provider if own else ai.provider,
+        base_url=sc.base_url.strip() if own else ai.base_url,
+        model=(sc.model or "").strip() or ai.model,
+        api_key=(sc.api_key if own else ai.api_key) or "",
+        max_images=0,
+        timeout_seconds=sc.timeout_seconds,
+        temperature=sc.temperature,
+        max_tokens=sc.max_tokens,
+        thinking=sc.thinking,
+        cloud=src.cloud,
+        rpm=src.rpm,
+        daily_limit=src.daily_limit,
+    )
+    if cloud_ai.cloud_kind(settings):  # 16-20 ads per call: room for the answer
+        settings.max_tokens = max(settings.max_tokens, cloud_ai.CLOUD_TRIAGE_MAX_TOKENS)
+    return settings
+
+
+def scout_fallback_settings(config: AppConfig) -> LLMSettings | None:
+    """A cloud scout's local stand-in: ai.scout.fallback, else (the scout on the ai endpoint)
+    the ai.fallback server with ai.scout.fallback.model or its own model."""
+    ai, sc = config.ai, config.ai.scout
+    settings = scout_llm_settings(config)
+    if not cloud_ai.cloud_kind(settings):
+        return None
+    fb = sc.fallback if sc.fallback.usable else None
+    if fb is None and ai.fallback.usable and not sc.base_url.strip():
+        fb = ai.fallback.model_copy(update={"model": sc.fallback.model.strip() or ai.fallback.model})
+    return cloud_ai.fallback_settings(fb, settings.model_copy(update={"max_tokens": sc.max_tokens}))
+
+
+def vision_fallback_settings(config: AppConfig) -> LLMSettings | None:
+    """«Облако + компьютер про запас»: the local photo model while the cloud can't be called."""
+    ai = config.ai
+    if ai.provider == "anthropic" or not cloud_ai.cloud_kind(ai):
+        return None
+    return cloud_ai.fallback_settings(ai.fallback, ai)
+
+
+def cloud_roles(config: AppConfig) -> list[tuple[str, Any, Any]]:
+    """(role, settings, local stand-in) of the photo check and the scout, for ai.cloud.cloud_view."""
+    ai = config.ai
+    roles: list[tuple[str, Any, Any]] = []
+    if ai.enabled:
+        roles.append(("vision", ai, vision_fallback_settings(config)))
+    if ai.scout.enabled:
+        roles.append(("scout", scout_llm_settings(config), scout_fallback_settings(config)))
+    return roles
+
+
+def make_scout_llm(settings: LLMSettings) -> Any:
+    """The scout's text client: thinking off (Qwen3.x small models, docs/design/AI_MODELS.md §5; the
+    switch per runtime is ai.cloud.thinking_controls) and the scout's share of a cloud quota."""
+    return make_llm(settings, purpose="triage")
+
+
+def _capped_maybe(evaluation: Evaluation, warning: str) -> Evaluation:
+    """At most "maybe" (score ≤ 65), with the warning as a reason."""
+    update: dict[str, Any] = {"reasons": [*evaluation.reasons, warning], "score": min(evaluation.score, 65.0)}
+    if evaluation.verdict == "buy":
+        update["verdict"] = "maybe"
+        if evaluation.action == "buy":
+            update["action"] = "watch"
+    return evaluation.model_copy(update=update)
 
 
 def _cross_check(estimate: PriceEstimate, verdict: AIVerdict | None) -> PriceEstimate:
@@ -1614,7 +2735,7 @@ def _until_text(exc: BaseException) -> str:
     until = getattr(exc, "cooldown_until", None)
     if not isinstance(until, datetime):
         return ""
-    return " до " + _aware(until).astimezone().strftime("%H:%M")
+    return " " + at_label(until)  # " в 21:34" in the user's time zone (general.timezone), not the host's
 
 
 def _severe_title(title: str) -> bool:

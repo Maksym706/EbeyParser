@@ -32,9 +32,23 @@ COMPS_SELLER_FILTER = "sellerAccountTypes:{INDIVIDUAL}"
 
 
 class EbayAPIError(Exception):
-    def __init__(self, message: str, status_code: int | None = None) -> None:
+    """str(exc) is technical (log / CLI); `message_ru` (when set) is what the web UI shows."""
+
+    service = "ebay"
+
+    def __init__(self, message: str, status_code: int | None = None, *, message_ru: str = "",
+                 code: str = "") -> None:
         super().__init__(message)
         self.status_code = status_code
+        if message_ru:
+            self.message_ru = message_ru
+        if code:
+            self.code = code
+        if message_ru or code:
+            self.action = {"label_ru": "Подключить eBay", "href": "/settings/ebay"}
+
+
+EBAY_NOT_CONNECTED_RU = "eBay не подключён — подключи его в настройках, и поиски по eBay заработают"
 
 
 def seller_account_type(item: dict[str, Any]) -> str:
@@ -206,7 +220,9 @@ class EbayBrowseClient:
                     return self._token
                 raise EbayAPIError(
                     "eBay: токен истёк или не задан. Укажи ebay.client_id и ebay.client_secret "
-                    "(App ID и Cert ID с developer.ebay.com) — тогда токен будет обновляться сам."
+                    "(App ID и Cert ID с developer.ebay.com) — тогда токен будет обновляться сам.",
+                    message_ru="Ключ eBay истёк — подключи eBay заново по App ID и Cert ID, тогда ключ будет "
+                               "обновляться сам", code="ebay_not_connected",
                 )
             basic = base64.b64encode(f"{self.cfg.client_id}:{self.cfg.client_secret}".encode()).decode()
             resp = await self._http.post(
@@ -216,7 +232,7 @@ class EbayBrowseClient:
                 data={"grant_type": "client_credentials", "scope": SCOPE},
             )
             if resp.status_code != 200:
-                raise EbayAPIError(f"eBay OAuth: {resp.status_code} {resp.text[:200]}")
+                raise EbayAPIError(f"eBay OAuth: {resp.status_code} {resp.text[:200]}", resp.status_code)
             payload = resp.json()
             self._token = payload["access_token"]
             self._token_expires = time.monotonic() + int(payload.get("expires_in", 7200)) - 120
@@ -237,11 +253,11 @@ class EbayBrowseClient:
                 await asyncio.sleep(2 ** attempt)
                 continue
             if resp.status_code == 401:
-                raise EbayAPIError("eBay: токен недействителен или истёк (401).")
+                raise EbayAPIError("eBay: токен недействителен или истёк (401).", 401)
             if resp.status_code >= 400:
                 raise EbayAPIError(f"eBay API {resp.status_code}: {resp.text[:300]}", resp.status_code)
             return resp.json()
-        raise EbayAPIError(f"eBay API не отвечает ({resp.status_code})")
+        raise EbayAPIError(f"eBay API не отвечает ({resp.status_code})", resp.status_code)
 
     # ------------------------------------------------------------ searching
     async def search(

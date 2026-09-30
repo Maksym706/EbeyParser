@@ -20,6 +20,7 @@ from .models import DealView
 from .web.configfile import save_searches_block, update_yaml_values, write_env_values
 from .web.localai import (
     DEFAULT_LMSTUDIO_MODEL,
+    DEFAULT_OLLAMA_MODEL,
     LMSTUDIO_URL,
     LocalAIServer,
     detect_local_ai,
@@ -37,21 +38,56 @@ def _setup_logging(verbose: bool) -> None:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    from .timefmt import LocalFormatter
+
+    for handler in logging.getLogger().handlers:  # times in the user's zone, not the host's
+        handler.setFormatter(LocalFormatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", "%H:%M:%S"))
     for noisy in ("httpx", "httpcore", "uvicorn.access"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def _open(config_path: Path) -> tuple[AppConfig, Database]:
+    from .timefmt import apply_config
+
     config = load_config(config_path)
+    apply_config(config)
     if not config_path.is_file():
         print(f"⚠  {config_path} не найден — работаю с настройками по умолчанию. "
               "Создай конфиг командой: python -m ebeyparser init")
     return config, Database(config.db_path)
 
 
-def _web_base_url(config: AppConfig) -> str:
-    host = "localhost" if config.web.host in ("0.0.0.0", "127.0.0.1", "::") else config.web.host
-    return f"http://{host}:{config.web.port}"
+def _web_base_url(config: AppConfig, host: str | None = None, port: int | None = None) -> str:
+    """Base of the links in alerts («Подробнее в EbeyParser»). Listening on the whole network: the
+    address a phone can open (Tailscale name / IP first — it works outside home too — then the
+    home network), not localhost. The links carry no key: the phone's browser remembers it."""
+    from .web.security import ANY_ADDRESS, is_loopback
+
+    host = (host or config.web.host or "").strip()
+    port = port or config.web.port
+    if is_loopback(host):
+        return f"http://localhost:{port}"
+    if host.strip("[]").lower() in ANY_ADDRESS:
+        best = _reachable_address()
+        return f"http://{best or 'localhost'}:{port}"
+    return f"http://{f'[{host}]' if ':' in host and not host.startswith('[') else host}:{port}"
+
+
+_REACHABLE: list[str | None] = []
+
+
+def _reachable_address() -> str | None:
+    """Tailscale name, Tailscale IP, else the first home-network IP (looked up once per process)."""
+    if not _REACHABLE:
+        from .homeserver import access_links
+        from .web.security import tailscale_name
+
+        name = tailscale_name()
+        links = access_links("0.0.0.0", 1, None, tailscale=name)
+        tailnet = [u for where, u in links if where == "Tailscale"]
+        pick = (tailnet[-1] if tailnet else links[0][1]) if links else None
+        _REACHABLE.append(pick.split("//", 1)[1].rsplit(":", 1)[0] if pick else None)
+    return _REACHABLE[0]
 
 
 def _money(value: float | None) -> str:
@@ -81,6 +117,25 @@ def _print_deals(deals: list[DealView]) -> None:
 
 
 # ------------------------------------------------------------------ commands
+
+def attach_projects(monitor: Any, db: Database) -> None:
+    """«Сборки»: alerts of build projects hooked into the monitor's events (never breaks startup)."""
+    try:
+        from .projects.hooks import attach
+
+        attach(monitor, db)
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).exception("build-project alerts not attached")
+
+
+async def drain_projects(monitor: Any) -> None:
+    try:
+        from .projects.hooks import drain
+
+        await drain(monitor)
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).exception("build-project alerts did not finish")
+
 def cmd_init(args: argparse.Namespace) -> int:
     target = Path(args.config)
     if target.exists():
@@ -149,49 +204,314 @@ def _long_running(config: AppConfig) -> Iterator[bool]:
         lock.release()
 
 
-def cmd_run(args: argparse.Namespace) -> int:
-    """Web UI + background monitoring (main mode)."""
+BROWSER_MARKER = ".browser_opened"
+BROWSER_QUIET_SECONDS = 10 * 60  # a crash-restart loop (start-windows.bat) must not open a tab every time
+BROWSER_WAIT_SECONDS = 60.0
+
+
+def bootstrap_config(config_path: Path, host: str | None = None) -> bool:
+    """No config.yaml yet: create it silently from the example — without its sample searches
+    and with the AI off — so the web UI's onboarding takes over. Also .env from .env.example.
+    `host`: web.host of the new config (a headless server: "0.0.0.0", the onboarding happens on
+    the phone or PC, with the access key)."""
+    if config_path.exists():
+        return False
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    if EXAMPLE_CONFIG.is_file():
+        shutil.copyfile(EXAMPLE_CONFIG, config_path)
+    else:
+        config_path.write_text("", encoding="utf-8")
+    save_searches_block(config_path, [])
+    update_yaml_values(config_path, {"ai.enabled": False, **({"web.host": host} if host else {})})
+    env = config_path.parent / ".env"
+    if not env.exists() and EXAMPLE_ENV.is_file():
+        shutil.copyfile(EXAMPLE_ENV, env)
+    return True
+
+
+def browser_allowed(args: argparse.Namespace) -> bool:
+    """Open the dashboard automatically? Not with --no-browser / EBEYPARSER_NO_BROWSER, not in
+    Docker, CI or a systemd service, not on a Linux box without a desktop, not when stdin is
+    redirected (Windows: pythonw without a console counts as a user double-click)."""
+    import os
+
+    if getattr(args, "no_browser", False) or getattr(args, "server", False) or os.environ.get("EBEYPARSER_NO_BROWSER"):
+        return False
+    if os.environ.get("CI") or os.environ.get("INVOCATION_ID") or os.environ.get("container") \
+            or Path("/.dockerenv").exists():
+        return False
+    stdin = sys.stdin
+    if sys.platform == "win32":
+        return stdin is None or stdin.isatty()
+    if sys.platform != "darwin" and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    return stdin is not None and stdin.isatty()
+
+
+def _browser_recently_opened(data_dir: Path, now: float) -> bool:
+    marker = Path(data_dir) / BROWSER_MARKER
+    try:
+        last = float(marker.read_text(encoding="utf-8").strip() or 0)
+    except (OSError, ValueError):
+        last = 0.0
+    if now - last < BROWSER_QUIET_SECONDS:
+        return True
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(now), encoding="utf-8")
+    except OSError:
+        pass
+    return False
+
+
+def open_browser_when_ready(server: Any, url: str, data_dir: Path, *, opener: Callable[[str], Any] | None = None,
+                            clock: Callable[[], float] | None = None, sleep: Callable[[float], Any] | None = None) -> None:
+    """Wait (in a thread) until uvicorn listens, then open `url` once."""
+    import threading
+    import time
+    import webbrowser
+
+    opener = opener or webbrowser.open
+    clock = clock or time.time
+    sleep = sleep or time.sleep
+
+    def wait() -> None:
+        waited = 0.0
+        while not getattr(server, "started", False):
+            if getattr(server, "should_exit", False) or waited >= BROWSER_WAIT_SECONDS:
+                return
+            sleep(0.2)
+            waited += 0.2
+        if _browser_recently_opened(data_dir, clock()):
+            return
+        try:
+            opener(url)
+        except Exception as exc:  # noqa: BLE001 - no browser is not an error
+            logging.getLogger(__name__).info("Browser not opened: %s", exc)
+
+    threading.Thread(target=wait, name="ebeyparser-browser", daemon=True).start()
+
+
+def _make_server(app: Any, host: str, port: int, verbose: bool) -> Any:
+    """uvicorn server that also ends the open live-update streams (SSE) on Ctrl+C."""
     import uvicorn
 
+    class _Server(uvicorn.Server):
+        def handle_exit(self, sig: int, frame: Any) -> None:
+            hub = getattr(app.state, "api_events", None)
+            if hub is not None:
+                hub.close_threadsafe()
+            super().handle_exit(sig, frame)
+
+    return _Server(uvicorn.Config(app, host=host, port=port, log_level="info" if verbose else "warning",
+                                  access_log=verbose))
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Web UI + background monitoring (main mode). Opens the browser once the server is up;
+    without config.yaml it creates one and the UI's onboarding takes over."""
     from .monitor import Monitor
     from .notify.base import build_notifiers
     from .web.app import create_app
-    from .web.security import TOKEN_PARAM, ensure_token, is_loopback, lan_urls
+    from .web.security import TOKEN_PARAM, ensure_token, is_loopback
 
     config_path = Path(args.config)
+    server_mode = bool(getattr(args, "server", False))
+    created = bootstrap_config(config_path, host=args.host or ("0.0.0.0" if server_mode else None))
+    if created:
+        where = "на телефоне или ПК по ссылке ниже" if server_mode or args.host else "в браузере"
+        print(f"✔ Создан {config_path} — настройка продолжится {where} (город, категории, нейросеть, Telegram).",
+              flush=True)
+    open_browser = browser_allowed(args)
     with _long_running(load_config(config_path)) as ok:
         if not ok:
             return 3
-        config, db = _open(config_path)
-        host = args.host or config.web.host
-        port = args.port or config.web.port
-        base_url = _web_base_url(config)
-        token = None if is_loopback(host) else ensure_token(config.data_path)
-        monitor = Monitor(config, db, web_base_url=base_url)
-        app = create_app(
-            config, db,
-            config_path=config_path,
-            monitor=monitor,
-            notifiers_factory=lambda: build_notifiers(app.state.config.notifications, web_base_url=base_url),
-            start_monitor=config.web.run_monitor and not args.no_monitor,
-            bind_host=host,
-            access_token=token,
-        )
-        if token is None:
-            print(f"🚀 EbeyParser: открой http://localhost:{port}")
+        _autoconfigure_scout(config_path)
+        while True:
+            config, db = _open(config_path)
+            if created:  # the web UI's onboarding asks for the AI step (see web/api/routes_app.is_onboarded)
+                db.set_state("onboarding:bootstrapped", "1")
+                created = False
+            host = args.host or config.web.host
+            port = args.port or config.web.port
+            base_url = _web_base_url(config, host, port)
+            token = None if is_loopback(host) else ensure_token(config.data_path)
+            monitor = Monitor(config, db, web_base_url=base_url)
+            attach_projects(monitor, db)  # build-project alerts (the web app only updates this wiring)
+            app = create_app(
+                config, db,
+                config_path=config_path,
+                monitor=monitor,
+                notifiers_factory=lambda: build_notifiers(app.state.config.notifications, web_base_url=base_url),
+                start_monitor=config.web.run_monitor and not args.no_monitor,
+                bind_host=host,
+                access_token=token,
+            )
+            _attach_scout_autoconfig(monitor, app)
+            everywhere = host.strip("[]") in ("0.0.0.0", "::", "")
+            local_host = "localhost" if everywhere or is_loopback(host) else (f"[{host}]" if ":" in host else host)
+            local_url = f"http://{local_host}:{port}/" + (f"?{TOKEN_PARAM}={token}" if token else "")
+            _print_access(config, host, port, token, server_mode=server_mode)
+            print(f"   Лог: {config.data_path / 'logs' / 'ebeyparser.log'}. Ctrl+C — остановить.", flush=True)
+            server = _make_server(app, host, port, args.verbose)
+            restart = {"requested": False}
+
+            def request_restart(server: Any = server, app: Any = app, restart: dict = restart) -> None:
+                restart["requested"] = True
+                hub = getattr(app.state, "api_events", None)
+                if hub is not None:
+                    hub.close()
+                server.should_exit = True
+
+            app.state.restart_callback = request_restart
+            if open_browser:
+                open_browser_when_ready(server, local_url, config.data_path)
+                open_browser = False
+            try:
+                server.run()
+            except KeyboardInterrupt:
+                return 0
+            finally:
+                db.close()
+            if not restart["requested"]:
+                break
+            print("♻ Перезапускаю с новыми настройками…")
+    return 0
+
+
+def _print_access(config: AppConfig, host: str, port: int, token: str | None, *, server_mode: bool = False,
+                  qr: bool = True, log_line: bool = True) -> None:
+    """Where to open the panel: real home-network / Tailscale addresses with the key, and a QR code
+    (stdout — the console, `journalctl -u ebeyparser`, `docker compose logs`); a line without the
+    key goes to the log file."""
+    from .homeserver import access_links, access_lines, emit
+    from .web.security import TOKEN_FILE, is_loopback, tailscale_name
+
+    ts_name = None if is_loopback(host) else tailscale_name()
+    emit(access_lines(host, port, token, config.data_path / TOKEN_FILE, allowed_hosts=config.web.allowed_hosts,
+                      qr=qr, tailscale=ts_name))
+    if is_loopback(host) and server_mode:
+        emit(["   Это сервер без экрана? Открой панель для домашней сети: python -m ebeyparser access lan",
+              "   (в Docker: docker compose exec ebeyparser python -m ebeyparser access lan) и перезапусти программу."])
+    if log_line and not is_loopback(host):
+        links = access_links(host, port, None, allowed_hosts=config.web.allowed_hosts, tailscale=ts_name)
+        logging.getLogger(__name__).info("Web UI for the network: %s (open once with ?token=… from %s)",
+                                         ", ".join(u.rstrip("/") for _, u in links) or host,
+                                         config.data_path / TOKEN_FILE)
+
+
+def _autoconfigure_scout(config_path: Path) -> None:
+    """Docker `ai` profile / install-linux.sh: EBEYPARSER_OLLAMA_URL points at the server's own
+    Ollama — switch the AI scout on there once (never over the user's own settings)."""
+    import os
+
+    from .homeserver import OLLAMA_URL_ENV, autoconfigure_scout, model_ram_gb
+
+    url = os.environ.get(OLLAMA_URL_ENV, "").strip()
+    if not url or not config_path.is_file():
+        return
+    try:
+        note = autoconfigure_scout(config_path, load_config(config_path), url, ram_gb=model_ram_gb())
+    except Exception as exc:  # noqa: BLE001 - never block the start
+        logging.getLogger(__name__).warning("AI scout auto-setup skipped: %s", exc)
+        return
+    if note:
+        print(f"🤖 {note}", flush=True)
+        logging.getLogger(__name__).info(note)
+
+
+def _attach_scout_autoconfig(monitor: Any, app: Any) -> None:
+    """The models may still be downloading at the first start: look again after each pass."""
+    import os
+
+    from .homeserver import OLLAMA_URL_ENV, model_ram_gb, scout_autoconfig_hook
+
+    try:
+        hook = scout_autoconfig_hook(app, os.environ.get(OLLAMA_URL_ENV, "").strip(), ram_gb=model_ram_gb())
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("AI scout auto-setup not attached: %s", exc)
+        return
+    hooks = getattr(monitor, "on_event", None)
+    if hook is not None and isinstance(hooks, list):
+        hooks.append(hook)
+
+
+def cmd_access(args: argparse.Namespace) -> int:
+    """Show the links (+ QR) for the phone, or switch who may open the panel: local / lan / tailscale."""
+    from .web.security import ensure_token, is_loopback, is_tailscale_ip, local_addresses
+
+    config_path = Path(args.config)
+    if args.mode:
+        if args.mode == "local":
+            host = "127.0.0.1"
+        elif args.mode == "lan":
+            host = "0.0.0.0"
         else:
-            everywhere = host in ("0.0.0.0", "::")
-            print(f"⚠ Панель открыта {'для всей сети' if everywhere else 'по адресу ' + host}"
-                  " — вход только по ссылке с ключом.")
-            if everywhere:
-                print("   Не делай так в общественном Wi-Fi (общежитие, кафе); для телефона лучше Tailscale.")
-                print(f"🚀 На этом компьютере: http://localhost:{port}/?token={token}")
-            urls = lan_urls(port, token) if everywhere else [f"http://{host}:{port}/?{TOKEN_PARAM}={token}"]
-            for url in urls:
-                print(f"📱 С телефона: {url}")
-            print(f"   Ключ хранится в {config.data_path / 'web_token.txt'} — удали файл, чтобы сменить ключ.")
-        print(f"   Лог: {config.data_path / 'logs' / 'ebeyparser.log'}. Ctrl+C — остановить.")
-        uvicorn.run(app, host=host, port=port, log_level="info" if args.verbose else "warning")
+            host = (args.host or "").strip() or next(iter(sorted(a for a in local_addresses() if is_tailscale_ip(a))), "")
+            if not host:
+                print("✖ Tailscale не найден на этом компьютере: установи Tailscale и войди в аккаунт"
+                      " (tailscale up), или укажи адрес: python -m ebeyparser access tailscale --host 100.x.y.z")
+                return 2
+        if bootstrap_config(config_path, host=host):
+            config = load_config(config_path)
+            db = Database(config.db_path)
+            db.set_state("onboarding:bootstrapped", "1")
+            db.close()
+        else:
+            update_yaml_values(config_path, {"web.host": host})
+        print(f"✔ web.host: {host} записан в {config_path}. Перезапусти программу (сервер: sudo systemctl restart"
+              " ebeyparser; Docker: docker compose restart ebeyparser), чтобы это заработало.")
+    config = load_config(config_path)
+    host = config.web.host
+    token = None if is_loopback(host) else ensure_token(config.data_path)
+    _print_access(config, host, config.web.port, token, qr=not args.no_qr, log_line=False)
+    return 0
+
+
+def cmd_server_models(args: argparse.Namespace) -> int:
+    """Which small models fit this server (model catalog by RAM/CPU); --pull downloads them into Ollama."""
+    import json as _json
+    import os
+
+    from .homeserver import (
+        OLLAMA_URL_ENV,
+        describe_plan,
+        detect_hardware,
+        ollama_limit_gb,
+        pull_models,
+        server_plan,
+    )
+
+    hw = detect_hardware()
+    if args.ram_gb:
+        hw = type(hw)(ram_gb=args.ram_gb, cores=hw.cores, arch=hw.arch, arm=hw.arm)
+    plan = server_plan(hw.ram_gb, arm=hw.arm, limit_gb=ollama_limit_gb())
+    if args.json:
+        print(_json.dumps({"hardware": hw.__dict__, **plan}, ensure_ascii=False))
+        return 0
+    for line in describe_plan(plan, hw):
+        print(line)
+    if not plan["pull"]:
+        return 1
+    url = args.ollama or os.environ.get(OLLAMA_URL_ENV) or "http://127.0.0.1:11434"
+    if not args.pull:
+        print(f"\nСкачать в Ollama ({url}): python -m ebeyparser server-models --pull"
+              f"   (или: {' && '.join('ollama pull ' + m for m in plan['pull'])})")
+        return 0
+    if args.dry_run:
+        print(f"\n[dry-run] скачал бы в Ollama {url}: {', '.join(plan['pull'])}")
+        return 0
+    print(f"\nСкачиваю в Ollama {url} …", flush=True)
+    failed = pull_models(url, plan["pull"], say=lambda text: print(text, flush=True),
+                         wait_seconds=args.wait)
+    if failed:
+        print(f"⚠ Не скачались: {', '.join(failed)}. Проверь интернет и место на диске и запусти ещё раз.")
+        return 0 if args.never_fail else 1
+    if os.environ.get(OLLAMA_URL_ENV):
+        print("✔ Модели на месте. Разведчик включится сам после ближайшей проверки или при следующем запуске"
+              " программы (Настройки → Нейросеть покажет модель и скорость).")
+    else:
+        print(f"✔ Модели на месте. Включи разведчика в панели: Настройки → Нейросеть → Разведчик, Ollama {url}.")
     return 0
 
 
@@ -199,6 +519,7 @@ async def _monitor_loop(config: AppConfig, db: Database) -> None:
     from .monitor import Monitor
 
     monitor = Monitor(config, db, web_base_url=_web_base_url(config))
+    attach_projects(monitor, db)  # build-project alerts work without the web app too
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -209,6 +530,7 @@ async def _monitor_loop(config: AppConfig, db: Database) -> None:
     try:
         await monitor.run_forever(stop)
     finally:
+        await drain_projects(monitor)
         await monitor.aclose()
 
 
@@ -237,9 +559,11 @@ def cmd_once(args: argparse.Namespace) -> int:
 
     async def go():
         monitor = Monitor(config, db, web_base_url=_web_base_url(config))
+        attach_projects(monitor, db)
         try:
             return await monitor.run_once()
         finally:
+            await drain_projects(monitor)  # the pass's run_finished sweep must finish before we exit
             await monitor.aclose()
 
     print("⏳ Проверяю поиски. Каждое новое объявление: страница, цены аналогов, фото и нейросеть —"
@@ -545,7 +869,7 @@ def cmd_ai_check(args: argparse.Namespace) -> int:
     print(f"⚠  Сервер {health['base_url']} работает, но модели «{health['model']}» на нём нет.")
     if not models:
         print("   На сервере вообще нет моделей." + (
-            " Скачай vision-модель в LM Studio (вкладка Discover), например Qwen2.5-VL-7B-Instruct."
+            " Скачай vision-модель в LM Studio (вкладка Discover), например Qwen3.5 9B (qwen/qwen3.5-9b)."
             if lmstudio else f" Скачай: ollama pull {health['model']}"))
         return 1
     print("   Модели на сервере:")
@@ -554,7 +878,7 @@ def cmd_ai_check(args: argparse.Namespace) -> int:
     vision = [m for m in models if looks_like_vision_model(m)]
     if not vision:
         print("   ⚠ Ни одна из них не похожа на vision-модель — а программе нужна модель, которая видит фото"
-              " (Qwen2.5-VL, Gemma 3, MiniCPM-V, LLaVA...).")
+              " (Qwen3.5, Qwen2.5-VL, Gemma 3, MiniCPM-V, LLaVA...).")
         return 1
     best = vision[0]
     if args.fix:
@@ -877,8 +1201,9 @@ def _ask_ai(p: _Prompter, servers: list[LocalAIServer]) -> dict[str, Any]:
               + (", ".join(vision[:3]) if vision else "ни одной"))
     if not servers:
         p.say("   Не нашёл: LM Studio (localhost:1234) и Ollama (localhost:11434) не отвечают.")
-        if p.yes("   Настроить под LM Studio с моделью Qwen2.5-VL-7B? Сервер можно запустить позже"):
-            p.say("   В LM Studio: скачай Qwen2.5-VL-7B (вкладка Discover) → Developer → Start Server.")
+        if p.yes("   Настроить под LM Studio с моделью Qwen3.5 9B? Сервер можно запустить позже"):
+            p.say("   В LM Studio: скачай Qwen3.5 9B (вкладка Discover, qwen/qwen3.5-9b; для видеокарты 6–8 ГБ —"
+                  " qwen/qwen3.5-4b) → Developer → Start Server.")
             return {"ai.enabled": True, "ai.provider": "openai", "ai.base_url": LMSTUDIO_URL,
                     "ai.model": DEFAULT_LMSTUDIO_MODEL}
         p.say("   Хорошо, без нейросети: оценка только по ценам. Включить позже — python -m ebeyparser setup.")
@@ -894,9 +1219,10 @@ def _ask_ai(p: _Prompter, servers: list[LocalAIServer]) -> dict[str, Any]:
             server = servers[int(answer) - 1]
     vision = server.vision_models
     if not vision:
-        model = DEFAULT_LMSTUDIO_MODEL if server.provider == "openai" else "qwen2.5vl:7b"
-        p.say(f"   ⚠ В {server.name} нет модели, которая видит фото. Скачай Qwen2.5-VL-7B"
-              + (" (вкладка Discover)." if server.provider == "openai" else " командой: ollama pull qwen2.5vl:7b")
+        model = DEFAULT_LMSTUDIO_MODEL if server.provider == "openai" else DEFAULT_OLLAMA_MODEL
+        p.say(f"   ⚠ В {server.name} нет модели, которая видит фото. Скачай Qwen3.5 9B"
+              + (" (вкладка Discover)." if server.provider == "openai"
+                 else f" командой: ollama pull {DEFAULT_OLLAMA_MODEL}")
               + f" Пока впишу {model}.")
     elif len(vision) == 1:
         model = vision[0]
@@ -1032,6 +1358,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("-c", "--config", default=str(DEFAULT_CONFIG_PATH), help="путь к config.yaml")
     parser.add_argument("-v", "--verbose", action="store_true", help="подробный лог")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="не открывать браузер при запуске (для `run` и запуска без команды)")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("init", help="создать config.yaml и .env из примеров").set_defaults(func=cmd_init)
@@ -1040,7 +1368,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host")
     p.add_argument("--port", type=int)
     p.add_argument("--no-monitor", action="store_true", help="только веб-интерфейс, без проверок")
+    p.add_argument("--no-browser", action="store_true", default=argparse.SUPPRESS,
+                   help="не открывать браузер при запуске")
+    p.add_argument("--server", action="store_true",
+                   help="домашний сервер без экрана: браузер не открывается, при первом запуске панель открыта"
+                        " для домашней сети (вход по ссылке с ключом, она в логе)")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("access", help="ссылки на панель для телефона (+ QR-код) или сменить доступ: local / lan / tailscale")
+    p.add_argument("mode", nargs="?", choices=["local", "lan", "tailscale"],
+                   help="local — только этот компьютер, lan — домашняя сеть, tailscale — только через Tailscale")
+    p.add_argument("--host", help="для tailscale: адрес компьютера в Tailscale (100.x.y.z), если не нашёлся сам")
+    p.add_argument("--no-qr", action="store_true", help="без QR-кода")
+    p.set_defaults(func=cmd_access)
+
+    p = sub.add_parser("server-models", help="какие нейросети потянет этот сервер (по памяти и процессору);"
+                                             " --pull — скачать их в Ollama")
+    p.add_argument("--pull", action="store_true", help="скачать в Ollama")
+    p.add_argument("--ollama", help="адрес Ollama (по умолчанию EBEYPARSER_OLLAMA_URL или http://127.0.0.1:11434)")
+    p.add_argument("--ram-gb", type=float, help="считать, что памяти столько ГБ")
+    p.add_argument("--dry-run", action="store_true", help="только показать, что будет скачано")
+    p.add_argument("--json", action="store_true", help="план в JSON (для скриптов установки)")
+    p.add_argument("--wait", type=float, default=60.0, help="сколько секунд ждать, пока Ollama запустится")
+    p.add_argument("--never-fail", action="store_true", help="код выхода 0, даже если скачать не вышло (Docker)")
+    p.set_defaults(func=cmd_server_models)
 
     sub.add_parser("monitor", help="мониторинг без веб-интерфейса").set_defaults(func=cmd_monitor)
 
@@ -1097,7 +1448,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command is None:
         args = parser.parse_args([*(argv or sys.argv[1:]), "run"])
-    for name, default in (("host", None), ("port", None), ("no_monitor", False)):
+    for name, default in (("host", None), ("port", None), ("no_monitor", False), ("no_browser", False),
+                          ("server", False)):
         if not hasattr(args, name):
             setattr(args, name, default)
     _setup_logging(args.verbose)

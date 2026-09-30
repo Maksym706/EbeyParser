@@ -8,8 +8,8 @@
   </div>
   {% if editable %}
   <div class="head-actions">
-    <a class="btn" href="/setup">{{ icon('settings') }}Мастер настройки</a>
-    <a class="btn btn-primary" href="/searches?new=1#form">{{ icon('plus') }}Добавить поиск</a>
+    <a class="btn" href="/classic/setup">{{ icon('settings') }}Мастер настройки</a>
+    <a class="btn btn-primary" href="/classic/searches?new=1#form">{{ icon('plus') }}Добавить поиск</a>
   </div>
   {% endif %}
 </section>
@@ -26,7 +26,7 @@
 <section class="card help">
   <div class="help-icon">{{ icon('info') }}</div>
   <div>
-    <p><b>Проще всего — <a class="link" href="/setup">мастер настройки</a>: город, радиус, категории и бюджет. Программа будет просматривать все новые объявления этих категорий рядом с тобой.</b></p>
+    <p><b>Проще всего — <a class="link" href="/classic/setup">мастер настройки</a>: город, радиус, категории и бюджет. Программа будет просматривать все новые объявления этих категорий рядом с тобой.</b></p>
     <p>Свой поиск тоже можно: настрой его на kleinanzeigen.de (регион, радиус, категория, цена), скопируй адрес страницы и вставь в поле URL — или укажи запрос и номер категории.</p>
     <p>Для eBay выбери источник «eBay»: укажи запрос, диапазон цен и формат (аукцион / купить сейчас). Хитрость: аукционы, которые заканчиваются в ближайшие часы, часто уходят дешевле рынка.</p>
     <p>«Для себя» — если покупаешь в личное пользование (например, детали для AI-сервера): тогда считается экономия относительно рынка, а не прибыль от перепродажи.</p>
@@ -48,7 +48,7 @@
         </div>
       </div>
       {% if editable %}
-      <form method="post" action="/searches/toggle">
+      <form method="post" action="/classic/searches/toggle">
         <input type="hidden" name="name" value="{{ s.name }}">
         <button class="switch" type="submit" role="switch" aria-checked="{{ 'true' if s.enabled else 'false' }}" title="{{ 'Выключить' if s.enabled else 'Включить' }} поиск" aria-label="Включён"></button>
       </form>
@@ -81,8 +81,8 @@
       <a class="link small" href="{{ c.href }}">{{ c.deals }} {{ plural(c.deals, 'объявление', 'объявления', 'объявлений') }}{% if c.buy %} · {{ c.buy }} «покупать»{% endif %}</a>
       {% if editable %}
       <div class="actions">
-        <a class="btn btn-ghost btn-sm" href="/searches?edit={{ s.name | urlencode }}#form">{{ icon('pencil') }}Изменить</a>
-        <form method="post" action="/searches/delete" data-confirm="Удалить поиск «{{ s.name }}»? Найденные объявления останутся в базе.">
+        <a class="btn btn-ghost btn-sm" href="/classic/searches?edit={{ s.name | urlencode }}#form">{{ icon('pencil') }}Изменить</a>
+        <form method="post" action="/classic/searches/delete" data-confirm="Удалить поиск «{{ s.name }}»? Найденные объявления останутся в базе.">
           <input type="hidden" name="name" value="{{ s.name }}">
           <button class="btn btn-ghost btn-sm btn-danger" type="submit">{{ icon('trash') }}Удалить</button>
         </form>
@@ -106,7 +106,7 @@
     <span class="title">{{ icon('pencil' if editing else 'plus') }}{% if editing %}Изменить поиск «{{ editing }}»{% else %}Новый поиск{% endif %}</span>
     {{ icon('chevron-down') }}
   </summary>
-  <form class="form-body" method="post" action="/searches/save" novalidate>
+  <form class="form-body" method="post" action="/classic/searches/save" novalidate>
     {% if editing %}<input type="hidden" name="original_name" value="{{ editing }}">{% endif %}
     {% if errors %}
     <div class="notice error">{{ icon('alert') }}<div><b>Проверь поля:</b><ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul></div></div>
@@ -262,7 +262,7 @@
 
     <div class="form-actions">
       <button class="btn btn-primary" type="submit">{{ icon('check') }}{{ 'Сохранить изменения' if editing else 'Добавить поиск' }}</button>
-      <a class="btn btn-ghost" href="/searches">Отмена</a>
+      <a class="btn btn-ghost" href="/classic/searches">Отмена</a>
     </div>
   </form>
 </details>

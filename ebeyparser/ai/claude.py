@@ -26,9 +26,10 @@ class ClaudeVision:
             try:
                 import anthropic
             except ImportError as exc:  # optional dependency
-                raise LLMError(
-                    "Для Claude установи пакет: pip install anthropic (или pip install -e .[claude])"
-                ) from exc
+                error = LLMError("Для Claude установи пакет: pip install anthropic (или pip install -e .[claude])")
+                error.message_ru = ("Для проверки через Claude не хватает модуля — переустанови программу "  # type: ignore[attr-defined]
+                                    "с поддержкой Claude")
+                raise error from exc
             kwargs: dict[str, Any] = {"timeout": cfg.timeout_seconds, "max_retries": 2}
             if cfg.api_key:
                 kwargs["api_key"] = cfg.api_key
@@ -91,10 +92,18 @@ class ClaudeVision:
             await close()
 
 
-def make_llm(cfg: Any) -> Any:
-    """Build the right client for cfg.provider."""
+def make_llm(cfg: Any, *, purpose: str = "vision", fallback: Any = None, transport: Any = None,
+             extra_body: dict[str, Any] | None = None) -> Any:
+    """Build the right client for cfg.provider. `purpose`: vision | triage | planner | second_opinion
+    (what thinking="auto" means, whose share of a cloud quota a call uses). `fallback`: LLMSettings
+    of a local model that stands in while a cloud endpoint is limited or down (ai/cloud.py)."""
     if cfg.provider == "anthropic":
         return ClaudeVision(cfg)
     from .client import VisionLLM
 
-    return VisionLLM(cfg)
+    llm = VisionLLM(cfg, transport=transport, extra_body=extra_body, purpose=purpose)
+    if fallback is not None and llm.cloud:
+        from .cloud import CloudRouter
+
+        return CloudRouter(llm, VisionLLM(fallback, transport=transport, extra_body=extra_body, purpose=purpose))
+    return llm

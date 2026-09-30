@@ -32,7 +32,7 @@ ebeyparser = "ebeyparser.cli:main"
 include = ["ebeyparser*"]
 
 [tool.setuptools.package-data]
-"ebeyparser.web" = ["templates/*.html", "static/*"]
+"ebeyparser.web" = ["templates/*.html", "static/*", "app/*", "app/**/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -178,6 +178,52 @@ def test_red_flags_negations_are_clean(text):
     assert detect_red_flags(text) == []
 
 
+CONTACT = "Просит связь через WhatsApp/Telegram"
+EMAIL = "Просит писать на e-mail"
+
+
+@pytest.mark.parametrize(
+    ("text", "flag"),
+    [
+        ("Schreib mir auf Telegram", CONTACT),
+        ("Meld dich per WhatsApp", CONTACT),
+        ("Bei Interesse: max.muster@gmail.com", EMAIL),
+        ("Kontakt: max (at) web.de", EMAIL),
+        ("Bitte schreib mir eine E-Mail", EMAIL),
+        # Kleinanzeigen's own "Sicher bezahlen" happens in the app: a link or an e-mail next to it is phishing
+        ("Sicher bezahlen: schick mir deine E-Mail, ich sende dir den Link", SCAM),
+        ("Ich schicke dir den Link für Sicher bezahlen per WhatsApp", SCAM),
+        ("Du bekommst von mir einen Zahlungslink", SCAM),
+        ("Verschicke über Kleinanzeigen 'Sicher bezahlen'. Bitte mir den Link schicken", SCAM),
+        ("Nur Sicher bezahlen. Schreib mir deine Handynummer", SCAM),
+        ("Da ich im Ausland bin, verschicke ich das Paket", SCAM),
+        ("Weil ich gerade im Ausland lebe, nur Versand", SCAM),
+        ("Ich befinde mich zurzeit im Ausland", SCAM),
+    ],
+)
+def test_contact_and_payment_scam_flags(text, flag):
+    assert flag in detect_red_flags(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Sicher bezahlen möglich",
+        "Versand mit Sicher bezahlen oder Abholung in Berlin",
+        "Sicher bezahlen möglich. Bei Fragen gern per Mail",
+        "Rechnung per Mail vorhanden",
+        "Kein WhatsApp, kein Telegram",
+        "Bitte keine Anfragen per Mail",
+        "Sicher bezahlen möglich. Link zum Datenblatt siehe Bilder",
+        "Sicher bezahlen möglich. Versand kostet 5 Euro",
+        "Im Ausland gekauft, EU-Version",
+        "Ich war letztes Jahr im Ausland und habe sie dort gekauft",
+    ],
+)
+def test_contact_and_payment_flags_leave_honest_ads_alone(text):
+    assert detect_red_flags(text) == []
+
+
 def test_red_flags_wanted_only_on_first_line_and_dedup():
     flags = detect_red_flags("Suche RTX 3080\ndefekt egal, auch defekte Karten")
     assert flags == [WANTED, DEFECT]

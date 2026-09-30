@@ -634,7 +634,12 @@ def _generic_cards(soup: BeautifulSoup, search_name: str = "") -> list[Listing]:
 
 
 class PageLayoutError(Exception):
-    """The page downloaded fine, but no ads could be recognised in it."""
+    """The page downloaded fine, but no ads could be recognised in it. str(exc) is the
+    technical text (log / CLI, with the debug hint); `message_ru` is what the web UI shows."""
+
+    message_ru = ("Kleinanzeigen показал страницу, которую я не смог разобрать — возможно, сайт изменился. "
+                  "Попробую снова на следующей проверке; если повторяется, обнови программу")
+    code = "layout"
 
 
 _EMPTY_RESULT_MARKERS = (
@@ -968,7 +973,7 @@ def parse_ad_detail(html: str, listing: Listing | None = None, url: str = "") ->
 
     if listing is None:
         if not ad_id or not title:
-            raise ValueError("page does not look like a Kleinanzeigen ad (no ad id / title)")
+            raise ValueError("Это не похоже на страницу объявления Kleinanzeigen — возможно, объявление уже удалено")
         listing = Listing(ad_id=ad_id, source="kleinanzeigen", url=page_url_ or f"{BASE_URL}/s-anzeige/{ad_id}", title=title)
 
     data = listing.model_dump()

@@ -26,6 +26,7 @@ general:
   max_requests_per_hour: 150    # жёсткий лимит страниц в час на один сайт
   block_cooldown_hours: [1, 2, 4, 12]  # после блокировки (403/429/капча) пауза растёт: 1 ч, 2 ч, 4 ч, 12 ч; переживает перезапуск
   baseline_first_run: true      # первая проверка НОВОГО поиска только изучает цены, без уведомлений о «старых» объявлениях
+  timezone: Europe/Berlin       # твой часовой пояс: время в уведомлениях, в веб-интерфейсе и в логе
 
 # ─── Что мониторить ──────────────────────────────────────────────────────────
 # Главный режим — сканировать КАТЕГОРИИ в радиусе от города: category_id + location + radius_km.
@@ -184,14 +185,29 @@ ai:
   enabled: true
   provider: ${AI_PROVIDER:-openai}                  # openai = LM Studio (и любой OpenAI-совместимый сервер) | ollama
   base_url: ${AI_BASE_URL:-http://localhost:1234/v1}
-  model: ${AI_MODEL:-qwen/qwen2.5-vl-7b}            # идентификатор модели в LM Studio (ai-check покажет список)
+  model: ${AI_MODEL:-qwen/qwen3.5-9b}               # модель для фото в LM Studio (ai-check покажет список);
+                                                    # видеокарта 6–8 ГБ: qwen/qwen3.5-4b; 24 ГБ: qwen/qwen3.6-35b-a3b
   max_images: 3                 # сколько фото показывать модели
   timeout_seconds: 240
   run_for: promising            # promising — только перспективные (быстрее), all — все подряд
   # ── Ollama вместо LM Studio ──
   # provider: ollama
   # base_url: http://localhost:11434
-  # model: qwen2.5vl:7b          # ollama pull qwen2.5vl:7b
+  # model: qwen3.5:9b-q4_K_M     # ollama pull qwen3.5:9b-q4_K_M
+  # ── Бесплатная нейросеть в облаке (docs/design/CLOUD_AI.md) — проще настроить в «Настройки → Нейросеть» ──
+  # Ключ — только в .env (OPENROUTER_API_KEY / NVIDIA_API_KEY / OMNIROUTE_API_KEY), не здесь.
+  # cloud: openrouter            # openrouter | nvidia | omniroute | custom; пусто = нейросеть на этом компьютере
+  # base_url: https://openrouter.ai/api/v1
+  # model: nvidia/nemotron-nano-12b-v2-vl:free       # фото; разведчику — scout.model ниже
+  # rpm: 0                       # запросов в минуту; 0 = само (OpenRouter 20, NVIDIA 40)
+  # daily_limit: 0               # запросов в день; 0 = само (OpenRouter 50, после покупки $10 — 1000)
+  # fallback:                    # «Облако + компьютер про запас»: когда лимит кончился — модель на этом ПК
+  #   enabled: true
+  #   provider: openai
+  #   base_url: http://localhost:1234/v1
+  #   model: qwen/qwen3.5-9b
+  cloud_send_ebay: false        # объявления с eBay в облако не отправлять (правила eBay API)
+  thinking: auto                # «размышления» модели: auto = выключены для фото и разведчика (быстрее)
 
   # Необязательно: «второе мнение» от Claude (облако, платно) — только для лучших находок.
   # Нужен ключ ANTHROPIC_API_KEY в .env и пакет:  pip install anthropic
@@ -202,6 +218,25 @@ ai:
     api_key: ${ANTHROPIC_API_KEY}
     min_score: 70               # проверять только то, что локальная модель уже оценила высоко
     max_per_run: 5              # не больше N платных запросов за одну проверку
+
+  # ИИ-разведчик (docs/design/AI_SCOUT.md): маленькая текстовая модель читает КАЖДОЕ новое объявление
+  # (название, цена, начало текста) и находит скрытое: опечатки, старый ПК с дорогой видеокартой,
+  # «Konvolut», продавцов, которые не знают, что продают. Цены она не придумывает — они из истории цен.
+  # Может работать на слабом сервере без видеокарты (llama.cpp / Ollama), пока модель для фото — на ПК.
+  vision_wait_minutes: 45       # ПК с моделью для фото выключен: ждать до N мин, потом прислать «фото не проверены»
+  scout:
+    enabled: false
+    # Сервер, который работает всегда (docs/design/AI_MODELS.md): слабый без видеокарты — Qwen3.5 2B
+    # (≈6 с на объявление, ~600 в час), 8 ядер / 16 ГБ — Qwen3.5 4B (точнее, ≈6 с). Модели меньше 2B не годятся.
+    provider: openai            # openai = LM Studio / llama-server | ollama
+    base_url: ""                # пусто = тот же сервер, что выше; например http://127.0.0.1:8080/v1 (llama-server)
+    model: ""                   # пусто = та же модель; LM Studio: qwen/qwen3.5-2b · Ollama: qwen3.5:2b-q4_K_M
+    mode: auto                  # auto — все объявления, пока успевает, иначе только непонятные; all; candidates
+    batch_size: 0               # объявлений за запрос; 0 = по размеру модели (5 для 2B, 10 для 4B и больше)
+    max_per_hour: 600           # не больше N объявлений в час (чтобы слабый процессор не задыхался)
+    pass_share: 0.5             # не больше этой доли интервала проверок на чтение
+    min_interest: 0             # «интерес» 0–10 у маленьких моделей почти случаен: решают цены; 0 = не отсеивать
+    # облако: model: nvidia/nemotron-3-super-120b-a12b:free — читает по 16–20 объявлений за запрос
 
 # ─── eBay (официальный API) ──────────────────────────────────────────────────
 # developer.ebay.com/my/keys → Production keyset: App ID → EBAY_CLIENT_ID, Cert ID → EBAY_CLIENT_SECRET (в .env).
@@ -222,6 +257,15 @@ notifications:
   health_alerts: true           # сообщить, если нейросеть недоступна, сайт заблокировал или страницы не читаются
   heartbeat_hour: 9             # каждый день в 9:00 — «жив, проверено N объявлений» (пусто = не присылать)
   unchecked_deals: true         # нейросеть недоступна: всё равно прислать выгодное с пометкой «ФОТО НЕ ПРОВЕРЕНЫ ИИ»
+  super_deals:                  # «🔥 Супер-находка»: сразу, мимо лимита в час и сводки
+    enabled: true
+    min_profit: 120             # прибыль от 120 €
+    min_roi: 0.8                # и доходность от 80 %
+    min_score: 85
+  daily_top:                    # «Топ за день»: лучшие сделки за сутки по каждому поиску, одним сообщением
+    enabled: false
+    hour: 20
+    per_search: 3
   email:
     enabled: false
     smtp_host: smtp.gmail.com
@@ -238,7 +282,7 @@ notifications:
 
 # ─── Веб-интерфейс ───────────────────────────────────────────────────────────
 web:
-  host: 127.0.0.1               # только этот компьютер. 0.0.0.0 — вся сеть: вход по ссылке с ключом,
+  host: 127.0.0.1               # 127.0.0.1 — только этот компьютер; 0.0.0.0 — вся сеть: вход по ссылке с ключом,
                                 # но НЕ делай так в общем Wi-Fi (общежитие, кафе). Для телефона лучше Tailscale.
   port: 8000
   run_monitor: true             # мониторинг работает в фоне вместе с сайтом

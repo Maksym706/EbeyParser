@@ -15,8 +15,17 @@ log = logging.getLogger(__name__)
 
 
 class NotifyError(Exception):
-    """A notification could not be delivered. The message is in Russian and
-    meant to be shown to the user as is."""
+    """A notification could not be delivered. str(exc) is the technical Russian text (log,
+    CLI); `message_ru` (when given) is the plain one for the web UI — without it the UI
+    derives one from the cause (ebeyparser.errors_ru.humanize)."""
+
+    def __init__(self, message: str, *, message_ru: str = "", code: str = "delivery_failed",
+                 service: str = "") -> None:
+        super().__init__(message)
+        if message_ru:
+            self.message_ru = message_ru
+        self.code = code
+        self.service = service
 
 
 @runtime_checkable

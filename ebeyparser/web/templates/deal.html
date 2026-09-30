@@ -3,7 +3,7 @@
 {% set l = deal.listing %}
 {% block title %}{{ l.title }}{% endblock %}
 {% block content %}
-<a class="back" href="/">{{ icon('arrow-left') }}Все сделки</a>
+<a class="back" href="/classic">{{ icon('arrow-left') }}Все сделки</a>
 
 <div class="detail" data-deal-detail="{{ card.id }}" data-status="{{ card.status }}">
   <div class="col">
@@ -50,7 +50,7 @@
         {% if card.buying_options %}<div><dt>Формат</dt><dd>{% for b in card.buying_options %}{{ BUYING_OPTION_LABELS.get(b, b) }}{% if not loop.last %}, {% endif %}{% endfor %}</dd></div>{% endif %}
         {% if l.posted_at_text %}<div><dt>Размещено</dt><dd>{{ l.posted_at_text }}</dd></div>{% endif %}
         <div><dt>Найдено</dt><dd>{{ l.first_seen | dt }}</dd></div>
-        {% if l.search_name %}<div><dt>Поиск</dt><dd><a class="link" href="/?search={{ l.search_name | urlencode }}&verdict=all">{{ l.search_name }}</a></dd></div>{% endif %}
+        {% if l.search_name %}<div><dt>Поиск</dt><dd><a class="link" href="/classic?search={{ l.search_name | urlencode }}&verdict=all">{{ l.search_name }}</a></dd></div>{% endif %}
         <div><dt>ID объявления</dt><dd class="num">{{ l.ad_id }}</dd></div>
         {% for key, value in l.attributes.items() %}<div><dt>{{ key }}</dt><dd>{{ value }}</dd></div>{% endfor %}
       </dl>

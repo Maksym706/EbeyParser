@@ -1,21 +1,35 @@
-# systemd-сервис для Linux (сервер, старый ноутбук, мини-ПК).
-# Установка:
-#   sudo cp deploy/ebeyparser.service /etc/systemd/system/
-#   sudo sed -i "s#/home/USER#$HOME#g; s#User=USER#User=$USER#" /etc/systemd/system/ebeyparser.service
+# systemd service for EbeyParser on a Linux home server (mini-PC, old laptop, Raspberry Pi).
+# Installed by deploy/install-linux.sh, which fills in @USER@, @GROUP@ and @DIR@. By hand:
+#   sed "s#@USER@#$USER#g; s#@GROUP@#$(id -gn)#g; s#@DIR@#$PWD#g" deploy/ebeyparser.service \
+#     | sudo tee /etc/systemd/system/ebeyparser.service
 #   sudo systemctl daemon-reload && sudo systemctl enable --now ebeyparser
-#   journalctl -u ebeyparser -f      # смотреть лог
+#   journalctl -u ebeyparser -f      # the log; the link for the phone: python -m ebeyparser access
 [Unit]
 Description=EbeyParser — мониторинг Kleinanzeigen и eBay
-After=network-online.target ollama.service
 Wants=network-online.target
+After=network-online.target ollama.service tailscaled.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=USER
-WorkingDirectory=/home/USER/EbeyParser
-ExecStart=/home/USER/EbeyParser/.venv/bin/python -m ebeyparser run
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@DIR@
+# --server: no browser; the first start opens the panel to the home network (with a key) and
+# prints «Открой http://<IP>:8000/?token=… на телефоне или ПК» + a QR code into the log.
+ExecStart=@DIR@/.venv/bin/python -m ebeyparser run --server
+Environment=PYTHONUNBUFFERED=1 PYTHONUTF8=1 MALLOC_ARENA_MAX=2
+# a local Ollama (install-linux.sh --with-ai): the AI scout switches itself on there
+Environment=EBEYPARSER_OLLAMA_URL=http://127.0.0.1:11434
 Restart=always
 RestartSec=30
+TimeoutStopSec=30
+# it needs ~100 MB; the rest of a small box belongs to the local AI
+MemoryHigh=600M
+MemoryMax=1G
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
 
 [Install]
 WantedBy=multi-user.target

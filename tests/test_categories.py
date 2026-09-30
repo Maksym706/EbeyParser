@@ -268,7 +268,7 @@ def test_build_setup_searches() -> None:
     # budget below the category's junk threshold: no contradicting min_price
     cheap = build_setup_searches(cats[:1], location="10115", radius_km=0, max_price=40, purpose="personal")[0]
     assert cheap.min_price is None and cheap.radius_km is None and cheap.purpose == "personal"
-    assert cheap.name == "Handy & Telefon · 10115" and cheap.min_profit is None
+    assert cheap.name == "Handy & Telefon · Mitte" and cheap.min_profit is None  # the district, not "10115"
 
 
 def test_answers_roundtrip_and_merge() -> None:

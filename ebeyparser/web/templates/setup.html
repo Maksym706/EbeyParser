@@ -17,8 +17,8 @@
   </div>
 </section>
 <nav class="subnav" aria-label="Настройка">
-  <a href="/setup" class="active" aria-current="page">{{ icon('search') }}Что искать</a>
-  <a href="/settings">{{ icon('sliders') }}Нейросеть, уведомления, выгода</a>
+  <a href="/classic/setup" class="active" aria-current="page">{{ icon('search') }}Что искать</a>
+  <a href="/classic/settings">{{ icon('sliders') }}Нейросеть, уведомления, выгода</a>
 </nav>
 
 {% if not editable or errors %}
@@ -32,7 +32,7 @@
 </div>
 {% endif %}
 
-<form class="setup-form" method="post" action="/setup" data-setup novalidate>
+<form class="setup-form" method="post" action="/classic/setup" data-setup novalidate>
   {# ----------------------------------------------------------- 1. region #}
   <section class="card step">
     <div class="step-head">
@@ -88,7 +88,7 @@
     </div>
     {% endfor %}
     <div class="inline-actions">
-      <button class="btn btn-sm" type="submit" formaction="/setup" formmethod="get" formnovalidate name="refresh" value="1" data-busy-on-click>{{ icon('refresh') }}Сверить с сайтом для этого места</button>
+      <button class="btn btn-sm" type="submit" formaction="/classic/setup" formmethod="get" formnovalidate name="refresh" value="1" data-busy-on-click>{{ icon('refresh') }}Сверить с сайтом для этого места</button>
       <button class="btn btn-ghost btn-sm" type="button" data-cat-select="recommended" data-js-only hidden>{{ icon('star') }}Только рекомендуемые</button>
       <button class="btn btn-ghost btn-sm" type="button" data-cat-select="none" data-js-only hidden>{{ icon('x') }}Снять все</button>
     </div>

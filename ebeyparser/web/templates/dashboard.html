@@ -23,7 +23,7 @@
     <h2>Настрой поиски за 2 минуты</h2>
     <p>Выбери город, радиус, категории и бюджет — программа сама будет сканировать Kleinanzeigen целиком по категориям и покажет, что можно выгодно купить.</p>
   </div>
-  <a class="btn btn-primary btn-lg" href="/setup">{{ icon('settings') }}Начать настройку</a>
+  <a class="btn btn-primary btn-lg" href="/classic/setup">{{ icon('settings') }}Начать настройку</a>
 </section>
 {% endif %}
 {% if keyword_only %}
@@ -33,14 +33,14 @@
     <h2>Сейчас только поиски по словам</h2>
     <p>Программа умеет просматривать целые категории в твоём районе — телефоны, ноутбуки, консоли, комплектующие — и сама находит то, что дешевле рынка. Так выгодных находок намного больше.</p>
   </div>
-  <a class="btn btn-primary" href="/setup">{{ icon('settings') }}Сканировать категории</a>
+  <a class="btn btn-primary" href="/classic/setup">{{ icon('settings') }}Сканировать категории</a>
   <button class="icon-btn" type="button" data-dismiss-hint title="Больше не показывать" aria-label="Скрыть подсказку">{{ icon('x') }}</button>
 </section>
 {% endif %}
 {% if last_run %}
 <p class="last-run muted">
   Последняя проверка {{ last_run.started_at | ago }} · новых {{ last_run.new_listings }} · выгодных {{ last_run.deals_found }}
-  {%- if last_run.errors %} · <a class="link" href="/status">{{ last_run.errors | length }} {{ plural(last_run.errors | length, 'ошибка', 'ошибки', 'ошибок') }}</a>{% endif %}
+  {%- if last_run.errors %} · <a class="link" href="/classic/status">{{ last_run.errors | length }} {{ plural(last_run.errors | length, 'ошибка', 'ошибки', 'ошибок') }}</a>{% endif %}
 </p>
 {% endif %}
 
@@ -80,7 +80,7 @@
     {% endfor %}
   </nav>
 
-  <form class="filters" method="get" action="/" data-filters>
+  <form class="filters" method="get" action="/classic" data-filters>
     {% if filters.verdict != 'good' %}<input type="hidden" name="verdict" value="{{ filters.verdict }}">{% endif %}
     <input type="checkbox" id="filters-toggle" class="filters-toggle-input" {% if filters.panel_active %}checked{% endif %}>
     <div class="toolbar-row">
@@ -135,7 +135,7 @@
       </label>
       <div class="filter-actions">
         <button class="btn btn-primary" type="submit">Применить</button>
-        <a class="btn btn-ghost" href="/">Сбросить</a>
+        <a class="btn btn-ghost" href="/classic">Сбросить</a>
       </div>
     </div>
   </form>
@@ -174,12 +174,12 @@
   {% endif %}
   <div class="head-actions">
     {% if has_searches %}
-    <a class="btn btn-primary" href="/searches?new=1#form">{{ icon('plus') }}Добавить поиск</a>
+    <a class="btn btn-primary" href="/classic/searches?new=1#form">{{ icon('plus') }}Добавить поиск</a>
     {% else %}
-    <a class="btn btn-primary" href="/setup">{{ icon('settings') }}Настроить за 2 минуты</a>
-    <a class="btn" href="/searches?new=1#form">{{ icon('plus') }}Добавить поиск</a>
+    <a class="btn btn-primary" href="/classic/setup">{{ icon('settings') }}Настроить за 2 минуты</a>
+    <a class="btn" href="/classic/searches?new=1#form">{{ icon('plus') }}Добавить поиск</a>
     {% endif %}
-    <a class="btn" href="/status">{{ icon('activity') }}Статус системы</a>
+    <a class="btn" href="/classic/status">{{ icon('activity') }}Статус системы</a>
   </div>
   <p class="small">Хочешь просто посмотреть интерфейс? Запусти <code>python -m ebeyparser demo</code> — появятся демо-сделки.</p>
 </section>
@@ -189,7 +189,7 @@
   <h2>Ничего не найдено</h2>
   <p>По этим фильтрам нет объявлений. Попробуй вкладку «Все» или сбрось фильтры.</p>
   <div class="head-actions">
-    <a class="btn btn-primary" href="/">Сбросить фильтры</a>
+    <a class="btn btn-primary" href="/classic">Сбросить фильтры</a>
     <a class="btn" href="{{ filters.url(verdict='all') }}">Показать все</a>
   </div>
 </section>

@@ -71,22 +71,30 @@ def _group(n: int) -> str:
     return f"{n:,}".replace(",", ".")  # German thousands separator
 
 
-def format_money(value: float | None) -> str:
+def format_money(value: float | None, *, russian: bool = False) -> str:
     """German-style euro amount: 1234.5 -> "1.235 €", 7.5 -> "7,50 €", None -> "—".
+    russian=True: the web app's format (lib/format.js money()): "1 235 €" with non-breaking
+    spaces and "−" for negatives (format_money_ru).
 
     Whole numbers and amounts >= 100 € are shown without cents."""
     d = _to_decimal(value)
     if d is None:
         return "—"
+    sep, space, minus = (" ", " ", "−") if russian else (".", " ", "-")
     cents = d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     if abs(cents) >= 100 or cents == cents.to_integral_value():
         q = d.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-        body = _group(abs(int(q)))
+        body = _group(abs(int(q))).replace(".", sep)
     else:
         q = cents
         whole, frac = f"{abs(q):.2f}".split(".")
-        body = f"{_group(int(whole))},{frac}"
-    return f"{'-' if q < 0 else ''}{body} €"
+        body = f"{_group(int(whole)).replace('.', sep)},{frac}"
+    return f"{minus if q < 0 else ''}{body}{space}€"
+
+
+def format_money_ru(value: float | None) -> str:
+    """Russian money for API texts the web app shows as is: 1065 -> "1 065 €" (non-breaking spaces)."""
+    return format_money(value, russian=True)
 
 
 def format_percent(value: float | None) -> str:
@@ -155,9 +163,12 @@ def format_time_left(ends_at: datetime, now: datetime | None = None) -> str:
 
 
 def _format_end_clock(ends_at: datetime, now: datetime) -> str:
-    """Auction end in the machine's local time: "сегодня в 21:30" / "завтра в 09:05" / "28.09 в 21:30"."""
-    end = _utc(ends_at).astimezone()
-    today = _utc(now).astimezone().date()
+    """Auction end in the user's time zone (general.timezone, not the host's):
+    "сегодня в 21:30" / "завтра в 09:05" / "28.09 в 21:30"."""
+    from ..timefmt import to_local
+
+    end = to_local(_utc(ends_at))
+    today = to_local(_utc(now)).date()
     if end.date() == today:
         day = "сегодня"
     elif end.date() == today + timedelta(days=1):
@@ -305,6 +316,7 @@ class _DealInfo:
     offer_money: str = ""  # "400 €"
     offer_profit: float | None = None  # profit / savings at the suggested offer
     unchecked: bool = False  # AI was down: photos NOT checked
+    extras: list[str] = field(default_factory=list)  # lines other features add (notify.extras), e.g. a build project
 
     @property
     def market_str(self) -> str:
@@ -511,6 +523,9 @@ def _collect(deal: DealView, web_base_url: str | None = None) -> _DealInfo:
             fb += f" ({_group(n)} " + plural_ru(n, "оценка", "оценки", "оценок") + ")"
         seller = f"{seller}, {fb}" if seller else f"продавец: {fb}"
     info.seller = seller
+    from .extras import lines_for
+
+    info.extras = lines_for(lst, ev)
     info.condition = _squash(lst.condition) or _squash(lst.attributes.get("Zustand", ""))
 
     if ai is not None:
@@ -553,6 +568,18 @@ def deal_headline(deal: DealView) -> str:
         line += f" → {info.profit_label.lower()} ≈ {format_money(info.profit)}"
     line = f"{line} · {info.source}"
     return f"{UNCHECKED_WARNING} · {line}" if info.unchecked else line
+
+
+SUPER_PREFIX = "🔥 Супер-находка"
+
+
+def super_title(deal: DealView) -> str:
+    """Headline of a «Супер-находка» alert: "🔥 Супер-находка: RTX 3080 за 150 € → прибыль ≈ 180 €"."""
+    info = _collect(deal)
+    head = f"{SUPER_PREFIX}: {_clip(info.title, 60)} за {info.price_short}"
+    if info.profit is not None:
+        head += f" → {info.profit_label.lower()} ≈ {format_money(info.profit)}"
+    return head
 
 
 def email_subject(deals: list[DealView]) -> str:
@@ -607,6 +634,7 @@ def _text_block(index: int, info: _DealInfo) -> list[str]:
         lines.append(f"{pad}{info.profit_label}: {_profit_line(info)}{extra}")
     if info.max_buy:
         lines.append(f"{pad}🎯 {info.max_buy}")
+    lines += [f"{pad}{x}" for x in info.extras]
     where = " · ".join(x for x in (info.location, info.posted, info.shipping) if x)
     if where:
         lines.append(f"{pad}Где: {where}")
@@ -816,6 +844,9 @@ def _email_card(info: _DealInfo) -> str:
         )
     if badges:
         out.append(f'<tr><td style="{pad}padding-top:10px;">{"".join(badges)}</td></tr>')
+    for extra in info.extras:
+        out.append(f'<tr><td style="{pad}padding-top:4px;font-family:{_FONT};font-size:14px;color:#1f2937;">'
+                   f"{_e(extra)}</td></tr>")
     # Details table
     price_val = _eh(info.price_full) + (f" + {_eh(info.shipping_cost)}" if info.shipping_cost else "")
     rows = [_row(info.price_label, price_val)]
@@ -1024,6 +1055,7 @@ def _tg_build(info: _DealInfo, level: tuple, with_url: bool) -> str:
         lines.append(line)
     if info.max_buy:
         lines.append(f"🎯 {_tg(info.max_buy)}")
+    lines += [_tg_clip(x, 200) for x in info.extras]
     if details and info.location:
         lines.append(f"📍 {_tg_clip(info.location, 80)}")
     if details and info.ai:

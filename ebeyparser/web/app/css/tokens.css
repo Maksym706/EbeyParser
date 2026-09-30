@@ -1,0 +1,290 @@
+/* EbeyParser design tokens — docs/design/DESIGN_BRIEF.md §6.
+   Light and dark are equal; the theme is set on <html data-theme="light|dark"> before first paint
+   (saved choice, else prefers-color-scheme). Use tokens, never raw hex, in components.
+
+   Semantic hues (colour = money, always the same way):
+     green  → profit, buy, success, brand        amber  → haggle, offer, warning
+     violet → auction, bid                        red    → danger, scam, loss, destructive
+     blue   → info, AI, links, focus               neutral (--surface-3 / --text-2) → maybe / skip
+   Each hue: --{hue}-bg (tint) · -border · -solid · -text (on bg/surface) · -on-solid. */
+
+/* ---- Inter (OFL, vendored in /app/fonts; only the subsets a page needs are downloaded) */
+@font-face {
+  font-family: "Inter Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("../fonts/inter-latin.woff2") format("woff2-variations"), url("../fonts/inter-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329,
+    U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Inter Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("../fonts/inter-latin-ext.woff2") format("woff2-variations"), url("../fonts/inter-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+1D00-1DBF, U+1E00-1E9F,
+    U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "Inter Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("../fonts/inter-cyrillic.woff2") format("woff2-variations"), url("../fonts/inter-cyrillic.woff2") format("woff2");
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+
+:root {
+  /* ---- typography (§6.2) */
+  --font-sans: "Inter Variable", Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif,
+    "Apple Color Emoji", "Segoe UI Emoji";
+  --font-mono: ui-monospace, "JetBrains Mono", SFMono-Regular, "Cascadia Code", Consolas, monospace;
+
+  /* size / line-height pairs */
+  --fs-display: 32px;
+  --lh-display: 38px;
+  --fs-h1: 24px;
+  --lh-h1: 30px;
+  --fs-h2: 20px;
+  --lh-h2: 26px;
+  --fs-h3: 16px;
+  --lh-h3: 22px;
+  --fs-body-lg: 16px;
+  --lh-body-lg: 24px;
+  --fs-body: 15px;
+  --lh-body: 22px;
+  --fs-body-sm: 13px;
+  --lh-body-sm: 18px;
+  --fs-caption: 12px;
+  --lh-caption: 16px;
+  --fs-overline: 11px;
+  --lh-overline: 14px;
+  --fs-price-xl: 28px;
+  --fs-price-lg: 20px;
+
+  /* ---- spacing (§6.3, 4-based) */
+  --s-0: 0;
+  --s-1: 2px;
+  --s-2: 4px;
+  --s-3: 8px;
+  --s-4: 12px;
+  --s-5: 16px;
+  --s-6: 20px;
+  --s-7: 24px;
+  --s-8: 32px;
+  --s-9: 40px;
+  --s-10: 48px;
+  --s-11: 64px;
+
+  /* ---- radii (§6.4) */
+  --r-xs: 6px;
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-xl: 20px;
+  --r-full: 9999px;
+
+  /* ---- motion (§6.6) */
+  --d-fast: 120ms;
+  --d-base: 180ms;
+  --d-enter: 240ms;
+  --d-exit: 180ms;
+  --ease-standard: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-enter: cubic-bezier(0.05, 0.7, 0.1, 1);
+  --ease-exit: cubic-bezier(0.3, 0, 0.8, 0.15);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* ---- sizes */
+  --control-sm: 32px;
+  --control-md: 40px;
+  --control-lg: 48px;
+  --touch: 44px;
+  --sidebar-w: 240px;
+  --rail-w: 64px;
+  --topbar-h: 56px;
+  --appbar-h: 48px;
+  --tabbar-h: 64px;
+  --content-max: 1440px;
+  --form-max: 720px;
+  --gutter: 32px;
+
+  /* ---- z-index (§6.5) */
+  --z-sticky: 10;
+  --z-sidebar: 20;
+  --z-topbar: 30;
+  --z-drawer: 40;
+  --z-sheet: 45;
+  --z-modal: 50;
+  --z-toast: 60;
+  --z-tooltip: 70;
+
+  /* ================= LIGHT ================= */
+  color-scheme: light;
+  --bg: #f6f7f9;
+  --surface-1: #ffffff;
+  --surface-2: #f1f3f6;
+  --surface-3: #e8ebef;
+  --overlay: rgba(14, 17, 22, 0.4);
+  --border: #e3e6ea;
+  --border-strong: #cdd2d9;
+  --text: #0e1116;
+  --text-2: #4a5361;
+  --text-3: #5f6773;
+  --text-disabled: #a3aab4;
+  --ink: #0e1116;
+  --on-ink: #ffffff;
+  --hover: rgba(14, 17, 22, 0.04);
+  --press: rgba(14, 17, 22, 0.07);
+  --glass: rgba(255, 255, 255, 0.82);
+
+  --green-bg: #e9f9ef;
+  --green-border: #b7ebc8;
+  --green-solid: #22c55e;
+  --green-solid-hover: #1fb455;
+  --green-text: #15803d;
+  --green-on-solid: #052e16;
+
+  --amber-bg: #fff6e0;
+  --amber-border: #f7d58a;
+  --amber-solid: #f5a524;
+  --amber-text: #a2560a;
+  --amber-on-solid: #3b2300;
+
+  --violet-bg: #f1eefe;
+  --violet-border: #d5ccfb;
+  --violet-solid: #7c5cfa;
+  --violet-text: #5b3fd9;
+  --violet-on-solid: #ffffff;
+
+  --red-bg: #fdecec;
+  --red-border: #f5c2c2;
+  --red-solid: #e5484d;
+  --red-solid-hover: #d63b40;
+  --red-text: #c62a2f;
+  --red-on-solid: #ffffff;
+
+  --blue-bg: #eaf3ff;
+  --blue-border: #bcd8ff;
+  --blue-solid: #3b82f6;
+  --blue-text: #1d5fd1;
+  --blue-on-solid: #ffffff;
+
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow-md: 0 1px 2px rgba(16, 24, 40, 0.06), 0 8px 24px -8px rgba(16, 24, 40, 0.14);
+  --shadow-lg: 0 2px 6px rgba(16, 24, 40, 0.06), 0 24px 48px -12px rgba(16, 24, 40, 0.22);
+  --shadow-toast: 0 12px 32px -8px rgba(16, 24, 40, 0.28);
+  --shadow-glow: 0 6px 18px -6px rgba(34, 197, 94, 0.45);
+
+  --ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--blue-solid);
+  --ring-inset: 0 0 0 3px rgba(59, 130, 246, 0.25);
+  --backdrop: radial-gradient(1100px 520px at 0% -8%, rgba(34, 197, 94, 0.07), transparent 60%),
+    radial-gradient(900px 480px at 100% 0%, rgba(59, 130, 246, 0.05), transparent 60%);
+}
+
+/* ================= DARK ================= */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0b0d10;
+  --surface-1: #12151a;
+  --surface-2: #181c22;
+  --surface-3: #20252d;
+  --overlay: rgba(0, 0, 0, 0.6);
+  --border: #262c34;
+  --border-strong: #343b45;
+  --text: #eceff3;
+  --text-2: #a9b1bc;
+  --text-3: #7a8491;
+  --text-disabled: #4b535e;
+  --ink: #f2f4f7;
+  --on-ink: #0b0d10;
+  --hover: rgba(255, 255, 255, 0.04);
+  --press: rgba(255, 255, 255, 0.07);
+  --glass: rgba(18, 21, 26, 0.8);
+
+  --green-bg: #0f2419;
+  --green-border: #1c4a2e;
+  --green-solid: #2bd46a;
+  --green-solid-hover: #3ee07b;
+  --green-text: #4ade80;
+  --green-on-solid: #052e16;
+
+  --amber-bg: #291e08;
+  --amber-border: #5c4210;
+  --amber-solid: #f5a524;
+  --amber-text: #fbbf24;
+  --amber-on-solid: #3b2300;
+
+  --violet-bg: #1d1836;
+  --violet-border: #3d3372;
+  --violet-solid: #8b7cf6;
+  --violet-text: #b4a8ff;
+  --violet-on-solid: #ffffff;
+
+  --red-bg: #2b1214;
+  --red-border: #5a2226;
+  --red-solid: #e5484d;
+  --red-solid-hover: #ee5a5f;
+  --red-text: #ff8b8b;
+  --red-on-solid: #ffffff;
+
+  --blue-bg: #0f1d33;
+  --blue-border: #1e3a66;
+  --blue-solid: #4c8df6;
+  --blue-text: #7db2ff;
+  --blue-on-solid: #ffffff;
+
+  --shadow-sm: none;
+  --shadow-md: 0 8px 24px -8px rgba(0, 0, 0, 0.6);
+  --shadow-lg: 0 24px 48px -12px rgba(0, 0, 0, 0.7);
+  --shadow-toast: 0 12px 32px -8px rgba(0, 0, 0, 0.8);
+  --shadow-glow: 0 6px 20px -6px rgba(43, 212, 106, 0.35);
+
+  --ring-inset: 0 0 0 3px rgba(76, 141, 246, 0.3);
+  --backdrop: radial-gradient(1100px 520px at 0% -8%, rgba(43, 212, 106, 0.06), transparent 60%),
+    radial-gradient(900px 480px at 100% 0%, rgba(76, 141, 246, 0.05), transparent 60%);
+}
+
+/* phones & touch: bigger controls, 16 px inputs (no iOS zoom) — §6.3, §6.8.2 */
+@media (pointer: coarse), (max-width: 599px) {
+  :root {
+    --control-md: 44px;
+    --control-lg: 48px;
+    --gutter: 16px;
+  }
+}
+
+@media (min-width: 600px) and (max-width: 1023px) {
+  :root {
+    --gutter: 24px;
+  }
+}
+
+@media (max-width: 599px) {
+  :root {
+    --fs-display: 28px;
+    --lh-display: 34px;
+  }
+}
+
+/* ---- helpers shared by components (not part of the brief's table) */
+:root {
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+  --leading-tight: 1.2;
+  --leading-snug: 1.35;
+  --leading: 1.5;
+  --fs-ui: 14px; /* buttons, nav, compact UI text */
+  --sidebar-bg: #fbfbfc;
+  --green-glow: rgba(34, 197, 94, 0.4);
+  --shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+}
+
+:root[data-theme="dark"] {
+  --sidebar-bg: #0e1014;
+  --green-glow: rgba(43, 212, 106, 0.3);
+  --shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}

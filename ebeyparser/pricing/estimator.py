@@ -16,6 +16,7 @@ from .text import (
     FLAG_BOX_ONLY,
     FLAG_DEFECT,
     FLAG_DELETED,
+    FLAG_EMAIL,
     FLAG_FAKE,
     FLAG_LOCKED,
     FLAG_MISSING,
@@ -1175,7 +1176,8 @@ def evaluate(
     if market is not None and buy_cost is not None and not listing.is_free and not auction:
         ratio = buy_cost / market
         text = _listing_text(listing)
-        whatsapp_bait = ratio < BAIT_WHATSAPP_RATIO and FLAG_WHATSAPP in flags
+        # far below market and the talk moves to WhatsApp / Telegram / e-mail: the classic bait
+        whatsapp_bait = ratio < BAIT_WHATSAPP_RATIO and (FLAG_WHATSAPP in flags or FLAG_EMAIL in flags)
         prepay_bait = ratio < BAIT_PREPAY_RATIO and is_prepay_shipping(text) and says_new(text)
         if (whatsapp_bait or prepay_bait) and FLAG_TOO_GOOD not in flags:
             flags.append(FLAG_BAIT)

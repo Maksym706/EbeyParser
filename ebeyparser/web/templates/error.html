@@ -6,8 +6,8 @@
   <h2>{{ title }}</h2>
   <p>{{ message or ('Такой страницы нет. Возможно, ссылка устарела.' if code == 404 else 'Это действие сейчас недоступно.') }}</p>
   <div class="head-actions">
-    <a class="btn btn-primary" href="/">{{ icon('tag') }}К сделкам</a>
-    <a class="btn" href="/status">{{ icon('activity') }}Статус</a>
+    <a class="btn btn-primary" href="/classic">{{ icon('tag') }}К сделкам</a>
+    <a class="btn" href="/classic/status">{{ icon('activity') }}Статус</a>
   </div>
 </section>
 {% endblock %}
