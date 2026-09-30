@@ -175,7 +175,9 @@ ollama pull qwen3.5:9b-q4_K_M
 | Команда | Что делает |
 |---|---|
 | `python -m ebeyparser setup` | мастер настройки: город, радиус, категории, бюджет, «для себя», интервал, нейросеть, Telegram |
-| `python -m ebeyparser run` | веб-панель + мониторинг 24/7 (основной режим) |
+| `python -m ebeyparser run` | веб-панель + мониторинг 24/7 (основной режим); `--server` — для сервера без экрана |
+| `python -m ebeyparser access [local\|lan\|tailscale]` | ссылки на панель для телефона + QR-код; с параметром — кому открыта панель |
+| `python -m ebeyparser server-models [--pull]` | какие нейросети потянет этот сервер; `--pull` — скачать их в Ollama |
 | `python -m ebeyparser categories [--location Berlin] [--radius 30] [--live]` | номера категорий Kleinanzeigen; `--live` — сверить с сайтом и показать число объявлений |
 | `python -m ebeyparser once` | одна проверка всех поисков и лучшие находки в консоли |
 | `python -m ebeyparser check <ссылка>` | «брать или нет?» — оценить одно объявление (`--purpose personal --target 300` — для себя) |
@@ -272,14 +274,91 @@ Register-ScheduledTask -TaskName "EbeyParser" -Action $action -Trigger $trigger 
 
 `pythonw` работает без окна: панель — http://localhost:8000, всё остальное — в логе. Остановить: `Stop-ScheduledTask EbeyParser`.
 
-**Docker / Linux:** `docker compose up -d` (см. `docker-compose.yml`) или systemd — [`deploy/ebeyparser.service`](deploy/ebeyparser.service).
+**Docker / Linux / мини-ПК:** см. [«Установка на домашний сервер (24/7)»](#установка-на-домашний-сервер-247).
 
 ### Панель с телефона
 
-По умолчанию панель открыта **только на этом компьютере** (`web.host: 127.0.0.1`).
+По умолчанию панель открыта **только на этом компьютере** (`web.host: 127.0.0.1`). Переключается в панели: **Настройки → Доступ с телефона** (или `python -m ebeyparser access lan|tailscale|local`).
 
-- **Лучший способ — [Tailscale](https://tailscale.com)** (бесплатно): поставь его на компьютер и телефон и впиши в `config.yaml` `web.host:` адрес компьютера в Tailscale (`100.x.y.z`, виден в приложении Tailscale). Панель будет доступна только твоим устройствам, из любой сети; при запуске программа напечатает ссылку с ключом для телефона. Если открываешь по имени `…ts.net`, добавь его в `config.yaml`: `web.allowed_hosts: [<имя>.ts.net]`.
+- **Лучший способ — [Tailscale](https://tailscale.com)** (бесплатно): поставь его на компьютер и телефон и выбери «Через Tailscale». Панель будет доступна только твоим устройствам, из любой сети; при запуске программа напечатает ссылку с ключом для телефона. Имена вида `…ts.net` работают сами.
 - `web.host: 0.0.0.0` открывает панель **всей локальной сети**. Тогда вход только по ссылке с ключом: программа печатает её при запуске (`http://192.168.x.y:8000/?token=…`), ключ лежит в `data/web_token.txt`, браузер запоминает его после первого входа. **Не делай так в общем Wi-Fi** (общежитие, кафе, коворкинг).
+
+---
+
+## Установка на домашний сервер (24/7)
+
+Слабого домашнего сервера хватает: мини-ПК на N100, старый ноутбук или Raspberry Pi 5, 4–8 ГБ памяти, без видеокарты. Он круглосуточно проверяет объявления и присылает в Telegram «🔥 Супер-находку» и «Топ за день», а панель ты открываешь с телефона и ПК. Сама программа занимает ~100 МБ памяти. Выбери один путь — всё остальное (город, категории, Telegram, нейросеть) настраивается потом в панели.
+
+### Путь 1. Docker (Linux: Ubuntu, Debian, Raspberry Pi OS)
+
+```bash
+curl -fsSL https://get.docker.com | sh && sudo usermod -aG docker $USER   # один раз, потом перезайди
+git clone https://github.com/Maksym706/EbeyParser EbeyParser && cd EbeyParser
+docker compose up -d
+docker compose logs ebeyparser        # здесь ссылка для телефона и QR-код
+```
+
+С маленькой нейросетью-разведчиком на процессоре сервера — вместо `docker compose up -d`:
+
+```bash
+docker compose --profile ai up -d
+```
+
+Программа сама выберет модель под память сервера (Qwen3.5 2B; при 16 ГБ — 4B, если в файл `.env` рядом добавить `OLLAMA_MEM_LIMIT=6g`), скачает её вместе с Qwen3-Embedding 0.6B (~2 ГБ, плюс ~3 ГБ сам образ Ollama) и включит разведчика. Ограничения памяти в `docker-compose.yml` рассчитаны на 4–8 ГБ. Панель работает на адресе самого сервера, поэтому этот путь — для Linux; на Windows бери путь 3.
+
+### Путь 2. Linux без Docker
+
+```bash
+git clone https://github.com/Maksym706/EbeyParser ~/EbeyParser && cd ~/EbeyParser
+bash deploy/install-linux.sh              # окружение Python + автозапуск (systemd), спросит пароль sudo
+bash deploy/install-linux.sh --with-ai    # по желанию: Ollama и модели под этот сервер (сначала покажет план)
+```
+
+Нужен Python 3.11+ (в Debian 12 и Raspberry Pi OS уже есть; Ubuntu 22.04: `sudo apt install python3.11 python3.11-venv`). Скрипт можно запускать повторно, `--dry-run` только покажет, что он сделает. В конце он печатает ссылку для телефона и QR-код. Лог: `journalctl -u ebeyparser -f`.
+
+### Путь 3. Windows (мини-ПК)
+
+1. Как в «Быстром старте»: дважды кликни `deploy\start-windows.bat`.
+2. Автозапуск — Планировщик заданий (раздел «Работа 24/7 на Windows»). Если у мини-ПК нет монитора, включи в Windows автоматический вход, чтобы задача стартовала после перезагрузки.
+3. В панели: **Настройки → Доступ с телефона** → «Через Tailscale» или «Домашний Wi-Fi» → перезапуск.
+
+### Первый запуск: телефон и ПК
+
+На сервере без экрана программа при первом запуске сама открывает панель для сети и пишет в лог:
+
+```
+📱 Открой http://192.168.178.40:8000/?token=… на телефоне или ПК (домашняя сеть)
+📱 Открой http://100.101.102.103:8000/?token=… на телефоне или ПК (Tailscale)
+   Или наведи камеру телефона на QR-код:
+```
+
+Открой ссылку **с ключом** (`?token=…`) один раз — браузер его запомнит, и дальше мастер настройки идёт прямо на телефоне.
+
+- **Tailscale — лучший вариант** (бесплатно): поставь на сервер (`curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up`) и на телефон, войди в один аккаунт. Ссылка «Tailscale» работает и дома, и в дороге, и только для твоих устройств.
+- **Домашний Wi-Fi**: ссылка «домашняя сеть» работает только дома. Дай серверу постоянный адрес в роутере (FritzBox: «Diesem Netzwerkgerät immer die gleiche IPv4-Adresse zuweisen»).
+- Порт 8000 на роутере в интернет **не открывай** — для доступа снаружи есть Tailscale.
+- Потерял ссылку: `python -m ebeyparser access` (Docker: `docker compose exec ebeyparser python -m ebeyparser access`). Сменить ключ или режим — **Настройки → Доступ с телефона**.
+
+### Большая нейросеть на игровом ПК
+
+Фото лучше проверяет модель побольше на игровом ПК с LM Studio:
+
+1. На ПК в LM Studio загрузи модель (например Qwen3.5 9B), вкладка **Developer → Settings → «Serve on Local Network»**, затем **Start Server**. Если Windows спросит — разреши LM Studio в брандмауэре для частной сети.
+2. В панели сервера: **Настройки → Нейросеть → «Другой сервер»**: сервер «LM Studio», адрес `http://<IP-ПК>:1234/v1` (с Tailscale — `http://<имя-ПК>:1234/v1`), модель — как в LM Studio. Кнопка «Проверить» покажет, видит ли сервер ПК.
+3. **ПК выключен — ничего страшного.** Разведчик на сервере продолжает читать объявления, выгодное ждёт проверки фото до 45 минут, потом приходит с пометкой «⚠ ФОТО НЕ ПРОВЕРЕНЫ ИИ — проверь сам». Включишь ПК — проверки продолжатся сами.
+
+### Обновление и резервная копия
+
+- **Docker:** `git pull && docker compose up -d --build` (с нейросетью: `docker compose --profile ai up -d --build`).
+- **Linux:** `bash deploy/update-linux.sh` — копия базы в `data/backups/` (три последние), новая версия, пакеты, перезапуск.
+- **Windows:** как в «Обновлении с прошлой версии».
+- **Резервная копия:** **Настройки → Данные и бэкап → Резервная копия** — zip с базой и настройками. Храни его не на сервере. Как восстановить, написано в `README.txt` внутри архива; в Docker распакуй архив в папку `backup` рядом и выполни:
+  ```bash
+  docker compose stop ebeyparser
+  docker compose run --rm --no-deps -v "$PWD/backup:/restore:ro" ebeyparser \
+    sh -c 'rm -f /app/data/*.sqlite3-wal /app/data/*.sqlite3-shm && cp /restore/config.yaml /restore/data/* /app/data/ && cp /restore/.env /app/data/ 2>/dev/null; true'
+  docker compose start ebeyparser
+  ```
 
 ---
 

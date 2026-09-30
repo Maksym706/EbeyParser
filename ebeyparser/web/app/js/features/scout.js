@@ -29,7 +29,7 @@ const clean = (t) =>
 /** «≈ 6,0 с на объявление, до 300 объявлений в час» — «Ожидается … (пока не измерено)» becomes a separate «оценка» mark. */
 export function scoutSpeed(s) {
   if (!s || !s.speed_ru) return "";
-  let t = clean(s.speed_ru).replace(/(\d)\.(\d)(?=\s*с\b)/g, "$1,$2");
+  let t = clean(s.speed_ru).replace(/(\d)\.(\d)(?=\s*с(?:[\s,.;)]|$))/g, "$1,$2");
   if (s.speed_expected) t = t.replace(/^Ожидается\s+/, "").replace(/\s*\(пока не измерено\)\s*$/, "");
   return t;
 }
@@ -68,7 +68,7 @@ export function ScoutNote({ deal }) {
     <span class="scout-note__icon"><${Icon} name="telescope" size=${18} /></span>
     <div>
       <b>${deal.found_by_label || "Нашла нейросеть"}</b>${reason ? html`: ${reason}` : ""}
-      <p class="scout-note__sub">Скрипт это объявление пропустил — нейросеть прочитала текст и узнала товар. Цена — по истории объявлений, не от нейросети.</p>
+      <p class="scout-note__sub">Нейросеть прочитала текст и узнала то, что скрипт по названию не понял. Цена — по истории объявлений, не от нейросети.</p>
     </div>
   </div>`;
 }
@@ -330,7 +330,7 @@ export function ModelAdvice({ onUsed, initialRole = "server" }) {
             <span class="overline">${pk.task_ru}</span>
             <div class="advice__name"><b>${pk.name}</b>${pk.label_ru && html`<span class="tag">${pk.label_ru}</span>`}</div>
             ${pk.desc_ru && html`<p class="advice__desc">${clean(pk.desc_ru)}</p>`}
-            ${pk.speed_ru && html`<p class="advice__speed"><${Icon} name="gauge" size=${13} />${clean(pk.speed_ru)}</p>`}
+            ${pk.speed_ru && html`<p class="advice__speed"><${Icon} name="gauge" size=${14} /><span>${clean(pk.speed_ru)}</span></p>`}
             ${id
               ? html`<div class="advice__id">
                   <code class="mono">${id}</code>

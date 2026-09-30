@@ -65,7 +65,7 @@ export function ScoutGroup({ form }) {
     <${SettingRow} label="Модель разведчика" help=${`Пусто — ${ai.model ? `как у нейросети для фото (${ai.model})` : "как у нейросети для фото"}. Хватит небольшой: Qwen3.5 2B или 4B`} error=${form.err("ai.scout.model")}>
       ${(id) => html`<${Input} id=${id} ...${form.bind("ai.scout.model")} class="mono" placeholder=${ai.model || "название модели из LM Studio или Ollama"} />`}
     <//>
-    <${SettingRow} label="Адрес сервера" help=${`Пусто — тот же, что у нейросети для фото${ai.base_url ? ` (${ai.base_url})` : ""}. Свой — если разведчик работает на другом компьютере`} error=${form.err("ai.scout.base_url")}>
+    <${SettingRow} label="Адрес сервера" help="Пусто — тот же, что у нейросети для фото. Свой — если разведчик работает на другом компьютере" error=${form.err("ai.scout.base_url")}>
       ${(id) => html`<${Input} id=${id} ...${form.bind("ai.scout.base_url")} class="mono" placeholder=${ai.base_url || "http://127.0.0.1:1234/v1"} />`}
     <//>
     ${own &&
@@ -86,7 +86,7 @@ export function ScoutGroup({ form }) {
     <//>
     <${Disclosure} title="Для продвинутых">
       <${SettingRow} label="Объявлений за один запрос" help="0 — авто по модели (5 для маленькой, 10 для 4B и больше)" error=${form.err("ai.scout.batch_size")}>
-        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("ai.scout.batch_size")} min=${0} max=${32} placeholder="авто" />`}
+        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("ai.scout.batch_size")} min=${0} max=${32} placeholder="0" suffix=${Number(sc.batch_size || 0) === 0 ? "авто по модели" : "за запрос"} />`}
       <//>
       <${SettingRow} label="Не больше в час" help="Потолок прочитанных объявлений — чтобы слабый сервер не был занят только разведчиком" error=${form.err("ai.scout.max_per_hour")}>
         ${(id) => html`<${NumberInput} id=${id} ...${form.bind("ai.scout.max_per_hour")} min=${0} max=${20000} suffix="в час" />`}
@@ -95,7 +95,7 @@ export function ScoutGroup({ form }) {
         <${Slider} value=${Math.round((sc.pass_share ?? 0.5) * 100)} min=${5} max=${100} step=${5} bubble="always" format=${(v) => `${v} %`} label="Доля времени проверки" onChange=${(v) => form.set("ai.scout.pass_share", v / 100)} />
       <//>
       <${SettingRow} label="Минимальный интерес" help="0 — не отсеивать (рекомендую: маленькие модели плохо оценивают интерес). Выше — разведчик возвращает меньше объявлений" error=${form.err("ai.scout.min_interest")}>
-        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("ai.scout.min_interest")} min=${0} max=${10} suffix="из 10" />`}
+        ${(id) => html`<${NumberInput} id=${id} ...${form.bind("ai.scout.min_interest")} min=${0} max=${10} suffix=${Number(sc.min_interest || 0) === 0 ? "не отсеивать" : "из 10"} />`}
       <//>
     <//>
   <//>`;
@@ -124,10 +124,10 @@ export function AlertTiersGroups({ form }) {
       <${SettingRow} label="Прибыль от" error=${form.err("notifications.super_deals.min_profit")}>
         ${(id) => html`<${NumberInput} id=${id} ...${form.bind("notifications.super_deals.min_profit")} min=${0} max=${100000} suffix="€" disabled=${!sup.enabled} />`}
       <//>
-      <${SettingRow} label="ROI от" help="Сколько заработаешь на каждый вложенный евро: 80 % — вложил 100 €, получил 180 €" error=${form.err("notifications.super_deals.min_roi")}>
+      <${SettingRow} label="ROI от" help="Сколько заработаешь на каждый вложенный евро: 80 % — вложил 100 €, получил 180 €" error=${form.err("notifications.super_deals.min_roi")}>
         ${(id) => html`<${NumberInput} id=${id} ...${form.bind("notifications.super_deals.min_roi", { scale: 100 })} min=${0} max=${1000} suffix="%" disabled=${!sup.enabled} />`}
       <//>
-      <${SettingRow} label="Балл от" wide>
+      <${SettingRow} label="Балл от" wide help="Тот же балл, что в кружке на карточке находки. Для обычных уведомлений порог ниже — здесь только лучшие">
         <${Slider} value=${sup.min_score ?? 85} min=${0} max=${100} step=${5} bubble="always" tone="green" label="Балл от" format=${(v) => `${v} из 100`} disabled=${!sup.enabled} onChange=${(v) => form.set("notifications.super_deals.min_score", v)} />
       <//>
     <//>

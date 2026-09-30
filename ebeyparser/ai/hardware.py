@@ -15,7 +15,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 ARM_MACHINES = frozenset({"arm64", "aarch64", "armv7l", "armv8l", "arm"})
-LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0", "ollama"})  # "ollama": the Docker service next to the app
 
 
 def _ram_bytes() -> int | None:

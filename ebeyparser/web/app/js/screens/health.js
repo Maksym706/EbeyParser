@@ -446,6 +446,7 @@ function ScoutTile({ d, reload }) {
     ${text.message && html`<p class=${cx("htile__lead", problem && `t-${st.tone === "danger" ? "red" : "amber"}`)}>${text.message}</p>`}
     ${text.details && html`<${Details} text=${text.details} />`}
     ${s.enabled &&
+    s.state !== "too_small" &&
     html`<div class="htile__grid">
       <div class="hmetric"><span>Прочитал за час</span><b class="num">${number(s.read_last_hour || 0)}${s.seen_last_hour ? ` из ${number(s.seen_last_hour)}` : ""}</b></div>
       <div class="hmetric"><span>Не успел за час</span><b class=${cx("num", s.overflow_last_hour > 0 && "t-amber")}>${number(s.overflow_last_hour || 0)}</b></div>

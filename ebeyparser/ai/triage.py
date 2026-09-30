@@ -601,6 +601,14 @@ class ScoutStats:
 # ---------------------------------------------------------------------------
 
 
+def _read_timeout(exc: BaseException) -> bool:
+    """The model server accepted the call but did not answer in time (httpx ReadTimeout behind
+    the LLMError), as opposed to being down or unreachable."""
+    cause = exc.__cause__
+    name = type(cause).__name__ if cause is not None else ""
+    return "Timeout" in name and "Connect" not in name and "Pool" not in name
+
+
 @dataclass
 class TriageRun:
     items: dict[str, TriageItem] = field(default_factory=dict)  # ad_id -> item (ai or script fallback)
@@ -754,9 +762,24 @@ class TriageEngine:
             if size <= 0:
                 break
             batch, queue = queue[:size], queue[size:]
+            started = self.clock()
             try:
                 got = await self._run_batch(batch, [cats.get(x.ad_id, "") for x in batch], hints, run)
             except LLMError as exc:
+                if _read_timeout(exc) and len(batch) > self.min_batch:
+                    # the server is up but too slow for this batch (a 4B on a 4-core CPU at batch 10):
+                    # remember the speed it showed at least, halve the batch and go on
+                    elapsed = max(0.0, self.clock() - started)
+                    run.seconds += elapsed
+                    per_ad = elapsed / len(batch)
+                    self.stats.sec_per_ad = max(self.stats.sec_per_ad or 0.0, per_ad) or None
+                    self.batch_size = max(self.min_batch, len(batch) // 2)
+                    self.stats.batch_size = self.batch_size
+                    self._streak = 0
+                    queue = batch + queue
+                    log.warning("AI scout: %d ads took over the timeout, trying batches of %d", len(batch),
+                                self.batch_size)
+                    continue
                 run.error = str(exc)
                 self.stats.last_error = run.error
                 self.stats.last_error_at = self._wall()

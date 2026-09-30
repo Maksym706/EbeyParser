@@ -30,18 +30,19 @@ You read second-hand ads from Kleinanzeigen.de and eBay.de for a student in Berl
 cheap things to resell. For EVERY ad return one object. Report only what the ad says; never \
 guess prices. Keys:
 i: the ad number [i].
-k: kind. Default: sale (one product for sale). Use another kind only when the ad says so:
-wanted = Suche, Suche nach, Kaufe, Gesucht
-swap = Tausche, Tausch, nur Tausch
-defect = defekt, kaputt, für Bastler, iCloud gesperrt
-part = Ersatzteil, als Ersatzteil (one component, not the whole device)
-box = nur OVP, nur Karton, leere Verpackung
+k: kind. Default: sale (one product for sale; also a graphics card, a laptop, or a device \
+"mit Hülle/Ladegerät"). Use another kind only when the ad says so:
+wanted = Suche, Suche nach, Kaufe, Gesucht (the author wants to buy)
+swap = Tausche, Tausch gegen, nur Tausch (wants another item instead of money)
+defect = defekt, kaputt, für Bastler, iCloud gesperrt (broken or locked device)
+part = Ersatzteil, als Ersatzteil: a spare part of a device (Display, Akku, Mainboard)
+box = nur OVP, nur Karton, Karton leer, ohne Inhalt (the empty box, no device)
 bundle = a product with extras: Paket, Set, Bundle, "mit 2 Controllern und Spielen"
-lot = Konvolut, Sammlung, Nachlass, Kiste mit Technik (many different things)
-pc = a whole computer: Gaming PC, Rechner, Tower (list its parts in c)
-acc = only an accessory: Hülle, Kabel, Ladegerät
+lot = Konvolut, Sammlung, Nachlass, Kiste mit Technik (many different things, list them in c)
+pc = a whole desktop computer or server: Gaming PC, Rechner, Tower (list GPU, CPU, RAM in c)
+acc = only an accessory, no device: Hülle, Kabel, Ladegerät, Ladestation
 service = Reparatur, Dienstleistung
-other = not electronics or tools: furniture, clothes, toys
+other = furniture, clothes, toys, bikes, prams (not electronics, not tools)
 p: the exact product: brand model variant storage, e.g. "Apple iPhone 13 Pro 256GB", \
 "NVIDIA RTX 3080 10GB". Copy model numbers and sizes exactly as the ad writes them; fix typos \
 ("Iphne" -> "iPhone"). Use the text, not only the title. "" if no model is named.
@@ -53,7 +54,8 @@ z: condition: new | good | used | defect | unknown.
 h: hidden value tags: typo (misspelled brand/model) | vague (title hides what it is) | \
 unknown_model (seller does not know the model) | pc_parts (valuable parts inside a PC) | \
 lot | bundle | wrong_category | cheap (price looks very low for this item). [] if none.
-x: risk tags: scam (Vorkasse, only shipping, WhatsApp, Telegram, e-mail, link, too good) | defect | \
+x: risk tags: scam (Vorkasse, Überweisung vorab, PayPal Freunde, nur Versand, seller im Ausland, \
+contact by WhatsApp/Telegram/e-mail, a payment or "Sicher bezahlen" link, far too cheap) | defect | \
 locked (iCloud/account lock) | fake (replica) | missing (important part missing) | reserved | rent. [] if none.
 s: interest 0-10 for reselling: 9-10 valuable item hidden or far too cheap; 6-8 known \
 valuable product, resellable; 3-5 ordinary; 0-2 junk, wanted, swap, service, broken, scam.
@@ -65,13 +67,17 @@ Example ads:
 RTX 3070, 16GB RAM, läuft
 [1] Titel: Iphne 12 64gb | Preis: 180 € | Text: Akku 86%, kleine Kratzer
 [2] Titel: Suche PS5 | Preis: VB | Text: Suche PS5 Disc bis 300€
+[3] Titel: Apple Watch Series 9 NEU | Preis: 90 € | Text: Bin im Ausland, nur Versand. Zahlung vorab \
+per PayPal Freunde, schreib mir auf WhatsApp
 Example answer:
 {"items":[{"i":0,"k":"pc","p":"","n":1,"c":["RTX 3070","Intel Core i7-8700K","16GB DDR4 RAM"],\
 "q":"gaming pc rtx 3070","z":"used","h":["pc_parts","vague"],"x":[],"s":9,"r":"старый ПК, внутри RTX 3070"},\
 {"i":1,"k":"sale","p":"Apple iPhone 12 64GB","n":1,"c":[],"q":"iphone 12 64gb","z":"used",\
 "h":["typo"],"x":[],"s":6,"r":"iPhone 12, опечатка в названии"},\
 {"i":2,"k":"wanted","p":"Sony PS5 Disc","n":1,"c":[],"q":"ps5 disc","z":"unknown","h":[],"x":[],\
-"s":0,"r":"ищет, а не продаёт"}]}
+"s":0,"r":"ищет, а не продаёт"},\
+{"i":3,"k":"sale","p":"Apple Watch Series 9","n":1,"c":[],"q":"apple watch series 9","z":"new",\
+"h":["cheap"],"x":["scam"],"s":0,"r":"предоплата и WhatsApp — похоже на развод"}]}
 """
 
 _ITEM_PROPERTIES: dict = {

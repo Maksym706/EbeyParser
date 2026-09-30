@@ -219,10 +219,15 @@
 }
 .advice__host {
   display: inline-flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 6px;
   color: var(--text-2);
   font-size: var(--fs-body-sm);
+  line-height: var(--lh-body-sm);
+}
+.advice__host > svg {
+  flex: none;
+  margin-top: 2px;
 }
 .advice__manual summary {
   display: inline-flex;
@@ -322,15 +327,16 @@
 }
 .advice__speed {
   display: flex;
-  align-items: center;
-  gap: 5px;
+  align-items: flex-start;
+  gap: 6px;
   color: var(--text);
   font-size: var(--fs-body-sm);
   font-weight: 500;
 }
 .advice__speed svg {
   flex: none;
-  color: var(--text-3);
+  margin-top: 3px;
+  color: var(--text-2);
 }
 .advice__id {
   display: flex;
@@ -383,6 +389,15 @@
 .model-guide .guide__body {
   padding: 0 var(--s-5) var(--s-5);
 }
+/* onboarding's .guide styles every nested summary with its own chevron and padding */
+.model-guide .guide__body summary {
+  min-height: 32px;
+  padding: 0;
+  font-weight: 600;
+}
+.model-guide .guide__body summary::before {
+  content: none;
+}
 
 /* ---------------------------------------------------------------- Состояние tile */
 .htile--wide {
@@ -394,9 +409,15 @@
   line-height: var(--lh-body-sm);
   font-weight: 500;
 }
+.htile__lead.t-amber {
+  color: var(--amber-text);
+}
+.htile__lead.t-red {
+  color: var(--red-text);
+}
 .htile__grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 240px), 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr));
   gap: 8px 32px;
 }
 .htile__grid .hmetric > span {
@@ -422,7 +443,12 @@
 
 @media (pointer: coarse) {
   .scout-readings summary,
-  .advice__manual summary {
+  .advice__manual summary,
+  .model-guide .guide__body summary {
+    min-height: 44px;
+  }
+  /* the pills row scrolls sideways (overflow clips hit-area extenders) — grow the pills instead */
+  .advice .tabs--pills .tabs__tab {
     min-height: 44px;
   }
 }

@@ -278,10 +278,11 @@ def scout_updates(url: str | None, *, probe: Callable[[str], Any] | None = None,
     url = (url or "").strip().rstrip("/")
     if not url:
         return None, None
-    if probe is None:
-        from .web.localai import probe_json as probe
+    from .web.localai import probe_json
+
+    fetch = probe or probe_json
     server = url[:-3] if url.endswith("/v1") else url
-    data = probe(f"{server}/api/tags")
+    data = fetch(f"{server}/api/tags")
     if not isinstance(data, dict) or not isinstance(data.get("models"), list):
         return None, None
     ids = [str(m.get("name") or m.get("model")) for m in data["models"] if isinstance(m, dict)]

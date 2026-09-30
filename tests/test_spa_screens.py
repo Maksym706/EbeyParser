@@ -29,8 +29,8 @@ ICON_DEF_RE = re.compile(r'^\s+"([a-z0-9-]+)":', re.M)
 
 def _icons() -> set[str]:
     names = set(ICON_DEF_RE.findall((JS / "ui" / "icons.js").read_text(encoding="utf-8")))
-    # additive registrations: Frontend B's extras and the «Сборки» ones (features/projects-common.js)
-    for extra in ("icons-extra.js", "projects-common.js"):
+    # additive registrations: Frontend B's extras, «Сборки» (features/projects-common.js), the AI scout (features/scout.js)
+    for extra in ("icons-extra.js", "projects-common.js", "scout.js"):
         names |= set(ICON_DEF_RE.findall((JS / "features" / extra).read_text(encoding="utf-8")))
     return names
 
