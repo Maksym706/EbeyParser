@@ -43,7 +43,7 @@ log = logging.getLogger(__name__)
 
 APP_TITLE = "EbeyParser"
 # OpenRouter attribution headers: the app's name only (no user data, no real site)
-OPENROUTER_HEADERS = {"HTTP-Referer": "http://localhost/ebeyparser", "X-Title": APP_TITLE}
+OPENROUTER_HEADERS = {"HTTP-Referer": "https://github.com/Maksym706/EbeyParser", "X-Title": APP_TITLE}
 
 CLOUD_BATCH = (16, 20)  # (first, largest) ads per scout call for big cloud models
 CLOUD_TRIAGE_MAX_TOKENS = 2600  # 20 ads × 110 tokens + overhead (triage.TOKENS_PER_ITEM)

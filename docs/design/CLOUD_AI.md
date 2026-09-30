@@ -134,7 +134,7 @@ The monitor loop never sleeps on quota.
 
 ### 4.3 What goes over the wire
 
-* OpenRouter gets the headers `HTTP-Referer: http://localhost/ebeyparser` and `X-Title: EbeyParser`
+* OpenRouter gets the headers `HTTP-Referer: https://github.com/Maksym706/EbeyParser` and `X-Title: EbeyParser`
   (the app's name only).
 * The format ladder json_schema → json_object → none is unchanged. On a cloud endpoint the step
   that worked is remembered, so no quota goes to requests the server rejects anyway.
