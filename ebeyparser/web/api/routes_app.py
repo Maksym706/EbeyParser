@@ -86,6 +86,10 @@ RANGES: dict[str, tuple[float | None, float | None]] = {
     "ai.second_opinion.max_images": (0, 10),
     "ai.second_opinion.timeout_seconds": (5, 1800),
     "ai.vision_wait_minutes": (0, 1440),
+    "ai.rpm": (0, 100000),
+    "ai.daily_limit": (0, 10000000),
+    "ai.scout.rpm": (0, 100000),
+    "ai.scout.daily_limit": (0, 10000000),
     "ai.scout.timeout_seconds": (5, 1800),
     "ai.scout.temperature": (0, 2),
     "ai.scout.max_tokens": (200, 16000),
@@ -618,6 +622,9 @@ def check_secret(name: str, value: str) -> str | None:
         return "нужен адрес почты"
     if name == "notify_email" and not all("@" in part for part in value.split(",") if part.strip()):
         return "адреса через запятую, например me@gmail.com"
+    if name in ("openrouter_api_key", "nvidia_api_key", "omniroute_api_key", "cloud_api_key") and (
+            len(value) < 6 or any(ch.isspace() for ch in value)):
+        return "похоже, скопировалось не всё — вставь ключ целиком, без пробелов"
     return None
 
 

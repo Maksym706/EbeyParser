@@ -11,7 +11,7 @@ import { NotificationsSection, EbaySection, AccessSection, DataSection, AboutSec
 export const SETTINGS_SECTIONS = [
   { key: "region", label: "Поиск и регион", icon: "map-pin", description: "Город, радиус, как часто проверять", component: RegionSection },
   { key: "money", label: "Деньги", icon: "wallet", description: "Стратегия, прибыль, комиссии", component: MoneySection },
-  { key: "ai", label: "Нейросеть", icon: "scan-eye", description: "LM Studio, модель, второе мнение", component: AiSection },
+  { key: "ai", label: "Нейросеть", icon: "scan-eye", description: "Облако или компьютер, модели, второе мнение", component: AiSection },
   { key: "notifications", label: "Уведомления", icon: "bell", description: "Telegram, почта, что присылать", component: NotificationsSection },
   { key: "ebay", label: "eBay", icon: "gavel", description: "Ключи API и площадка", component: EbaySection },
   { key: "access", label: "Доступ с телефона", icon: "smartphone", description: "Wi-Fi, Tailscale, QR-код", component: AccessSection, standalone: true },

@@ -99,8 +99,7 @@ PRESETS: dict[str, CloudPreset] = {p.key: p for p in (
         text_picks=("nvidia/nemotron-3-super-120b-a12b:free", "nvidia/nemotron-3.5-lightning:free",
                     "nvidia/nemotron-3-ultra-550b-a55b:free"),
         vision_picks=("nvidia/nemotron-nano-12b-v2-vl:free", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"),
-        terms_ru=("Бесплатно: 20 запросов в минуту и 50 в день; после разовой покупки $10 кредитов — 1000 в день. "
-                  "Некоторые бесплатные модели могут сохранять запросы — это настраивается в аккаунте OpenRouter."),
+        terms_ru="Бесплатно: 20 запросов в минуту и 50 в день; после разовой покупки $10 кредитов — 1000 в день.",
         how_ru="Войди на openrouter.ai → Keys → Create Key и вставь ключ сюда",
     ),
     CloudPreset(
@@ -297,11 +296,14 @@ def parse_retry(headers: Any, now: float) -> float | None:
     return None
 
 
-def _num(value: Any) -> float | None:
+def as_number(value: Any) -> float | None:
     try:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+_num = as_number
 
 
 # ---------------------------------------------------------------------------
@@ -318,8 +320,12 @@ def _plural(n: int, one: str, few: str, many: str) -> str:
     return many
 
 
-def _int_ru(n: int) -> str:
-    return f"{int(n):,}".replace(",", " ")
+def int_ru(n: int) -> str:
+    """16000 → «16 000», 1000 → «1000» (Russian groups digits from five on)."""
+    return f"{int(n):,}".replace(",", " ") if abs(int(n)) >= 10000 else str(int(n))
+
+
+_int_ru = int_ru
 
 
 def plan_budget(rpm: int, daily_limit: int, *, batch: int = CLOUD_BATCH[1], photo_share: float = PHOTO_SHARE,
@@ -494,12 +500,13 @@ class QuotaLimiter:
         now = self.wall()
         name = self.preset.name
         if self.daily_exhausted_until > now:
-            return self._limited(f"Бесплатный лимит {name} на сегодня исчерпан — продолжу после обнуления",
+            return self._limited(f"Бесплатный лимит {name} на сегодня исчерпан — продолжу {_at(self.daily_exhausted_until)}",
                                  "daily", self.daily_exhausted_until)
         limit = self.daily_limit
         if limit and self.used >= limit:
-            return self._limited(f"Бесплатный лимит {name} на сегодня исчерпан ({limit} запросов) — "
-                                 "продолжу после обнуления", "daily", self.next_reset())
+            reset = self.next_reset()
+            return self._limited(f"Бесплатный лимит {name} на сегодня исчерпан ({limit} запросов) — продолжу "
+                                 + (_at(reset) if reset else "позже"), "daily", reset)
         if purpose == "triage" and limit:
             cap = self.triage_cap()
             if cap is not None and self.used >= cap:
@@ -739,6 +746,13 @@ def _hhmm(ts: float) -> str:
     return hhmm(datetime.fromtimestamp(ts, timezone.utc))
 
 
+def _at(ts: float) -> str:
+    """«в 02:00» / «завтра в 02:00» in the user's time zone."""
+    from ..timefmt import at_label
+
+    return at_label(datetime.fromtimestamp(ts, timezone.utc))
+
+
 class QuotaRegistry:
     """Process-wide limiters, one per endpoint + key: the scout and the photo check on the same
     account share one quota. `attach(db)` makes the counters survive restarts."""
@@ -786,6 +800,46 @@ _REGISTRY = QuotaRegistry()
 
 def registry() -> QuotaRegistry:
     return _REGISTRY
+
+
+EBAY_RULE_RU = ("Объявления с eBay в облако не отправляю: правила eBay запрещают передавать их данные другим "
+                "сервисам. Их смотрит компьютер про запас или обычная проверка")
+
+
+def cloud_view(roles: Sequence[tuple[str, Any, Any]], *, send_ebay: bool = False,
+               reg: QuotaRegistry | None = None) -> dict[str, Any]:
+    """The «Облако» block of /health and /monitor. `roles`: (role, settings, fallback settings or
+    None) for the photo check ("vision") and the scout ("scout"); a local endpoint is skipped, one
+    shared cloud account is one row."""
+    rows: list[dict[str, Any]] = []
+    by_id: dict[str, dict[str, Any]] = {}
+    for role, settings, fb in roles:
+        limiter = (reg or registry()).for_settings(settings)
+        if limiter is None:
+            continue
+        row = by_id.get(limiter.endpoint)
+        if row is None:
+            row = limiter.snapshot(fallback_configured=fb is not None)
+            row.update(roles=[], models={})
+            by_id[limiter.endpoint] = row
+            rows.append(row)
+        elif fb is not None and not row["fallback_configured"]:
+            row.update({k: v for k, v in limiter.snapshot(fallback_configured=True).items()
+                        if k in ("fallback_configured", "fallback_active")})
+        row["roles"].append(role)
+        row["models"][role] = str(getattr(settings, "model", "") or "")
+    if not rows:
+        return {"enabled": False, "endpoints": [], "send_ebay": send_ebay, "ebay_ru": EBAY_RULE_RU, "text_ru": ""}
+    main = rows[0]
+    if main["limited"]:
+        text = main["limited_ru"] + (" · пока работает компьютер про запас" if main["fallback_active"] else "")
+    elif main["scout_low"]:
+        text = ("Бесплатный лимит на сегодня почти потрачен — разведчик читает только непонятные объявления,"
+                " фото лучших находок проверяю в первую очередь")
+    else:
+        text = f"{main['used_ru']} · {main['estimate_ru']}"
+    return {"enabled": True, **main, "endpoints": rows, "send_ebay": send_ebay, "ebay_ru": EBAY_RULE_RU,
+            "text_ru": text}
 
 
 # ---------------------------------------------------------------------------
@@ -1132,9 +1186,9 @@ def first_line(texts: Iterable[str]) -> str:
 
 __all__ = [
     "APP_TITLE", "CLOUD_BATCH", "CLOUD_KINDS", "CLOUD_TRIAGE_MAX_TOKENS", "CLOUD_VISION_MAX_TOKENS", "CloudLimited",
-    "CloudPreset", "CloudRouter", "fallback_settings", "EBAY_LOCAL_RU", "OPENROUTER_HEADERS", "PRESETS", "QuotaLimiter", "QuotaRegistry",
+    "CloudPreset", "CloudRouter", "EBAY_RULE_RU", "cloud_view", "fallback_settings", "EBAY_LOCAL_RU", "OPENROUTER_HEADERS", "PRESETS", "QuotaLimiter", "QuotaRegistry",
     "ThinkingControls", "ad_city", "cloud_kind", "cloud_listing", "demo_ads", "detect_cloud", "endpoint_id",
-    "is_cloud_model", "key_env", "limits_text", "local_only", "local_only_reason", "mask_key", "parse_key_info",
+    "as_number", "int_ru", "is_cloud_model", "key_env", "limits_text", "local_only", "local_only_reason", "mask_key", "parse_key_info",
     "parse_models", "parse_retry", "pick_models", "plan_budget", "preset", "redact_contacts", "registry",
     "resolve_api_key", "stored_key", "strip_think", "thinking_controls",
 ]

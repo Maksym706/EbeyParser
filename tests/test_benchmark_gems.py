@@ -59,3 +59,16 @@ def test_deterministic():
     a = run_gems(SEED, 80, "noisy", scout=True)
     b = run_gems(SEED, 80, "noisy", scout=True)
     assert (a.buys, a.correct_buys, a.by_flavour, a.scout_read) == (b.buys, b.correct_buys, b.by_flavour, b.scout_read)
+
+
+def test_cloud_profiles_keep_precision_and_respect_the_free_quota():
+    """The scout and the photo check on OpenRouter's free limits (20/min, 50 or 1000 a day, random
+    429s, docs/design/CLOUD_AI.md): never a trap, never a false «покупать», never above the quota."""
+    free, paid = run_gems(SEED, N, "oracle", scout=True, hardware="cloud_free50"), \
+        run_gems(SEED, N, "noisy", scout=True, hardware="cloud_free1000")
+    for r in (free, paid):
+        assert r.precision == 1.0 and r.trap_buys == 0 and r.severe_trap_buys == 0, r.false_buys
+        assert r.cloud_429 > 0 and r.scout_read > 0  # upstream 429s happen; the scout still reads
+    assert free.cloud_requests <= 50 and free.cloud_limited > 0  # the day's quota ends: photos wait
+    assert paid.cloud_requests < 1000 and paid.scout_read > free.scout_read
+    assert "cloud_free50" in format_comparison([free, paid])

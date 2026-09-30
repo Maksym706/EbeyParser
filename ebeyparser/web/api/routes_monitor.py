@@ -257,6 +257,17 @@ def scout_view(ctx: ApiContext) -> dict[str, Any]:
                        max_per_hour=sc.max_per_hour, too_small=sc.enabled and too_small_for_triage(model))
 
 
+def cloud_block(ctx: ApiContext) -> dict[str, Any]:
+    """Free cloud AI (docs/design/CLOUD_AI.md): today's usage / limit, 429s, the local stand-in, the reset."""
+    from .routes_cloud import cloud_status
+
+    try:
+        return cloud_status(ctx)
+    except Exception:  # noqa: BLE001 - a status block never breaks the page
+        log.exception("cloud status failed")
+        return {"enabled": False, "endpoints": []}
+
+
 async def monitor_view(ctx: ApiContext, *, with_hosts: bool = True) -> dict[str, Any]:
     from .routes_app import _learning
 
@@ -309,6 +320,7 @@ async def monitor_view(ctx: ApiContext, *, with_hosts: bool = True) -> dict[str,
         "http": hosts if with_hosts else [],
         "searches_enabled": sum(1 for s in cfg.searches if s.enabled),
         "scout": scout_view(ctx),
+        "cloud": cloud_block(ctx),
     }
     view["learning"] = _learning(ctx, view)
     return view

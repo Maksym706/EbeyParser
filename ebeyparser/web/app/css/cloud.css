@@ -1,0 +1,312 @@
+/* Free cloud AI (docs/design/CLOUD_AI.md): «Где работает нейросеть» (Settings → Нейросеть, the
+   onboarding AI step), the cloud flow (provider → key → «Проверить» → models → limits), the usage
+   bar. Tokens only (tokens.css). Blue = AI / info, green = safe / money (brief §2.6). */
+
+/* ---------------------------------------------------------------- where: 3 cards */
+.where-cards .choice-card__desc {
+  font-size: var(--fs-body-sm);
+}
+
+/* tablet / narrow content column: the cards read as a list (icon left), like on the phone */
+@media (max-width: 1023px) {
+  .where-cards .choice-cards {
+    grid-template-columns: 1fr;
+    gap: var(--s-3);
+  }
+  .where-cards .choice-card {
+    display: grid;
+    grid-template-columns: 40px minmax(0, 1fr);
+    column-gap: var(--s-4);
+    row-gap: 2px;
+    align-items: center;
+    padding: var(--s-4);
+  }
+  .where-cards .choice-card__icon {
+    grid-row: span 2;
+    margin-bottom: 0;
+  }
+  .where-cards .choice-card__title,
+  .where-cards .choice-card__desc {
+    grid-column: 2;
+  }
+  .where-cards .choice-card__desc {
+    padding-right: 24px;
+  }
+}
+
+.onb-where {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+}
+
+.onb-where__label,
+.cloud-step__label {
+  color: var(--text-3);
+  font-size: var(--fs-overline);
+  line-height: var(--lh-overline);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* ---------------------------------------------------------------- the flow */
+.cloud-flow {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-6);
+  margin-top: var(--s-6);
+  min-width: 0;
+}
+
+.cloud-step {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  min-width: 0;
+}
+
+.cloud-hint {
+  margin: 0;
+  color: var(--text-2);
+  font-size: var(--fs-body-sm);
+  line-height: var(--lh-body-sm);
+  overflow-wrap: anywhere;
+}
+
+.cloud-hint--icon {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.cloud-hint--icon > svg {
+  flex: none;
+  margin-top: 3px;
+  color: var(--text-3);
+}
+
+.cloud-hint--icon > span {
+  min-width: 0;
+}
+
+.cloud-key {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-3);
+}
+
+.cloud-key__input {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.cloud-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-3) var(--s-4);
+}
+
+.cloud-warnings {
+  margin: var(--s-2) 0 0;
+  padding-left: 18px;
+  color: var(--amber-text);
+  font-size: var(--fs-body-sm);
+  line-height: var(--lh-body-sm);
+}
+
+/* ---------------------------------------------------------------- models */
+.cloud-models {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--s-4);
+}
+
+@media (max-width: 599px) {
+  .cloud-models {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.cloud-model {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.cloud-model__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-2);
+  font-size: var(--fs-body-sm);
+  font-weight: var(--weight-medium);
+}
+
+.cloud-model .select {
+  width: 100%;
+  min-width: 0;
+}
+
+.cloud-model select {
+  text-overflow: ellipsis;
+}
+
+.cloud-model__id {
+  display: block;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------- limits / privacy */
+.cloud-limits {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  padding: 12px 14px;
+  border: 1px solid var(--blue-border);
+  border-radius: var(--r-md);
+  background: var(--blue-bg);
+  color: var(--text);
+  font-size: var(--fs-body-sm);
+  line-height: var(--lh-body-sm);
+}
+
+.cloud-limits__row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.cloud-limits__row > svg {
+  flex: none;
+  margin-top: 2px;
+  color: var(--blue-text);
+}
+
+.cloud-limits__row > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.cloud-limits__tip {
+  color: var(--text-2);
+}
+
+.cloud-privacy {
+  display: flex;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  font-size: var(--fs-body-sm);
+  line-height: var(--lh-body-sm);
+}
+
+.cloud-privacy > svg {
+  flex: none;
+  margin-top: 1px;
+  color: var(--green-text);
+}
+
+.cloud-privacy p {
+  margin: 0;
+}
+
+.cloud-privacy p + p {
+  margin-top: 4px;
+}
+
+.cloud-privacy > div {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* an outside page on its own line: a full touch target (never a tiny link inside a sentence) */
+.cloud-link {
+  display: inline-flex;
+  align-self: flex-start;
+  align-items: center;
+  gap: 4px;
+  min-height: 32px;
+  font-size: var(--fs-body-sm);
+  font-weight: var(--weight-medium);
+}
+
+.cloud-limits .cloud-link {
+  margin-left: 24px;
+}
+
+@media (pointer: coarse) {
+  .cloud-link {
+    min-height: 44px;
+  }
+}
+
+.cloud-switch {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--s-3);
+  margin-top: var(--s-5);
+}
+
+/* ---------------------------------------------------------------- usage bar */
+.cloud-usage {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: var(--fs-body-sm);
+  line-height: var(--lh-body-sm);
+}
+
+.cloud-usage__top {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--s-3);
+  color: var(--text-2);
+}
+
+.cloud-usage__top b {
+  color: var(--text);
+}
+
+.cloud-usage__track {
+  position: relative;
+  height: 8px;
+  border-radius: var(--r-full);
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.cloud-usage__track > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--green-solid);
+  transition: width var(--d-base) var(--ease-standard);
+}
+
+.cloud-usage--amber .cloud-usage__track > span {
+  background: var(--amber-solid);
+}
+
+.cloud-usage--red .cloud-usage__track > span {
+  background: var(--red-solid);
+}
+
+.cloud-usage__note {
+  margin: 0;
+  color: var(--text-2);
+}

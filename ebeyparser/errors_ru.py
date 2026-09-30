@@ -321,7 +321,7 @@ def ai_problem(provider: str, base_url: str, model: str, error: str, *, server_o
     """The one Russian explanation of a failed AI check (/health, the AI test, the tile)."""
     from .ai.cloud import detect_cloud, preset
 
-    kind = cloud or detect_cloud(base_url)
+    kind = "" if cloud == "-" else (cloud or detect_cloud(base_url))  # "-": a local server, whatever the address
     if kind:
         return _cloud_problem(kind, preset(kind).name if preset(kind) else "облако", model, error, server_ok)
     ollama = provider == "ollama" or "11434" in (base_url or "")

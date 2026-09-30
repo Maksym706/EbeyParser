@@ -3,10 +3,12 @@ import { html, useEffect, useState } from "../../lib/html.js";
 import { api } from "../../lib/api.js";
 import { everyLabel, number } from "../../lib/format.js";
 import { useDebounced } from "../../lib/hooks.js";
-import { Icon, Button, Toggle, NumberInput, Input, Select, Segmented, Slider, SettingRow, Meter, HelpTip, SecretInput, TestResult, Badge, ChipInput, IconButton } from "../../ui/index.js";
+import { Icon, Button, Toggle, NumberInput, Input, Select, Segmented, Slider, SettingRow, Meter, HelpTip, SecretInput, TestResult, Badge, ChipInput, IconButton, Skeleton, toast } from "../../ui/index.js";
 import { LocationPicker, RadiusSlider } from "../../setup/where.js";
 import { StrategyCards, ExampleBox, DEFAULT_PRESETS, detectStrategy } from "../../setup/money.js";
 import { AiConnect } from "../../setup/ai.js";
+import { WherePicker, CloudConnect, useCloud } from "../../setup/cloud.js";
+import { refreshMonitor } from "../../shell/monitor.js";
 import { Group } from "./form.js";
 import { ScoutGroup, ModelsGroup } from "./scout.js";
 
@@ -218,6 +220,50 @@ function ReferencePrices({ form }) {
 }
 
 // ============================================================ 3. Нейросеть
+/** Settings → Нейросеть → «Где работает нейросеть» (docs/design/CLOUD_AI.md): cloud / computer / both. */
+function WhereGroup({ form, cloud, mode, setWhere }) {
+  const savedMode = cloud.data ? cloud.data.mode : null;
+  const [busy, setBusy] = useState(false);
+  const done = () => {
+    cloud.reload();
+    form.reload();
+    refreshMonitor();
+  };
+  const toLocal = async () => {
+    setBusy(true);
+    try {
+      await api.put("/ai/cloud", { mode: "local" });
+      toast.success("Нейросеть снова работает на компьютере");
+      done();
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return html`<${Group}
+    id="cloud"
+    title="Где работает нейросеть"
+    description="Бесплатное облако не требует видеокарты: нужен только ключ. На компьютере — без интернета и лимитов."
+    icon="cloud"
+    tone="blue"
+  >
+    ${cloud.error && !cloud.data
+      ? html`<${TestResult} state="fail" title=${cloud.error.message} details=${cloud.error.details} />`
+      : !cloud.data
+        ? html`<div class="stack" style=${{ "--gap": "8px" }}><${Skeleton} h=${88} radius="var(--r-lg)" /><${Skeleton} w="60%" h=${14} /></div>`
+        : html`<${WherePicker} value=${mode} onChange=${setWhere} />`}
+    ${cloud.data && mode !== "local" && html`<${CloudConnect} mode=${mode} data=${cloud.data} onSaved=${done} />`}
+    ${cloud.data &&
+    mode === "local" &&
+    savedMode !== "local" &&
+    html`<div class="cloud-switch">
+      <p class="muted-line">Сейчас нейросеть работает в облаке. Перейти на модель этого компьютера?</p>
+      <${Button} variant="primary" icon="cpu" loading=${busy} onClick=${toLocal}>Перейти на компьютер<//>
+    </div>`}
+  <//>`;
+}
+
 export function AiSection({ form }) {
   const d = form.draft;
   const ai = d.ai;
@@ -225,6 +271,10 @@ export function AiSection({ form }) {
   const secrets = (form.settings && form.settings.secrets) || {};
   const [claudeKey, setClaudeKey] = useState("");
   const [keyState, setKeyState] = useState(null);
+  const cloud = useCloud();
+  const [where, setWhere] = useState(null);
+  const mode = where || (cloud.data ? cloud.data.mode : "local");
+  const local = mode === "local";
   const saveKey = async () => {
     try {
       await api.put("/secrets", { anthropic_api_key: claudeKey.trim() });
@@ -236,7 +286,10 @@ export function AiSection({ form }) {
     }
   };
   return html`
-    <${Group}
+    <${WhereGroup} form=${form} cloud=${cloud} mode=${mode} setWhere=${setWhere} />
+
+    ${local &&
+    html`<${Group}
       title="Локальная нейросеть"
       description="Проверяет фото и описание — бесплатно, на твоём компьютере."
       icon="scan-eye"
@@ -245,8 +298,8 @@ export function AiSection({ form }) {
       <p class="muted-line">
         Сейчас: ${ai.enabled ? html`<b>включена</b> · ${ai.provider === "ollama" ? "Ollama" : ai.provider === "anthropic" ? "Claude" : "LM Studio"} · <code>${ai.model}</code>` : html`<b>выключена</b> — уведомления приходят с пометкой ⚠ «фото не проверены»`}
       </p>
-      <${AiConnect} save=${true} current=${{ model: ai.model, enabled: form.settings && form.settings.ai && form.settings.ai.enabled }} onDone=${() => form.reload()} />
-    <//>
+      <${AiConnect} save=${true} current=${{ model: ai.model, enabled: form.settings && form.settings.ai && form.settings.ai.enabled }} onDone=${() => { form.reload(); cloud.reload(); }} />
+    <//>`}
 
     <${ScoutGroup} form=${form} />
     <${ModelsGroup} form=${form} />
@@ -272,7 +325,7 @@ export function AiSection({ form }) {
       <${SettingRow} label="Уменьшать фото до" help="Меньше — быстрее" error=${form.err("ai.image_max_side")}>
         ${(id) => html`<${NumberInput} id=${id} ...${form.bind("ai.image_max_side")} suffix="px" min=${128} max=${4096} />`}
       <//>
-      <${Advanced} title="Другой сервер">
+      ${local && html`<${Advanced} title="Другой сервер">
         <${SettingRow} label="Сервер">
           ${(id) => html`<${Select}
             id=${id}
@@ -290,7 +343,7 @@ export function AiSection({ form }) {
         <${SettingRow} label="Модель" error=${form.err("ai.model")}>
           ${(id) => html`<${Input} id=${id} ...${form.bind("ai.model")} class="mono" placeholder="название модели из LM Studio или Ollama" />`}
         <//>
-      <//>
+      <//>`}
     <//>
 
     <${Group}

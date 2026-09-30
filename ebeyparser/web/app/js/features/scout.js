@@ -80,6 +80,7 @@ export const SCOUT_STATE = {
   behind: { tone: "haggle", label: "Не успевает всё" },
   down: { tone: "danger", label: "Не отвечает" },
   too_small: { tone: "haggle", label: "Модель слишком маленькая" },
+  quota: { tone: "haggle", label: "Бережёт лимит облака" },
 };
 
 export function scoutState(s) {

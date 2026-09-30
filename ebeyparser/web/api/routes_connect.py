@@ -89,16 +89,22 @@ async def ai_detect(ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
         })
     vision = [s for s in out if s["vision_models"]]
     ai = ctx.config.ai
+    from ...ai.cloud import cloud_kind
+
+    # the model on THIS computer: the main one, or the cloud's local stand-in (ai.fallback)
+    local = ai if not cloud_kind(ai) else (ai.fallback if ai.fallback.base_url.strip() and ai.fallback.model.strip()
+                                           else None)
     if vision:
         variant, text = "found", f"Нашёл {vision[0]['name']} · модель видит фото"
     elif out:
         variant = "no_vision"
         text = (f"{out[0]['name']} работает, но нет модели, которая понимает фото — скачай Qwen3.5 9B"
                 " (для видеокарты 6–8 ГБ — Qwen3.5 4B)")
-    elif ai.enabled and ai.model and ai.provider in ("openai", "ollama"):
+    elif local is not None and local.model and local.provider in ("openai", "ollama") and (
+            ai.enabled or local is not ai):
         # already set up, the server is just closed: not the install guide
         variant = "not_running"
-        text = ai_problem(ai.provider, ai.base_url, ai.model, "", server_ok=False)
+        text = ai_problem(local.provider, local.base_url, local.model, "", server_ok=False, cloud="-")
     else:
         variant, text = "none", "LM Studio и Ollama не найдены — установи LM Studio и запусти сервер"
     best = vision[0] if vision else (out[0] if out else None)
@@ -190,11 +196,12 @@ def sample_image() -> bytes:
     return buf.getvalue()
 
 
-def _llm(ctx: ApiContext, settings: Any) -> Any:
+def _llm(ctx: ApiContext, settings: Any, purpose: str = "vision") -> Any:
     if settings.provider in ("openai", "ollama"):
         from ...ai.client import VisionLLM
 
-        return VisionLLM(settings, transport=ctx.http_transport)
+        # a user's «Проверить» on a cloud endpoint: counted in the quota, never refused by the day plan
+        return VisionLLM(settings, transport=ctx.http_transport, purpose=purpose, force_quota=True)
     from ...ai.claude import make_llm
 
     return make_llm(settings)
@@ -262,8 +269,14 @@ async def ai_test(body: AiTestIn | None = None, ctx: ApiContext = Depends(get_ct
             await llm.aclose()
         except Exception:  # noqa: BLE001
             pass
-    if result["ok"] and body.save:
-        ctx.write_values({"ai.enabled": True, "ai.provider": provider, "ai.base_url": base_url,
+    if result["ok"] and body.save and body.save_as == "fallback":
+        # «Облако + компьютер про запас»: this local model stands in while the cloud is limited
+        ctx.write_values({"ai.fallback.enabled": True, "ai.fallback.provider": provider,
+                          "ai.fallback.base_url": base_url, "ai.fallback.model": result["resolved_model"] or model},
+                         reason="ai")
+        result["saved"] = True
+    elif result["ok"] and body.save:
+        ctx.write_values({"ai.enabled": True, "ai.provider": provider, "ai.base_url": base_url, "ai.cloud": "",
                           "ai.model": result["resolved_model"] or model}, reason="ai")
         ctx.mark_done("ai")
         result["saved"] = True
@@ -320,7 +333,7 @@ async def ai_scout_test(body: AiTestIn | None = None, ctx: ApiContext = Depends(
         result["error_ru"] = result["message_ru"] = _too_small_ru(model, provider, suggested)
         return result
     try:
-        llm = _llm(ctx, settings)
+        llm = _llm(ctx, settings, "triage")
     except Exception as exc:  # noqa: BLE001
         human = humanize(exc, "ai", host=base_url)
         result["error_ru"] = result["message_ru"] = human.message_ru

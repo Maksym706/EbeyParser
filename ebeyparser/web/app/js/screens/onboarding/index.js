@@ -18,7 +18,7 @@ export const STEPS = [
   { key: "what", title: "Что искать", subtitle: "Категории, где чаще всего бывают выгодные вещи", icon: "layout-grid", component: WhatStep },
   { key: "money", title: "Деньги", subtitle: "Сколько тратить и насколько выгодным должно быть предложение", icon: "wallet", component: MoneyStep },
   { key: "wishlist", title: "Для себя", heading: "Ищешь что-то для себя?", subtitle: "Например, железо для AI-сервера. Буду следить и скажу, когда цена ниже рынка.", icon: "heart", optional: true, component: WishlistStep },
-  { key: "ai", title: "Нейросеть", subtitle: "Смотрит фото и описание — бесплатно и прямо на твоём компьютере", icon: "scan-eye", tone: "blue", optional: true, component: AiStep },
+  { key: "ai", title: "Нейросеть", subtitle: "Читает объявления и смотрит фото — бесплатно: в облаке или на твоём компьютере", icon: "scan-eye", tone: "blue", optional: true, component: AiStep },
   { key: "telegram", title: "Telegram", subtitle: "Самый быстрый способ узнать о находке — сообщение с фото прямо в телефон", icon: "send", tone: "blue", optional: true, component: TelegramStep },
   { key: "ebay", title: "eBay", heading: "Добавить eBay?", subtitle: "Аукционы и «Sofort-Kaufen» с eBay.de — через официальный API, бесплатно. Можно пропустить.", icon: "gavel", tone: "violet", optional: true, component: EbayStep },
   { key: "done", title: "Готово", heading: "Всё готово", subtitle: "Проверь, что получилось, и запускай", icon: "rocket", component: DoneStep },
@@ -140,7 +140,9 @@ export default function OnboardingScreen({ params }) {
   const onNext = async () => {
     if (step.key === "money") updateDraft({ money_seen: true });
     // AI found with a model that sees photos: «Дальше» accepts it — no «Продолжить без нейросети?» (P1-6)
-    if (step.key === "ai" && !draft.ai.done && draft.ai.found && draft.ai.found.vision) {
+    // (only when the user stays on «На моём компьютере»: the cloud has its own «Подключить»)
+    const aiWhere = draft.ai.where || (draft.ai.found ? "local" : "cloud");
+    if (step.key === "ai" && !draft.ai.done && aiWhere === "local" && draft.ai.found && draft.ai.found.vision) {
       const f = draft.ai.found;
       updateDraft({ ai: { ...draft.ai, done: true, skipped: false, model: f.model, auto: true } });
       api.patch("/settings", { ai: { enabled: true, provider: f.provider, base_url: f.base_url, model: f.model } }).catch((e) =>

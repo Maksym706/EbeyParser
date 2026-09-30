@@ -27,6 +27,9 @@ ALLOWED_LINK_HOSTS = {
     "www.kleinanzeigen.de",
     "myaccount.google.com",
     "tailscale.com",
+    "openrouter.ai",  # free cloud AI: «Получить ключ», credits, privacy settings
+    "build.nvidia.com",
+    "github.com",  # OmniRoute (self-hosted gateway)
 }
 URL_RE = re.compile(r"""(?:https?:)?//([a-z0-9.-]+\.[a-z]{2,})(?=[/"'`\s)?#:]|$)""", re.I)
 

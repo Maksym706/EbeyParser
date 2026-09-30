@@ -24,6 +24,12 @@ interest score is pure noise (as measured for Qwen3.5 2B, docs/design/AI_MODELS.
 Speed is simulated too (tokens/s of a GPU or a 4-core CPU): overflow, the hourly cap and the
 "candidates" mode are exercised. Stage C (photos) is a gem-aware oracle vision fake.
 
+Cloud profiles (docs/design/CLOUD_AI.md): `cloud_free50` / `cloud_free1000` put the scout AND the photo
+check behind the real quota limiter of ai/cloud.py with OpenRouter's free limits — 20 requests a
+minute, 50 (or 1000 after $10 of credits) a day, random upstream 429s — on the simulated clock. The
+monitor then paces the scout over the day, switches it to «только непонятные» when the quota runs
+low, keeps photos of the top candidates first and never sends eBay ads to the cloud.
+
     python -m ebeyparser.benchmark_gems --seed 1 --n 400
 """
 
@@ -88,7 +94,19 @@ HARDWARE: dict[str, tuple[float, float]] = {
     "gpu_7b": (1200.0, 50.0),  # 7B Q4 on an RTX 3060 12GB
     "cpu_3b": (45.0, 9.0),  # 3B Q4 on a 4-core desktop CPU
     "cpu_1.5b": (110.0, 20.0),  # 1.5B Q4 on a 4-core desktop CPU
+    # free cloud (a big MoE model behind a shared API): fast tokens, but a quota (CLOUD_PROFILES)
+    "cloud_free50": (3000.0, 120.0),
+    "cloud_free1000": (3000.0, 120.0),
+    "cloud_nvidia": (2500.0, 90.0),
 }
+# cloud hardware -> (requests per minute, requests per UTC day, share of calls answered with a 429)
+CLOUD_PROFILES: dict[str, tuple[int, int, float]] = {
+    "cloud_free50": (20, 50, 0.12),  # OpenRouter free, < $10 of credits ever bought
+    "cloud_free1000": (20, 1000, 0.12),  # OpenRouter free after a one-time $10
+    "cloud_nvidia": (40, 0, 0.05),  # the NVIDIA API catalog: ~40 a minute, no daily cap
+}
+CLOUD_TEXT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+CLOUD_VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
 MODE_HARDWARE = {"oracle": "gpu_7b", "noisy": "gpu_7b", "weak": "cpu_3b"}
 # the model research (AI_MODELS.md §4): a small model's interest barely separates gems from junk
 # (AUC 0.43 for Qwen3.5 2B) — the weak model's interest is pure noise here
@@ -519,6 +537,93 @@ class SimTriageLLM:
 
 
 # ---------------------------------------------------------------------------
+# The free cloud: one quota for the scout and the photos, random upstream 429s
+# ---------------------------------------------------------------------------
+
+
+# Retry-After of an upstream 429 (seconds): mostly a short breath, sometimes a minute
+RETRY_AFTER_CHOICES = (1, 2, 2, 3, 5, 10, 30, 60)
+CLOUD_PHOTO_SECONDS = 3.0  # one photo check on a free 12B VL endpoint (answer + upload of 3 photos)
+
+
+class _CloudClient:
+    """What the monitor reads off a cloud client: the kind, the quota, the last quota refusal."""
+
+    def __init__(self, quota: Any, rng: random.Random, p429: float, clock: SimClock | None = None,
+                 seconds: float = 0.0):
+        self.cloud = "openrouter"
+        self.quota = quota
+        self.rng = rng
+        self.p429 = p429
+        self.clock = clock
+        self.seconds = seconds  # simulated time one call takes (the scout's is counted by SimTriageLLM)
+        self.last_limited: Exception | None = None
+        self.calls_429 = 0
+        self.requests = 0  # requests the quota let through (all days of the simulation)
+
+    async def gate(self, purpose: str) -> None:
+        """Like VisionLLM._send: the quota first; an upstream 429 is retried once after a short pause,
+        a long one fails fast (CloudLimited) and the caller takes the usual "AI down" path."""
+        from .ai.cloud import CloudLimited
+
+        self.last_limited = None
+        try:
+            for attempt in range(2):
+                await self.quota.acquire(purpose)
+                self.requests += 1
+                if self.rng.random() >= self.p429:
+                    if self.clock is not None:
+                        self.clock.advance(self.seconds)
+                    self.quota.note_success()
+                    return
+                self.calls_429 += 1
+                if self.clock is not None:
+                    self.clock.advance(0.3)
+                wait = self.quota.note_429({"retry-after": str(self.rng.choice(RETRY_AFTER_CHOICES))})
+                if attempt == 0 and wait <= self.quota.max_wait:
+                    continue
+                raise self.quota.blocked(purpose) or CloudLimited("Облако просит подождать", reason="429")
+        except CloudLimited as exc:
+            self.last_limited = exc
+            raise
+
+
+class SimCloudLLM(_CloudClient):
+    """The scout's model on a free cloud endpoint (SimTriageLLM behind the quota)."""
+
+    def __init__(self, inner: SimTriageLLM, quota: Any, *, seed: int, p429: float):
+        super().__init__(quota, random.Random(f"{seed}:cloud-scout"), p429)
+        self.inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+    async def chat_json(self, system: str, user: str, images: list[bytes] | None = None,
+                        schema: dict | None = None) -> str:
+        await self.gate("triage")
+        return await self.inner.chat_json(system, user, images, schema)
+
+    async def health(self) -> dict:
+        return await self.inner.health()
+
+    async def aclose(self) -> None:
+        return None
+
+
+def make_cloud_quota(hardware: str, clock: SimClock) -> Any:
+    from .ai.cloud import QuotaLimiter
+
+    rpm, daily, _ = CLOUD_PROFILES[hardware]
+    kind = "nvidia" if "nvidia" in hardware else "openrouter"
+
+    async def sleep(seconds: float) -> None:
+        clock.advance(seconds)
+
+    return QuotaLimiter(f"bench-{hardware}", kind=kind, rpm=rpm, daily_limit=daily, clock=clock, wall=clock,
+                        sleep=sleep, rng=random.Random(7))
+
+
+# ---------------------------------------------------------------------------
 # Vision fake that also knows the gems (stage C)
 # ---------------------------------------------------------------------------
 
@@ -574,6 +679,31 @@ class GemVision(OracleEvaluator):
                            variant={"model": p.model}, defects=[], locked=False, stock_photos=False)
 
 
+class CloudGemVision(GemVision):
+    """The photo check on the same free cloud quota (photos of the top candidates come first)."""
+
+    def __init__(self, gm: GemMarket, mode: str, quota: Any, *, seed: int, p429: float, clock: SimClock | None = None):
+        super().__init__(gm, mode, seed=seed)
+        self.llm = _CloudClient(quota, random.Random(f"{seed}:cloud-vision"), p429, clock, CLOUD_PHOTO_SECONDS)
+        self.limited = 0
+
+    async def evaluate(self, listing: Listing, images: list[bytes], *, purpose: str = "resale",
+                       estimate: Any = None, target_price: float | None = None, **kw: Any) -> AIVerdict:
+        from .ai.cloud import CloudLimited, local_only_reason
+
+        try:
+            if local_only_reason():  # an eBay ad: never to the cloud
+                raise CloudLimited("eBay-объявления в облако не отправляю", reason="ebay")
+            await self.llm.gate("vision")
+        except CloudLimited as exc:
+            self.llm.last_limited = exc
+            self.limited += 1
+            return AIVerdict(verdict="maybe", confidence=0.0, reasoning=f"Нейросеть не проверила фото: {exc}",
+                             model="cloud")
+        return await super().evaluate(listing, images, purpose=purpose, estimate=estimate, target_price=target_price,
+                                      **kw)
+
+
 # ---------------------------------------------------------------------------
 # Runner and scoring
 # ---------------------------------------------------------------------------
@@ -615,15 +745,25 @@ class GemsResult:
     vision_calls: int
     details: int
     elapsed_s: float
+    cloud_requests: int = 0  # cloud profiles: requests the quota let through (scout + photos)
+    cloud_429: int = 0
+    cloud_limited: int = 0  # photo checks the quota refused (the "фото не проверены" path)
+    cloud_daily_limit: int = 0
+    cloud_profile: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
-def gems_config(*, scout: bool, mode: str, overrides: dict[str, Any] | None = None) -> Any:
+def gems_config(*, scout: bool, mode: str, overrides: dict[str, Any] | None = None,
+                hardware: str | None = None) -> Any:
     extra: dict[str, Any] = {"ai": {"scout": {"enabled": scout, "mode": "auto", "batch_size": 8,
                                               "max_per_hour": 2000 if MODE_HARDWARE[mode] == "gpu_7b" else 500,
                                               "pass_share": 0.5}}}
+    if hardware in CLOUD_PROFILES:  # a big cloud model: 16-20 ads per call (triage.batch_for_model)
+        extra["ai"]["scout"].update(model=CLOUD_TEXT_MODEL, batch_size=0, max_batch=0, max_tokens=2600,
+                                    max_per_hour=20000)
+        extra["ai"].update(cloud="openrouter", model=CLOUD_VISION_MODEL)
     searches_extra = [{"name": "Категория: PCs", "query": "", "category_id": PC_CATEGORY, "location": "Berlin",
                        "radius_km": 30}]
     cfg = benchmark_config(category_scan=True, ai_enabled=True, ebay_api=True, overrides=extra | (overrides or {}))
@@ -641,15 +781,23 @@ async def run_gems_async(seed: int = 1, n_listings: int = 400, mode: str = "orac
     started = time.perf_counter()
     gm = build_gem_market(seed, n_listings)
     market = gm.market
-    config = gems_config(scout=scout, mode=mode, overrides=config_overrides)
+    config = gems_config(scout=scout, mode=mode, overrides=config_overrides, hardware=hardware)
     db = Database()
     ka = FakeKleinanzeigen(market)
     sold = FakeEbaySold(market)
     api = FakeEbayAPI(market)
-    vision = GemVision(gm, mode, seed=seed)
     clock = SimClock()
     llm = SimTriageLLM(gm, mode, seed=seed, clock=clock, hardware=hardware)
-    engine = TriageEngine.from_config(llm, config.ai.scout, clock=clock, wall=clock) if scout else None
+    quota: Any = None
+    scout_llm: Any = llm
+    if hardware in CLOUD_PROFILES:
+        quota = make_cloud_quota(hardware, clock)
+        p429 = CLOUD_PROFILES[hardware][2]
+        vision: GemVision = CloudGemVision(gm, mode, quota, seed=seed, p429=p429, clock=clock)
+        scout_llm = SimCloudLLM(llm, quota, seed=seed, p429=p429)
+    else:
+        vision = GemVision(gm, mode, seed=seed)
+    engine = TriageEngine.from_config(scout_llm, config.ai.scout, clock=clock, wall=clock) if scout else None
     notifier = CountingNotifier()
     monitor = Monitor(config, db, scraper=ka, ebay=sold, ebay_api=api, evaluator=vision,  # type: ignore[arg-type]
                       notifiers=[notifier], scout=engine)
@@ -667,8 +815,16 @@ async def run_gems_async(seed: int = 1, n_listings: int = 400, mode: str = "orac
             summaries.append(await monitor.run_once())
             clock.advance(max(0.0, interval - (clock() - before)))  # the next pass starts an interval later
         await monitor.aclose()
-    return _score_gems(gm, scored, db, config, summaries, llm, vision, ka, api, seed, n_listings, mode, scout,
-                       llm.hardware, time.perf_counter() - started)
+    result = _score_gems(gm, scored, db, config, summaries, llm, vision, ka, api, seed, n_listings, mode, scout,
+                         llm.hardware, time.perf_counter() - started)
+    if quota is not None:
+        clients = [vision.llm] + ([scout_llm] if isinstance(scout_llm, SimCloudLLM) else [])
+        result.cloud_requests = sum(c.requests for c in clients)
+        result.cloud_429 = sum(c.calls_429 for c in clients)
+        result.cloud_limited = getattr(vision, "limited", 0)
+        result.cloud_daily_limit = CLOUD_PROFILES[llm.hardware][1]
+        result.cloud_profile = True
+    return result
 
 
 def run_gems(seed: int = 1, n_listings: int = 400, mode: str = "oracle", **kwargs: Any) -> GemsResult:
@@ -768,13 +924,20 @@ def _pct(x: float | None) -> str:
 
 def format_comparison(rows: list[GemsResult]) -> str:
     lines = ["Скрытые находки: только скрипт против ИИ-разведчика", "",
-             f"{'режим':<10}{'разведчик':<11}{'точность':>9}{'полнота':>9}{'находки: buy':>14}{'в ленте':>9}"
+             f"{'режим':<10}{'разведчик':<21}{'точность':>9}{'полнота':>9}{'находки: buy':>14}{'в ленте':>9}"
              f"{'ловушки':>9}{'нейросеть нашла':>17}{'прочитал/не успел':>19}"]
     for r in rows:
         lines.append(
-            f"{r.mode:<10}{('да, ' + r.hardware) if r.scout else 'нет':<11}{_pct(r.precision):>9}{_pct(r.recall):>9}"
+            f"{r.mode:<10}{('да, ' + r.hardware) if r.scout else 'нет':<21}{_pct(r.precision):>9}{_pct(r.recall):>9}"
             f"{f'{r.gem_buys}/{r.gem_true_deals}':>14}{_pct(r.gem_seen_rate):>9}{r.trap_buys:>9}"
             f"{r.found_by_scout_buys:>17}{f'{r.scout_read}/{r.scout_overflow}':>19}")
+    cloud = [r for r in rows if r.cloud_profile]
+    if cloud:
+        lines.append("")
+        lines.append("Облако: запросов за симуляцию / лимит в день · ответов 429 · фото не проверены из-за лимита")
+        for r in cloud:
+            lines.append(f"  {r.mode:<8}{r.hardware:<16}{r.cloud_requests:>5} / {r.cloud_daily_limit or '—':<6}"
+                         f"{r.cloud_429:>6}{r.cloud_limited:>8}")
     lines.append("")
     for r in rows:
         if r.false_buys:

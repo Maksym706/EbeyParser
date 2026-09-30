@@ -153,6 +153,10 @@ class SecretsIn(ApiModel):
     ebay_client_secret: str | None = None
     ebay_oauth_token: str | None = None
     anthropic_api_key: str | None = None
+    openrouter_api_key: str | None = None
+    nvidia_api_key: str | None = None
+    omniroute_api_key: str | None = None
+    cloud_api_key: str | None = None
 
 
 class AccessIn(ApiModel):
@@ -175,6 +179,44 @@ class AiTestIn(ApiModel):
     sample: bool = True  # run the model on the bundled sample ad (photo + text), not just "is it there"
     timeout_seconds: float = Field(default=180.0, ge=5, le=900)
     save: bool = False  # on success write provider/base_url/model (and enable the AI)
+    # "fallback": the local model is the stand-in of a cloud endpoint (ai.fallback), the cloud stays
+    save_as: Literal["main", "fallback"] = "main"
+
+
+CloudProviderIn = Literal["openrouter", "nvidia", "omniroute", "custom"]
+
+
+class CloudTestIn(ApiModel):
+    provider: CloudProviderIn = "openrouter"
+    api_key: str | None = Field(default=None, max_length=400)  # empty: the saved one
+    base_url: str | None = Field(default=None, max_length=300)  # empty: the provider's address
+    text_model: str | None = Field(default=None, max_length=200)  # empty: the recommended one
+    vision_model: str | None = Field(default=None, max_length=200)
+    triage: bool = True  # 5 demo ads through the scout (latency, quality)
+    photo: bool = False  # + one demo photo through the vision model
+    save_key: bool = False  # the key works -> store it in .env
+    timeout_seconds: float = Field(default=90.0, ge=5, le=600)
+
+
+class CloudFallbackIn(ApiModel):
+    provider: Literal["openai", "ollama"] = "openai"
+    base_url: str = Field(default="", max_length=300)
+    model: str = Field(default="", max_length=200)
+    text_model: str = Field(default="", max_length=200)  # the scout's local model ("" = model)
+
+
+class CloudSaveIn(ApiModel):
+    mode: Literal["cloud", "hybrid", "local"]
+    provider: CloudProviderIn = "openrouter"
+    api_key: str | None = Field(default=None, max_length=400)
+    base_url: str | None = Field(default=None, max_length=300)
+    text_model: str | None = Field(default=None, max_length=200)
+    vision_model: str | None = Field(default=None, max_length=200)
+    rpm: int | None = Field(default=None, ge=0, le=100000)
+    daily_limit: int | None = Field(default=None, ge=0, le=10000000)
+    fallback: CloudFallbackIn | None = None
+    send_ebay: bool | None = None
+    scout: bool = True  # the scout reads ads with text_model
 
 
 class TelegramTokenIn(ApiModel):

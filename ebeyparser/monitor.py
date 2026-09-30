@@ -31,6 +31,7 @@ from typing import Any, Callable
 
 import httpx
 
+from .ai import cloud as cloud_ai
 from .ai import scout as scout_ai
 from .ai.claude import make_llm
 from .ai.evaluator import AIEvaluator, same_variant_comparables
@@ -283,6 +284,9 @@ class Monitor:
         # AI scout (docs/design/AI_SCOUT.md): a small text model reads every new ad first
         self._scout = scout
         self._scout_llm: Any = None
+        # a cloud scout's local stand-in (ai.scout.fallback / ai.fallback) with its own batch sizes
+        self._scout_local: TriageEngine | None = None
+        self._scout_local_llm: Any = None
         self._scout_items: dict[str, TriageItem] = {}  # this pass: ad id -> the scout's reading
         self._scout_plans: dict[str, Any] = {}  # ad id -> ai.scout.ScoutPlan (priced reading)
         self._scout_deadline: float | None = None  # engine clock: end of this pass's scout time
@@ -296,6 +300,9 @@ class Monitor:
         self._comps_cache: OrderedDict[str, tuple[float, PriceEstimate]] = OrderedDict()
         self._ai_answered = 0  # AI calls of this pass that got a real answer ...
         self._ai_failed = 0  # ... and that failed (LM Studio down)
+        self._ai_limited = 0  # ... and that the free cloud quota did not allow (docs/design/CLOUD_AI.md)
+        self._ai_limited_ru = ""
+        cloud_ai.registry().attach(db)  # cloud quota counters survive restarts (kv_state)
         self._upkeep_done = False
         self._ebay_blocked = False
         self._running = False
@@ -391,21 +398,55 @@ class Monitor:
         if not self._injected["scout"]:
             self._scout = None
             self._scout_llm = _close_soon(self._scout_llm)
+            self._scout_local = None
+            self._scout_local_llm = _close_soon(self._scout_local_llm)
 
     def _scout_llm_settings(self) -> LLMSettings:
         """The scout's endpoint: its own (the always-on small model) or, left empty, the ai one."""
-        ai, sc = self.config.ai, self.config.ai.scout
-        own = bool(sc.base_url.strip())
-        return LLMSettings(
-            provider=sc.provider if own else ai.provider,
-            base_url=sc.base_url.strip() if own else ai.base_url,
-            model=(sc.model or "").strip() or ai.model,
-            api_key=(sc.api_key if own else ai.api_key) or "",
-            max_images=0,
-            timeout_seconds=sc.timeout_seconds,
-            temperature=sc.temperature,
-            max_tokens=sc.max_tokens,
-        )
+        return scout_llm_settings(self.config)
+
+    def _scout_fallback(self) -> LLMSettings | None:
+        return scout_fallback_settings(self.config)
+
+    def _vision_fallback(self) -> LLMSettings | None:
+        return vision_fallback_settings(self.config)
+
+    def _scout_quota(self, engine: Any = None) -> Any:
+        """The cloud quota of the scout's (main) endpoint, or None for a local scout."""
+        engine = engine if engine is not None else self._scout
+        llm = getattr(engine, "llm", None) if engine is not None else None
+        quota = getattr(llm, "quota", None)
+        if quota is not None or engine is not None:
+            return quota
+        return cloud_ai.registry().for_settings(self._scout_llm_settings())
+
+    def _scout_pick(self, *, ebay: bool) -> Any:
+        """The engine for these ads: the cloud one while it may be called, its local stand-in while
+        the cloud is limited — and for eBay ads, which never go to the cloud (eBay's API license,
+        ai.cloud_send_ebay). None = the script path."""
+        primary, local = self._scout, self._scout_local
+        quota = self._scout_quota()
+        if quota is None:
+            return primary
+        if ebay and not self.config.ai.cloud_send_ebay:
+            return local
+        if local is not None and quota.blocked("triage") is not None:
+            return local
+        return primary
+
+    def _vision_llm(self) -> Any:
+        """The photo check's client (the evaluator's own, also when a test injects one)."""
+        return getattr(self._evaluator, "llm", None) or self._llm
+
+    def _vision_policy(self, listing: Listing) -> str:
+        """May the photo model see this ad? "" = yes; "local" = only the local stand-in (an eBay
+        ad and a cloud endpoint); "none" = no model may (an eBay ad, the cloud without a stand-in)."""
+        if listing.source != "ebay" or self.config.ai.cloud_send_ebay:
+            return ""
+        llm = self._vision_llm()
+        if not getattr(llm, "cloud", ""):
+            return ""
+        return "local" if isinstance(llm, cloud_ai.CloudRouter) else "none"
 
     def _scout_too_small(self) -> bool:
         """No triage with a model under ~2B (docs/design/AI_MODELS.md §4: the 0.8B renumbered and
@@ -439,12 +480,12 @@ class Monitor:
             )
         ai = self.config.ai
         if self._evaluator is None and ai.enabled and not self._injected["evaluator"]:
-            self._llm = make_llm(ai)
+            self._llm = make_llm(ai, purpose="vision", fallback=self._vision_fallback())
             self._evaluator = AIEvaluator(self._llm, ai)
         so = ai.second_opinion
         if self._second is None and so.enabled and not self._injected["second"]:
             try:
-                self._second_llm = make_llm(so)
+                self._second_llm = make_llm(so, purpose="second_opinion")
                 self._second = AIEvaluator(self._second_llm, so)
             except Exception as exc:  # e.g. anthropic package missing
                 log.warning("Second opinion disabled: %s", exc)
@@ -453,7 +494,13 @@ class Monitor:
             try:
                 settings = self._scout_llm_settings()
                 self._scout_llm = make_scout_llm(settings)
-                self._scout = TriageEngine.from_config(self._scout_llm, sc.model_copy(update={"model": settings.model}))
+                self._scout = TriageEngine.from_config(self._scout_llm, sc.model_copy(
+                    update={"model": settings.model, "max_tokens": settings.max_tokens}))
+                local = self._scout_fallback()
+                if local is not None:
+                    self._scout_local_llm = make_scout_llm(local)
+                    self._scout_local = TriageEngine.from_config(self._scout_local_llm,
+                                                                 sc.model_copy(update={"model": local.model}))
             except Exception as exc:  # e.g. anthropic package missing: the script path works as before
                 log.warning("AI scout disabled: %s", exc)
         if self._notifiers is None:
@@ -462,7 +509,7 @@ class Monitor:
             )
 
     async def aclose(self) -> None:
-        for name in ("_llm", "_second_llm", "_scout_llm", "_ebay_api"):
+        for name in ("_llm", "_second_llm", "_scout_llm", "_scout_local_llm", "_ebay_api"):
             obj = getattr(self, name)
             if obj is not None:
                 await obj.aclose()
@@ -482,7 +529,7 @@ class Monitor:
             return {**base, "ok": False, "enabled": False, "model_available": False,
                     "error": "Нейросеть выключена в настройках"}
         try:
-            llm = self._llm or make_llm(ai)
+            llm = self._llm or make_llm(ai, purpose="vision", fallback=self._vision_fallback())
         except Exception as exc:
             return {**base, "ok": False, "enabled": True, "model_available": False, "error": str(exc)}
         try:
@@ -570,13 +617,14 @@ class Monitor:
         self._ebay_blocked = False
         self._rate_limited = {}
         self._second_calls = 0
-        self._ai_answered = self._ai_failed = 0
+        self._ai_answered = self._ai_failed = self._ai_limited = 0
         summary = self.db.start_run()
         digest: list[DealView] = []
         self._emit("run_started", {"run_id": summary.id, "started_at": summary.started_at.isoformat(),
                                    "searches": len(searches)})
         try:
             self._ensure_components()
+            await self._cloud_probe()
             self._upkeep()
             self._prune_history()
             self._scout_begin_pass(len(searches))
@@ -1198,17 +1246,24 @@ class Monitor:
         the market price now comes from the AI's own search query. A bundle priced by its
         parts shows no comparables (the parts are not "the same variant" as the whole)."""
         assert self._evaluator is not None
-        images = await self._images(listing, source, self.config.ai.max_images)
+        policy = self._vision_policy(listing)  # eBay ads never go to a cloud endpoint
+        images = [] if policy == "none" else await self._images(listing, source, self.config.ai.max_images)
         by_parts = plan is not None and plan.kind in scout_ai.BUNDLE_KINDS and estimate is plan.estimate
         shown = [] if by_parts else prompt_comparables(None, _comparables_for_ai(estimate))
-        verdict = await self._evaluator.evaluate(
-            listing, images, purpose=search.purpose,
-            estimate=estimate if estimate.market_price is not None else None,
-            target_price=search.target_price,
-            **self._comparables_kwarg(self._evaluator, shown),
-        )
+        with cloud_ai.local_only("ebay" if policy else ""):
+            verdict = await self._evaluator.evaluate(
+                listing, images, purpose=search.purpose,
+                estimate=estimate if estimate.market_price is not None else None,
+                target_price=search.target_price,
+                **self._comparables_kwarg(self._evaluator, shown),
+            )
+        limited = getattr(self._vision_llm(), "last_limited", None)
         if verdict.confidence > 0:
             self._ai_answered += 1
+        elif limited is not None:  # the free cloud quota / the eBay rule, not a broken server
+            if getattr(limited, "reason", "") != "ebay":
+                self._ai_limited += 1
+                self._ai_limited_ru = getattr(limited, "message_ru", "") or str(limited)
         else:
             self._ai_failed += 1
         estimate = self._variant_checked(estimate, same_variant_comparables(verdict, shown) if shown else None)
@@ -1562,7 +1617,10 @@ class Monitor:
         script is blind); ai.scout.mode forces one of them."""
         sc = self.config.ai.scout
         mode = sc.mode
-        if mode == "auto" and self._scout is not None:
+        quota = self._scout_quota() if self._scout is not None else None
+        if mode == "auto" and quota is not None and quota.quota_low():
+            mode = "candidates"  # the free cloud quota runs low: only where the script is blind, until the reset
+        elif mode == "auto" and self._scout is not None:
             stats = self._scout.stats
             capacity = stats.capacity_per_hour(sc.pass_share, sc.max_per_hour)
             mode = "candidates" if capacity is not None and stats.seen_last_hour > capacity else "all"
@@ -1600,10 +1658,12 @@ class Monitor:
         script is blind; within this search's time share and the hourly cap. Never raises."""
         if not self.scout_enabled or not todo:
             return
-        engine = self._scout
-        assert engine is not None
+        engine = self._scout_pick(ebay=search.source == "ebay")
+        if engine is None:  # eBay ads, a cloud scout without a local stand-in: the script path
+            return
+        assert self._scout is not None
         self._scout_load([item.ad_id for item in todo])
-        engine.note_arrivals(len(fresh))
+        self._scout.note_arrivals(len(fresh))
         unread = [item for item in todo if item.ad_id not in self._scout_items]
         mode = self._scout_mode()
         queue = unread if mode == "all" else [item for item in unread if blind_spot(item)]
@@ -1614,7 +1674,8 @@ class Monitor:
         summary.scout_overflow += not_offered
         if not queue:
             return
-        run = await self._scout_run(queue, deadline, {item.ad_id: search.category_name for item in queue}, summary)
+        run = await self._scout_run(queue, deadline, {item.ad_id: search.category_name for item in queue}, summary,
+                                    engine=engine)
         if run is None:
             return
         by_id = {item.ad_id: item for item in queue}
@@ -1622,8 +1683,8 @@ class Monitor:
             self._scout_remember([by_id[a] for a in run.items if a in by_id and a in fresh])
 
     async def _scout_run(self, queue: list[Listing], deadline: float | None, categories: dict[str, str],
-                         summary: RunSummary, *, rescue: bool = False) -> Any:
-        engine = self._scout
+                         summary: RunSummary, *, rescue: bool = False, engine: Any = None) -> Any:
+        engine = engine if engine is not None else self._scout
         assert engine is not None
         try:
             run = await engine.triage(queue, deadline=deadline, categories=categories, hints=self._scout_hints(),
@@ -1631,7 +1692,7 @@ class Monitor:
         except Exception as exc:  # noqa: BLE001 - the scout never breaks a pass
             log.exception("AI scout failed")
             summary.scout_overflow += len(queue)
-            await self._scout_down(str(exc), summary)
+            await self._scout_down(str(exc), summary, engine)
             return None
         self._scout_items.update(run.items)
         try:
@@ -1648,10 +1709,15 @@ class Monitor:
                      run.ai_count, run.seconds, run.calls, len(run.overflow), len(run.failed))
             self._scout_down_reported = False
         if run.error:
-            await self._scout_down(run.error, summary)
+            await self._scout_down(run.error, summary, engine)
         return run
 
-    async def _scout_down(self, error: str, summary: RunSummary) -> None:
+    async def _scout_down(self, error: str, summary: RunSummary, engine: Any = None) -> None:
+        limited = getattr(getattr(engine or self._scout, "llm", None), "last_limited", None)
+        if limited is not None and str(limited) == error:
+            # the free cloud quota, not a broken server: the Состояние tile shows it, no alert
+            log.info("AI scout: %s", error)
+            return
         if self._scout_down_reported:
             return
         self._scout_down_reported = True
@@ -1667,7 +1733,8 @@ class Monitor:
         text = ""
         if self.config.ai.scout.learn_from_feedback:
             try:
-                text = scout_feedback_hints(self.db.feedback_examples(limit=4))
+                private = bool(cloud_ai.cloud_kind(self._scout_llm_settings()))  # a cloud scout: titles only
+                text = scout_feedback_hints(self.db.feedback_examples(limit=4), private=private)
             except sqlite3.Error:
                 text = ""
         self._scout_hints_text = text
@@ -1877,7 +1944,11 @@ class Monitor:
             unread = [item for item in unread if blind_spot(item)]
         if unread and self._scout_deadline is not None and self._scout.clock() < self._scout_deadline:
             unread.sort(key=lambda item: (-scout_priority(item), -_aware(item.first_seen).timestamp()))
-            await self._scout_run(unread, self._scout_deadline, {}, summary, rescue=True)
+            for ebay in (False, True):  # eBay ads never go to a cloud scout (its local stand-in or none)
+                group = [item for item in unread if (item.source == "ebay") == ebay]
+                engine = self._scout_pick(ebay=ebay) if group else None
+                if engine is not None and self._scout.clock() < self._scout_deadline:
+                    await self._scout_run(group, self._scout_deadline, {}, summary, rescue=True, engine=engine)
         budget = self._budget_for(summary)
         instant = self.config.notifications.mode == "instant"
         found: list[tuple[_Candidate, SearchConfig]] = []
@@ -1928,11 +1999,23 @@ class Monitor:
             return False
         return self._scout_worth(listing, search, plan)
 
+    def _scout_snapshot(self) -> dict[str, Any]:
+        """The scout's throughput: the main engine's, plus what its local stand-in read."""
+        assert self._scout is not None
+        sc = self.config.ai.scout
+        snap = self._scout.stats.snapshot(share=sc.pass_share, max_per_hour=sc.max_per_hour)
+        if self._scout_local is not None:
+            local = self._scout_local.stats.snapshot(share=sc.pass_share, max_per_hour=sc.max_per_hour)
+            for key in ("triaged_last_hour", "failed_last_hour"):
+                snap[key] = int(snap.get(key) or 0) + int(local.get(key) or 0)
+            if (local.get("last_ok_at") or 0) > (snap.get("last_ok_at") or 0):
+                snap["last_ok_at"] = local["last_ok_at"]
+        return snap
+
     def _scout_save_stats(self, summary: RunSummary) -> None:
         if self._scout is None:
             return
-        sc = self.config.ai.scout
-        snap = self._scout.stats.snapshot(share=sc.pass_share, max_per_hour=sc.max_per_hour)
+        snap = self._scout_snapshot()
         snap["saved_at"] = utcnow().isoformat()
         try:
             self.db.set_state(SCOUT_STATS_KEY, json.dumps(snap))
@@ -1947,7 +2030,7 @@ class Monitor:
         settings = self._scout_llm_settings()
         snap: dict[str, Any] = {}
         if self._scout is not None:
-            snap = self._scout.stats.snapshot(share=sc.pass_share, max_per_hour=sc.max_per_hour)
+            snap = self._scout_snapshot()
         else:
             try:
                 state = self.db.get_state(SCOUT_STATS_KEY)
@@ -1959,12 +2042,33 @@ class Monitor:
         except (sqlite3.Error, AttributeError):
             waiting = 0
         too_small = enabled and not self._injected["scout"] and too_small_for_triage(settings.model)
+        quota = self._scout_quota() if enabled else None
+        cloud = quota.snapshot(fallback_configured=self._scout_fallback() is not None) if quota is not None else None
         return scout_status_view(enabled=enabled, mode_setting=sc.mode, provider=settings.provider,
                                  base_url=settings.base_url, model=settings.model, own_endpoint=bool(sc.base_url.strip()),
                                  snap=snap, vision_waiting=waiting,
                                  vision_wait_minutes=self.config.ai.vision_wait_minutes,
                                  expected_sec_per_ad=self._scout_expected_speed(settings),
-                                 pass_share=sc.pass_share, max_per_hour=sc.max_per_hour, too_small=too_small)
+                                 pass_share=sc.pass_share, max_per_hour=sc.max_per_hour, too_small=too_small,
+                                 cloud=cloud, fallback=bool(cloud and cloud.get("fallback_active")))
+
+    def cloud_status(self) -> dict[str, Any]:
+        """Free cloud AI for /health and /monitor: usage today / limit, 429s, the local stand-in,
+        the next reset — one row per endpoint (the scout and the photo check may share one)."""
+        return cloud_ai.cloud_view(cloud_roles(self.config), send_ebay=self.config.ai.cloud_send_ebay)
+
+    async def _cloud_probe(self) -> None:
+        """Once a day: the OpenRouter account's limits (GET /key costs no quota) — 50 or 1000 a day."""
+        for llm in (self._llm, self._scout_llm):
+            primary = getattr(llm, "primary", llm)
+            quota = getattr(primary, "quota", None)
+            if quota is None or not quota.probe_stale() or not hasattr(primary, "probe_key"):
+                continue
+            try:
+                await asyncio.wait_for(primary.probe_key(), timeout=10)
+            except Exception as exc:  # noqa: BLE001 - only a hint for the day's budget
+                log.info("Cloud key check skipped: %s", exc)
+                quota.probe["checked_at"] = quota.wall() - cloud_ai.PROBE_MAX_AGE + 3600  # again in an hour
 
     @staticmethod
     def _scout_expected_speed(settings: LLMSettings) -> float | None:
@@ -1986,7 +2090,7 @@ class Monitor:
     def _hold_for_vision(self, listing: Listing, search: SearchConfig, evaluation: Evaluation) -> None:
         """A would-be deal whose photos the (offline) vision model couldn't check waits for it."""
         if (evaluation.would_buy and evaluation.ai_checked is False and self.config.ai.vision_wait_minutes > 0
-                and self._evaluator is not None):
+                and self._evaluator is not None and self._vision_policy(listing) != "none"):
             try:
                 self.db.queue_vision(listing.ad_id, search.name)
             except sqlite3.Error as exc:
@@ -2338,6 +2442,11 @@ class Monitor:
                         " Выгодные по цене объявления присылаю с пометкой «фото не проверены».")
             hint = "Запусти приложение Ollama" if self.config.ai.provider == "ollama" else AI_DOWN_HINT_RU
             await self._health("ai_down", f"⚠ {AI_DOWN_RU}. {hint}." + tail, summary)
+        elif self._evaluator is not None and self._ai_limited and not self._ai_answered:
+            wait = self.config.ai.vision_wait_minutes
+            tail = (f" Выгодные по цене объявления жду до {wait:.0f} мин, потом присылаю с пометкой «фото не проверены»."
+                    if wait > 0 else " Выгодные по цене объявления присылаю с пометкой «фото не проверены».")
+            await self._health("cloud_quota", f"⚠ {self._ai_limited_ru.rstrip('.')}." + tail, summary)
         await self._flush_alert_queue(summary)
         await self._maybe_heartbeat(summary)
         await self._maybe_daily_top(summary)
@@ -2435,15 +2544,67 @@ def _scout_may_overrule(kind: str, plan: Any) -> bool:
     return plan.kind != "single" or plan.identified
 
 
-def make_scout_llm(settings: LLMSettings) -> Any:
-    """The scout's text client: thinking off (Qwen3.x small models, docs/design/AI_MODELS.md §5)."""
-    if settings.provider in ("openai", "ollama"):
-        from .ai.client import VisionLLM
+def scout_llm_settings(config: AppConfig) -> LLMSettings:
+    """The scout's endpoint: its own (the always-on small model) or, left empty, the ai one
+    (a cloud endpoint's kind and limits included)."""
+    ai, sc = config.ai, config.ai.scout
+    own = bool(sc.base_url.strip())
+    src = sc if own else ai
+    settings = LLMSettings(
+        provider=sc.provider if own else ai.provider,
+        base_url=sc.base_url.strip() if own else ai.base_url,
+        model=(sc.model or "").strip() or ai.model,
+        api_key=(sc.api_key if own else ai.api_key) or "",
+        max_images=0,
+        timeout_seconds=sc.timeout_seconds,
+        temperature=sc.temperature,
+        max_tokens=sc.max_tokens,
+        thinking=sc.thinking,
+        cloud=src.cloud,
+        rpm=src.rpm,
+        daily_limit=src.daily_limit,
+    )
+    if cloud_ai.cloud_kind(settings):  # 16-20 ads per call: room for the answer
+        settings.max_tokens = max(settings.max_tokens, cloud_ai.CLOUD_TRIAGE_MAX_TOKENS)
+    return settings
 
-        extra: dict[str, Any] = ({"think": False} if settings.provider == "ollama"
-                                 else {"chat_template_kwargs": {"enable_thinking": False}})
-        return VisionLLM(settings, extra_body=extra)
-    return make_llm(settings)
+
+def scout_fallback_settings(config: AppConfig) -> LLMSettings | None:
+    """A cloud scout's local stand-in: ai.scout.fallback, else (the scout on the ai endpoint)
+    the ai.fallback server with ai.scout.fallback.model or its own model."""
+    ai, sc = config.ai, config.ai.scout
+    settings = scout_llm_settings(config)
+    if not cloud_ai.cloud_kind(settings):
+        return None
+    fb = sc.fallback if sc.fallback.usable else None
+    if fb is None and ai.fallback.usable and not sc.base_url.strip():
+        fb = ai.fallback.model_copy(update={"model": sc.fallback.model.strip() or ai.fallback.model})
+    return cloud_ai.fallback_settings(fb, settings.model_copy(update={"max_tokens": sc.max_tokens}))
+
+
+def vision_fallback_settings(config: AppConfig) -> LLMSettings | None:
+    """«Облако + компьютер про запас»: the local photo model while the cloud can't be called."""
+    ai = config.ai
+    if ai.provider == "anthropic" or not cloud_ai.cloud_kind(ai):
+        return None
+    return cloud_ai.fallback_settings(ai.fallback, ai)
+
+
+def cloud_roles(config: AppConfig) -> list[tuple[str, Any, Any]]:
+    """(role, settings, local stand-in) of the photo check and the scout, for ai.cloud.cloud_view."""
+    ai = config.ai
+    roles: list[tuple[str, Any, Any]] = []
+    if ai.enabled:
+        roles.append(("vision", ai, vision_fallback_settings(config)))
+    if ai.scout.enabled:
+        roles.append(("scout", scout_llm_settings(config), scout_fallback_settings(config)))
+    return roles
+
+
+def make_scout_llm(settings: LLMSettings) -> Any:
+    """The scout's text client: thinking off (Qwen3.x small models, docs/design/AI_MODELS.md §5; the
+    switch per runtime is ai.cloud.thinking_controls) and the scout's share of a cloud quota."""
+    return make_llm(settings, purpose="triage")
 
 
 def _capped_maybe(evaluation: Evaluation, warning: str) -> Evaluation:

@@ -43,8 +43,12 @@ AI_STATE_OFF = "Нейросеть выключена — фото никто н
 
 async def ai_health(ctx: ApiContext) -> dict[str, Any]:
     """AI status for /health (and the Состояние tile): the same texts as the AI test."""
+    from ...ai.cloud import cloud_kind, preset
+
     ai = ctx.config.ai
-    base = {"enabled": ai.enabled, "provider": ai.provider, "base_url": ai.base_url, "model": ai.model}
+    kind = cloud_kind(ai)
+    base = {"enabled": ai.enabled, "provider": ai.provider, "base_url": ai.base_url, "model": ai.model,
+            "cloud": kind, "cloud_name": preset(kind).name if kind and preset(kind) else ""}
     if not ai.enabled:
         return {**base, "ok": None, "state_ru": AI_STATE_OFF, "error_ru": "", "latency_ms": None}
     fn = getattr(ctx.monitor, "ai_health", None)
@@ -56,11 +60,11 @@ async def ai_health(ctx: ApiContext) -> dict[str, Any]:
         result = await asyncio.wait_for(fn(), timeout=AI_HEALTH_TIMEOUT)
     except asyncio.TimeoutError:
         return {**base, "ok": False, "server_ok": False, "state_ru": AI_STATE_DOWN, "latency_ms": None,
-                "error_ru": ai_problem(ai.provider, ai.base_url, ai.model, "не ответил за 8 с", server_ok=False),
+                "error_ru": ai_problem(ai.provider, ai.base_url, ai.model, "не ответил за 8 с", server_ok=False, cloud=kind),
                 "details": f"Сервер нейросети не ответил за {AI_HEALTH_TIMEOUT:g} с"}
     except Exception as exc:  # noqa: BLE001
         return {**base, "ok": False, "server_ok": False, "state_ru": AI_STATE_DOWN, "latency_ms": None,
-                "error_ru": ai_problem(ai.provider, ai.base_url, ai.model, str(exc), server_ok=False),
+                "error_ru": ai_problem(ai.provider, ai.base_url, ai.model, str(exc), server_ok=False, cloud=kind),
                 "details": f"{type(exc).__name__}: {exc}"}
     result = result if isinstance(result, dict) else {}
     ok = bool(result.get("ok"))
@@ -69,7 +73,7 @@ async def ai_health(ctx: ApiContext) -> dict[str, Any]:
     out = {
         **base, "ok": ok, "server_ok": server_ok, "model_available": result.get("model_available"),
         "resolved_model": result.get("resolved_model"),
-        "error_ru": "" if ok else ai_problem(ai.provider, ai.base_url, ai.model, error, server_ok=server_ok),
+        "error_ru": "" if ok else ai_problem(ai.provider, ai.base_url, ai.model, error, server_ok=server_ok, cloud=kind),
         "latency_ms": int((time.monotonic() - started) * 1000) if ok else None,  # no "1 мс" next to "не отвечает"
         "state_ru": AI_STATE_OK if ok else (AI_STATE_DOWN if server_ok is False else "Модель не найдена"),
     }
@@ -176,6 +180,11 @@ async def health(ai: bool = Query(True, description="проверять нейр
     if scout.get("enabled") and scout.get("state") in ("down", "too_small"):
         add("warn", scout.get("text_ru") or "Разведчик не отвечает", {"label_ru": "Настройки нейросети",
                                                                        "href": "/settings/ai"})
+    cloud = mon.get("cloud") or {}
+    if cloud.get("enabled") and cloud.get("limited") and not cloud.get("fallback_active"):
+        add("warn", f"{cloud.get('limited_ru') or 'Бесплатный лимит облака исчерпан'}. Фото лучших находок жду,"
+                    " потом присылаю с пометкой «фото не проверены»",
+            {"label_ru": "Настройки нейросети", "href": "/settings/ai#cloud"})
     if (scout.get("vision_queue") or {}).get("waiting"):  # the photo model is offline: deals wait for it
         add("warn", f"{scout['vision_queue']['text_ru']} — нейросеть для фото сейчас не отвечает",
             {"label_ru": "Настройки нейросети", "href": "/settings/ai"})
@@ -231,6 +240,7 @@ async def health(ai: bool = Query(True, description="проверять нейр
         "monitor": {k: v for k, v in mon.items() if k != "http"},
         "ai": ai_info,
         "scout": mon.get("scout"),
+        "cloud": mon.get("cloud"),
         "sites": sites,
         "cooldown": cooldown,
         "ebay": {"configured": ctx.config.ebay.configured, "marketplace_id": ctx.config.ebay.marketplace_id},

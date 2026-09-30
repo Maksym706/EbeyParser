@@ -50,7 +50,7 @@ ONBOARDING_STEPS: tuple[tuple[str, str, bool], ...] = (  # key, title, required
 @dataclass(frozen=True)
 class SecretSpec:
     env: str  # variable in .env
-    paths: tuple[str, ...]  # config keys that reference it as ${ENV}
+    paths: tuple[str, ...]  # config keys that reference it as ${ENV} (none: read from the environment)
     label: str
     kind: str = "token"  # token | email | id
 
@@ -66,7 +66,14 @@ SECRETS: dict[str, SecretSpec] = {
     "ebay_client_secret": SecretSpec("EBAY_CLIENT_SECRET", ("ebay.client_secret",), "eBay Cert ID (Client Secret)"),
     "ebay_oauth_token": SecretSpec("EBAY_OAUTH_TOKEN", ("ebay.oauth_token",), "Разовый OAuth-токен eBay"),
     "anthropic_api_key": SecretSpec("ANTHROPIC_API_KEY", ("ai.second_opinion.api_key",), "Ключ Claude (Anthropic)"),
+    # free cloud AI (docs/design/CLOUD_AI.md): only in .env; the client picks the provider's key itself
+    "openrouter_api_key": SecretSpec("OPENROUTER_API_KEY", (), "Ключ OpenRouter"),
+    "nvidia_api_key": SecretSpec("NVIDIA_API_KEY", (), "Ключ NVIDIA"),
+    "omniroute_api_key": SecretSpec("OMNIROUTE_API_KEY", (), "Ключ OmniRoute"),
+    "cloud_api_key": SecretSpec("CLOUD_API_KEY", (), "Ключ облачной нейросети"),
 }
+CLOUD_SECRET = {"openrouter": "openrouter_api_key", "nvidia": "nvidia_api_key", "omniroute": "omniroute_api_key",
+                "custom": "cloud_api_key"}
 
 
 def mask(value: str, kind: str = "token") -> str:
@@ -234,6 +241,8 @@ class ApiContext:
     # ---------------------------------------------------------------- secrets
     def secret_value(self, name: str) -> str:
         spec = SECRETS[name]
+        if not spec.paths:
+            return os.environ.get(spec.env, "").strip()
         value = dig(self.config.model_dump(), spec.paths[0])
         if isinstance(value, list):
             value = ", ".join(str(v) for v in value)
@@ -245,7 +254,7 @@ class ApiContext:
         out: dict[str, dict[str, Any]] = {}
         for name, spec in SECRETS.items():
             value = self.secret_value(name)
-            referenced = str(dig(raw, spec.paths[0]) or "").strip()
+            referenced = str(dig(raw, spec.paths[0]) or "").strip() if spec.paths else ""
             out[name] = {
                 "set": bool(value),
                 "masked": mask(value, spec.kind),
@@ -392,4 +401,4 @@ def parse_since(value: str | None) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-__all__ = ["ApiContext", "SECRETS", "SecretSpec", "get_ctx", "mask"]
+__all__ = ["CLOUD_SECRET", "ApiContext", "SECRETS", "SecretSpec", "get_ctx", "mask"]

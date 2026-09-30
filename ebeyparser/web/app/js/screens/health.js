@@ -5,7 +5,7 @@ import { useAsync, useNow, useMediaQuery, BREAKPOINTS } from "../lib/hooks.js";
 import { api, humanize } from "../lib/api.js";
 import { onEvent } from "../lib/events.js";
 import { navigate } from "../lib/router.js";
-import { ago, number, plural, span, bytes, dateTime, untilTime, localizeText } from "../lib/format.js";
+import { ago, number, plural, span, bytes, dateTime, untilTime, whenTime, localizeText } from "../lib/format.js";
 import { Icon, Button, PageHeader, ErrorState, Skeleton, Tooltip, Meter, toast, Tabs, Details } from "../ui/index.js";
 import { useTopbar } from "../shell/topbar.js";
 import { refreshMonitor, monitorAction, cooldownOf, normalize } from "../shell/monitor.js";
@@ -91,6 +91,7 @@ function Overview() {
     <div class="htiles">
       <${ChecksTile} d=${d} now=${now} reload=${h.reload} />
       <${AiTile} d=${d} loading=${h.aiLoading} reload=${h.reload} />
+      ${d.cloud && d.cloud.enabled && html`<${CloudTile} d=${d} now=${now} />`}
       <${SiteTile} d=${d} now=${now} />
       <${EbayTile} d=${d} />
       <${NotifyTile} d=${d} />
@@ -299,11 +300,47 @@ function AiTile({ d, loading, reload }) {
       : ai &&
         html`${ai.enabled
           ? html`<div class="hmetric"><span>Модель</span><code class="mono">${ai.resolved_model || ai.model || "—"}</code></div>
-              <div class="hmetric"><span>Сервер</span><b>${ai.provider === "ollama" ? "Ollama" : ai.provider === "anthropic" ? "Claude" : "LM Studio"}</b></div>
+              <div class="hmetric"><span>Сервер</span><b>${ai.cloud_name ? `${ai.cloud_name} (облако)` : ai.provider === "ollama" ? "Ollama" : ai.provider === "anthropic" ? "Claude" : "LM Studio"}</b></div>
               ${ai.latency_ms != null && ai.ok !== false && html`<div class="hmetric"><span>Ответ сервера</span><b class="num">${ai.latency_ms < 1000 ? `${ai.latency_ms} мс` : `${(ai.latency_ms / 1000).toFixed(1).replace(".", ",")} с`}</b></div>`}
               ${ai.error_ru && html`<div class="htile__err">${human(ai.error_ru).message}<${Details} text=${human(ai.error_ru).details || ai.details} /></div>`}`
           : html`<p class="htile__note">Без нейросети фото никто не проверяет — уведомления приходят с пометкой ⚠.</p>`}
         ${d.monitor && d.monitor.last_summary && html`<div class="hmetric"><span>Вызовов за проверку</span><b class="num">${d.monitor.last_summary.ai_calls || 0}</b></div>`}`}
+  <//>`;
+}
+
+const CLOUD_STATE = {
+  ok: { tone: "profit", label: "Работает" },
+  flaky: { tone: "haggle", label: "Бывают отказы" },
+  low: { tone: "haggle", label: "Лимит почти потрачен" },
+  limited: { tone: "danger", label: "Лимит исчерпан" },
+};
+
+/** «Облако» (docs/design/CLOUD_AI.md): the free cloud AI's usage today, 429s, the local stand-in. */
+function CloudTile({ d, now }) {
+  const c = d.cloud;
+  const st = CLOUD_STATE[c.state] || CLOUD_STATE.ok;
+  const state = c.limited && c.fallback_active ? "Лимит исчерпан · работает компьютер" : c.limited && c.limited_reason === "cooldown" ? "Пауза" : st.label;
+  const limit = c.daily_limit;
+  const used = c.used_today || 0;
+  const other = (c.endpoints || []).slice(1);
+  return html`<${Tile}
+    icon="cloud"
+    title=${`Облако · ${c.provider_name || ""}`}
+    tone=${c.limited && c.fallback_active ? "haggle" : st.tone}
+    state=${state}
+    tip="Бесплатная нейросеть в облаке: сколько запросов потрачено сегодня, сколько осталось, и работает ли компьютер про запас."
+    actions=${html`<${Button} size="sm" variant="ghost" href="/settings/ai#cloud">Настроить<//>`}
+  >
+    ${limit
+      ? html`<${Meter} label="Запросов сегодня" value=${Math.min(used, limit)} max=${limit} valueText=${`${number(Math.min(used, limit))} из ${number(limit)}`} marker=${0.8} />`
+      : html`<div class="hmetric"><span>Запросов сегодня</span><b class="num">${number(used)}</b></div>`}
+    ${c.limited_ru && html`<p class="htile__lead t-amber">${human(c.limited_ru).message}</p>`}
+    ${c.next_reset && html`<div class="hmetric"><span>Лимит обнулится</span><b>${whenTime(c.next_reset, now)}</b></div>`}
+    ${c.rpm && html`<div class="hmetric"><span>В минуту</span><b class="num">до ${c.rpm} запросов</b></div>`}
+    <div class="hmetric"><span>«Подожди» от сервиса</span><b class=${cx("num", c.count_429_today > 0 && "t-amber")}>${number(c.count_429_today || 0)}</b></div>
+    <div class="hmetric"><span>Компьютер про запас</span><b class=${cx(c.fallback_active && "t-amber")}>${!c.fallback_configured ? "не настроен" : c.fallback_active ? "работает сейчас" : "готов"}</b></div>
+    ${c.estimate_ru && !c.limited && html`<p class="htile__note"><${Icon} name="gauge" size=${14} /><span>${human(c.estimate_ru).message}</span></p>`}
+    ${other.map((e) => html`<div class="hmetric"><span>${e.provider_name}</span><b class="num">${e.daily_limit ? `${number(e.used_today || 0)} из ${number(e.daily_limit)}` : number(e.used_today || 0)}</b></div>`)}
   <//>`;
 }
 
@@ -425,7 +462,7 @@ function ScoutTile({ d, reload }) {
   const st = scoutState(s);
   const text = human(s.text_ru);
   const q = s.vision_queue || {};
-  const problem = s.state === "down" || s.state === "too_small" || s.state === "behind";
+  const problem = s.state === "down" || s.state === "too_small" || s.state === "behind" || s.state === "quota";
   return html`<${Tile}
     icon="telescope"
     title="Разведчик"

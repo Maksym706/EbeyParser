@@ -113,9 +113,10 @@ const ART = {
 /**
  * The whole AI block. Props:
  *   save — write provider/base_url/model on a successful test (onboarding: true)
+ *   saveAs — "main" (ai.*) or "fallback" (ai.fallback.*: the local stand-in of a cloud endpoint)
  *   onDone(result) — called after a successful test
  */
-export function AiConnect({ save = true, onDone, current, onChoice }) {
+export function AiConnect({ save = true, saveAs = "main", onDone, current, onChoice }) {
   const { loading, data, error, detect } = useAiDetect();
   const [choice, setChoice] = useState("");
   const [gpu, setGpu] = useState(null);
@@ -159,7 +160,7 @@ export function AiConnect({ save = true, onDone, current, onChoice }) {
     const model = rest.join("|");
     setTest({ state: "loading", result: null, error: null });
     try {
-      const result = await api.post("/ai/test", { provider, base_url, model, sample: true, save }, { timeout: 200000 });
+      const result = await api.post("/ai/test", { provider, base_url, model, sample: true, save, save_as: saveAs }, { timeout: 200000 });
       setTest({ state: result.ok ? "ok" : "fail", result, error: null });
       if (result.ok && onDone) onDone(result);
     } catch (e) {

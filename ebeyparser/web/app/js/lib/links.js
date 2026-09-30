@@ -10,4 +10,10 @@ export const LINKS = {
   googleAppPasswords: "https://myaccount.google.com/apppasswords",
   tailscale: "https://tailscale.com/download",
   kleinanzeigen: "https://www.kleinanzeigen.de",
+  // free cloud AI (docs/design/CLOUD_AI.md): where to get a key
+  openRouterKeys: "https://openrouter.ai/keys",
+  openRouterCredits: "https://openrouter.ai/settings/credits",
+  openRouterPrivacy: "https://openrouter.ai/settings/privacy",
+  nvidiaKeys: "https://build.nvidia.com/settings/api-keys",
+  omniRoute: "https://github.com/diegosouzapw/OmniRoute",
 };

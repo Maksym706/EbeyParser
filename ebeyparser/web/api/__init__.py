@@ -45,8 +45,9 @@ def build_router() -> APIRouter:
     router.include_router(routes_monitor.router, tags=["monitor"])
     router.include_router(routes_deals.router, tags=["deals"])
     router.include_router(routes_system.router, tags=["system"])
-    from . import routes_projects
+    from . import routes_cloud, routes_projects
 
+    router.include_router(routes_cloud.router, tags=["connections"])
     router.include_router(routes_projects.router, tags=["projects"])
     return router
 
