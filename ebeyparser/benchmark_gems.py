@@ -105,7 +105,7 @@ CLOUD_PROFILES: dict[str, tuple[int, int, float]] = {
     "cloud_free1000": (20, 1000, 0.12),  # OpenRouter free after a one-time $10
     "cloud_nvidia": (40, 0, 0.05),  # the NVIDIA API catalog: ~40 a minute, no daily cap
 }
-CLOUD_TEXT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+CLOUD_TEXT_MODEL = "nvidia/nemotron-3.5-lightning:free"
 CLOUD_VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"
 MODE_HARDWARE = {"oracle": "gpu_7b", "noisy": "gpu_7b", "weak": "cpu_3b"}
 # the model research (AI_MODELS.md §4): a small model's interest barely separates gems from junk

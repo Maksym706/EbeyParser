@@ -36,7 +36,7 @@ presets at run time (§4.3).
 | Key | `sk-or-v1-…` from openrouter.ai/keys | `nvapi-…` from build.nvidia.com (free NVIDIA Developer account) | optional |
 | Per minute | 20 requests on free models | ~40 per account, shared by all models | depends on the providers behind it |
 | Per day | **50**. **1000** once $10 of credits was ever bought (one purchase; free models do not spend credits). Resets 00:00 UTC | no daily cap (the credit model ended) | depends |
-| Text models | `nvidia/nemotron-3-super-120b-a12b:free`, `nvidia/nemotron-3-ultra-550b-a55b:free`, `nvidia/nemotron-3.5-lightning:free` | the same families without `:free` | whatever is connected |
+| Text models | `nvidia/nemotron-3.5-lightning:free` (**the user's choice, the default pick**), `nvidia/nemotron-3-super-120b-a12b:free`, `nvidia/nemotron-3-ultra-550b-a55b:free` | the same families without `:free` | whatever is connected |
 | Vision models | `nvidia/nemotron-nano-12b-v2-vl:free` (JPEG/PNG ≤ 1024², 128k context), `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` (reasoning toggle `reasoning.enabled`) | `nvidia/nemotron-nano-12b-v2-vl`, Nano Omni | — |
 | Limits API | `GET /api/v1/key`: `is_free_tier`, `limit_remaining`, `rate_limit`, … | none (the rate-limit headers only) | — |
 | Model list | `GET /api/v1/models`: `pricing`, `architecture.input_modalities` (free and vision can be filtered live) | `GET /v1/models` (ids only) | `GET /v1/models` |
@@ -87,6 +87,11 @@ Design choices:
   `{set, masked: "…abcd"}`. Error texts pass through `redact_key`, and the key is never logged.
 * **Switching back** («На моём компьютере») restores the local model remembered in `ai.fallback`
   when the cloud was switched on.
+* **Model picks** come from the live `/models` list. For reading ads on OpenRouter the order is
+  Nemotron 3.5 Lightning (the user's choice), then 3 Super, then 3 Ultra. Each is tried by its id,
+  then its id without `:free`, then by name tokens, so renamed ids still match. For photos the
+  order is Nemotron Nano 12B VL, then Nano Omni. A model the list no longer offers gets a plain
+  «выбери другую».
 
 ## 4. The client and the limiter
 

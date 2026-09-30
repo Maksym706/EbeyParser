@@ -137,7 +137,8 @@ async def _triage_check(ctx: ApiContext, settings: LLMSettings) -> dict[str, Any
     quality = sum(bool(out[k]) for k in ("hidden_gpu", "typo_fixed", "wanted_seen"))
     out["ok"] = run.ai_count >= 4 and quality >= 2
     if not out["ok"]:
-        out["error_ru"] = ("Модель ответила, но читает объявления плохо — выбери другую (например, Nemotron 3 Super)"
+        out["error_ru"] = ("Модель ответила, но читает объявления плохо — выбери другую (например, Nemotron 3.5 Lightning"
+                           " или Nemotron 3 Super)"
                            if run.ai_count else "Модель ответила не в том формате — выбери другую модель")
     return out
 

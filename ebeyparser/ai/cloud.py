@@ -80,6 +80,7 @@ class CloudPreset:
     daily_limit_paid: int = 0  # OpenRouter: after $10 of credits were ever bought
     text_picks: tuple[str, ...] = ()  # preferred ids for reading ads, best first
     vision_picks: tuple[str, ...] = ()  # preferred ids for photos, best first
+    text_tokens: tuple[tuple[str, ...], ...] = ()  # name tokens of the preferred text models (ids change)
     terms_ru: str = ""
     how_ru: str = ""  # one line: what to click to get a key
 
@@ -96,9 +97,11 @@ PRESETS: dict[str, CloudPreset] = {p.key: p for p in (
         key="openrouter", name="OpenRouter", base_url="https://openrouter.ai/api/v1",
         key_env="OPENROUTER_API_KEY", key_url="https://openrouter.ai/keys", key_hint="sk-or-v1-…",
         key_required=True, rpm=20, daily_limit=50, daily_limit_paid=1000,
-        text_picks=("nvidia/nemotron-3-super-120b-a12b:free", "nvidia/nemotron-3.5-lightning:free",
+        # the user's choice first (https://openrouter.ai/nvidia/nemotron-3.5-lightning:free), then Super / Ultra
+        text_picks=("nvidia/nemotron-3.5-lightning:free", "nvidia/nemotron-3-super-120b-a12b:free",
                     "nvidia/nemotron-3-ultra-550b-a55b:free"),
         vision_picks=("nvidia/nemotron-nano-12b-v2-vl:free", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"),
+        text_tokens=(("nemotron", "lightning"), ("nemotron", "super"), ("nemotron", "ultra")),
         terms_ru="Бесплатно: 20 запросов в минуту и 50 в день; после разовой покупки $10 кредитов — 1000 в день.",
         how_ru="Войди на openrouter.ai → Keys → Create Key и вставь ключ сюда",
     ),
@@ -131,7 +134,7 @@ PRESETS: dict[str, CloudPreset] = {p.key: p for p in (
 CLOUD_KINDS = tuple(PRESETS)
 
 # name tokens for picking models from a live list when the preferred ids changed (best first)
-TEXT_WISHES: tuple[tuple[str, ...], ...] = (("nemotron", "super"), ("nemotron", "lightning"), ("nemotron", "ultra"),
+TEXT_WISHES: tuple[tuple[str, ...], ...] = (("nemotron", "lightning"), ("nemotron", "super"), ("nemotron", "ultra"),
                                             ("llama", "70b"), ("qwen3", "235b"), ("gpt-oss", "120b"),
                                             ("deepseek",), ("nemotron",))
 VISION_WISHES: tuple[tuple[str, ...], ...] = (("nemotron", "vl"), ("nemotron", "omni"), ("qwen", "vl"),
@@ -1013,17 +1016,25 @@ def _canon_id(model_id: str) -> str:
 
 
 def pick_model(models: Sequence[dict[str, Any]], wishes: Sequence[str], token_wishes: Sequence[tuple[str, ...]],
-               *, vision: bool) -> str | None:
-    """The best available model: a preferred id (exact, then without ":free"/the publisher), then by
-    name tokens ("nemotron" + "super"), then the biggest free one. None if nothing fits."""
+               *, vision: bool, ranked: Sequence[tuple[str, tuple[str, ...]]] = ()) -> str | None:
+    """The best available model. `ranked`: preferred models, best first, each tried by its id, then
+    its id without ":free"/the publisher, then its name tokens (ids change) before the next one; then
+    the other preferred ids, then generic name tokens ("nemotron" + "super"), then the biggest free
+    one. None if nothing fits."""
     pool = [m for m in models if m.get("free", True) and (m.get("vision") if vision else True)]
     if not pool:
         return None
     ids = [m["id"] for m in pool]
+    canon = {_canon_id(i): i for i in ids}
+    for wish, tokens in ranked:
+        hit = wish if wish in ids else canon.get(_canon_id(wish))
+        if hit is None and tokens:
+            hit = next((mid for mid in ids if all(t in mid.lower() for t in tokens)), None)
+        if hit:
+            return hit
     for wish in wishes:
         if wish in ids:
             return wish
-    canon = {_canon_id(i): i for i in ids}
     for wish in wishes:
         hit = canon.get(_canon_id(wish))
         if hit:
@@ -1040,7 +1051,8 @@ def pick_models(models: Sequence[dict[str, Any]], kind: str) -> dict[str, str | 
     """Recommended picks: a big text model for reading ads, a vision model for photos."""
     p = preset(kind)
     text_pool = [m for m in models if not (m.get("vision") and _params_b(m["id"]) and _params_b(m["id"]) < 20)]
-    text = pick_model(text_pool or models, p.text_picks if p else (), TEXT_WISHES, vision=False)
+    ranked = tuple(zip(p.text_picks, p.text_tokens)) if p else ()
+    text = pick_model(text_pool or models, p.text_picks if p else (), TEXT_WISHES, vision=False, ranked=ranked)
     vision = pick_model(models, p.vision_picks if p else (), VISION_WISHES, vision=True)
     return {"text": text, "vision": vision}
 

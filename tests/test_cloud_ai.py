@@ -533,6 +533,14 @@ def test_model_picks_follow_the_live_list() -> None:
     picks = cloud.pick_models(renamed, "openrouter")
     assert picks == {"text": "nvidia/nemotron-3.1-super-130b-a13b:free", "vision": "nvidia/nemotron-nano-13b-v3-vl:free"}
     assert cloud.pick_models([], "openrouter") == {"text": None, "vision": None}
+    # the user's pick: Nemotron 3.5 Lightning reads the ads when the live list offers it, matched by name
+    lightning = cloud.parse_models({"data": OR_MODELS["data"] + [
+        {"id": "nvidia/nemotron-3.5-lightning:free", "pricing": {"prompt": "0", "completion": "0"}}]}, "openrouter")
+    assert cloud.pick_models([m for m in lightning if m["free"]], "openrouter")["text"] == "nvidia/nemotron-3.5-lightning:free"
+    renamed_l = cloud.parse_models({"data": OR_MODELS["data"] + [
+        {"id": "nvidia/nemotron-3.6-lightning-v2:free", "pricing": {"prompt": "0", "completion": "0"}}]}, "openrouter")
+    assert cloud.pick_models([m for m in renamed_l if m["free"]], "openrouter")["text"] == "nvidia/nemotron-3.6-lightning-v2:free"
+    assert cloud.PRESETS["openrouter"].text_picks[0] == "nvidia/nemotron-3.5-lightning:free"
     text_only = [m for m in renamed if not m["vision"]]
     assert cloud.pick_models(text_only, "openrouter")["vision"] is None
 
