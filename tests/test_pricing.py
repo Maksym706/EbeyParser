@@ -194,6 +194,11 @@ EMAIL = "Просит писать на e-mail"
         ("Sicher bezahlen: schick mir deine E-Mail, ich sende dir den Link", SCAM),
         ("Ich schicke dir den Link für Sicher bezahlen per WhatsApp", SCAM),
         ("Du bekommst von mir einen Zahlungslink", SCAM),
+        ("Verschicke über Kleinanzeigen 'Sicher bezahlen'. Bitte mir den Link schicken", SCAM),
+        ("Nur Sicher bezahlen. Schreib mir deine Handynummer", SCAM),
+        ("Da ich im Ausland bin, verschicke ich das Paket", SCAM),
+        ("Weil ich gerade im Ausland lebe, nur Versand", SCAM),
+        ("Ich befinde mich zurzeit im Ausland", SCAM),
     ],
 )
 def test_contact_and_payment_scam_flags(text, flag):
@@ -209,6 +214,10 @@ def test_contact_and_payment_scam_flags(text, flag):
         "Rechnung per Mail vorhanden",
         "Kein WhatsApp, kein Telegram",
         "Bitte keine Anfragen per Mail",
+        "Sicher bezahlen möglich. Link zum Datenblatt siehe Bilder",
+        "Sicher bezahlen möglich. Versand kostet 5 Euro",
+        "Im Ausland gekauft, EU-Version",
+        "Ich war letztes Jahr im Ausland und habe sie dort gekauft",
     ],
 )
 def test_contact_and_payment_flags_leave_honest_ads_alone(text):

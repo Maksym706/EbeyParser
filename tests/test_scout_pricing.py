@@ -70,6 +70,11 @@ def test_split_quantity():
     ("NVIDIA RTX 3080 10GB", "RTX 3080 12GB", False),  # another size of the same product
     ("NVIDIA RTX 3080 10GB", "PC mit RTX 3080 und 32GB DDR4", True),  # that size is the PC's RAM
     ("Apple iPhone 13 128GB", "iPhone 13, sehr gut", True),  # no size stated at all
+    ("Sony PlayStation 5 Digital Edition", "PS5 Digital mit 2 Controllern, top", True),  # an alias
+    ("Sony PlayStation 5", "PS5 Disc Edition, OVP", True),
+    ("Sony PlayStation 5", "PS5 Controller DualSense weiss", False),  # an accessory of it
+    ("Sony PlayStation 5 Digital Edition", "PS5 Disc, OVP", False),  # another edition
+    ("Sony PlayStation 5", "Konsole ohne PS5 Spiele, nur Xbox", False),
     ("NVIDIA RTX 3080", "Gaming PC ohne Grafikkarte (war RTX 3080 drin)", False),
     ("NVIDIA RTX 3080", "RTX 3080 schon verkauft, Rest da", False),
     ("NVIDIA RTX 3080", "Gaming PC, GTX 1060, suche eigentlich was mit RTX 3080", False),

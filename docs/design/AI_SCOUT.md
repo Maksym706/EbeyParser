@@ -486,79 +486,143 @@ Reading it:
 * The standard benchmark (`python -m ebeyparser.benchmark --seed 1 --n 600`, scout off) is unchanged: precision
   100 %, recall 92.6 %, 0 trap buys, invariant ✔.
 
-### 14.2 Real-LLM smoke test
+### 14.2 Real-LLM smoke test (2026-09-30)
 
-**Setup.** Hugging Face is blocked from this sandbox (proxy 403). The llama.cpp release (b10830, CPU) came from GitHub
-releases, and `qwen2.5-1.5b-instruct-q4_k_m.gguf` from a GitHub release mirror (size matches the official file). The
-model research downloaded the Qwen3.5 GGUFs, and the smoke test used **Qwen3.5-2B Q4_K_M** (the catalog's T0 pick)
-read-only. `llama-server` (OpenAI-compatible, private port) went through the **real** `VisionLLM` client
-(`json_schema` response format, thinking off) and the **real** `TriageEngine` (batch 8). The ads were
-`scratchpad/ai/triage_testset.py`: 40 realistic German Kleinanzeigen-style ads (16 gems, 12 traps, 12 normal), 16 of
-them used here (every other one: 8 gems, 6 traps, 2 normal).
+**Setup.**
 
-**The CPU was shared.** Another agent was benchmarking models on the same 4 vCPUs the whole time (load 5–8). With 4
-threads, llama.cpp slowed to 0.39 tok/s from oversubscription, so this run used **1 thread**. Treat the speed as a
-worst case. The clean-machine numbers are the model research's measurements (`AI_MODELS.md` §4: 2B ≈ 6 s/ad, 4B ≈
-15.5 s/ad on this VM).
+* **The real app code, configured like the monitor does it**: `parse_config` with `ai.scout.enabled/base_url/model`
+  → `Monitor._ensure_components` → `make_scout_llm` (`VisionLLM`, `json_schema`, thinking off) →
+  `TriageEngine.from_config` with the defaults (batch size by model: 2B 5/5, 4B 10/15; `timeout_seconds` 180,
+  `max_tokens` 1800). The ads go in `scout_priority` order, as `_scout_read` sorts them, in one `triage()` call.
+  Stage B is the real `scout.plan` + `scout.worth_a_look` + `scout.code_red_flags`.
+* **70 German ads with gold labels**: the scout's `triage_testset.py` (40: 16 gems, 12 traps, 12 normal) and the
+  model research's set (30: 7 gems, 13 traps including 4 scams: Spain + PayPal F&F + WhatsApp, prepayment only,
+  e-mail only, «Sicher bezahlen» + "send me the link"). Kinds are mapped to the scout's enum. Where both answers are
+  defensible and in the same promotion class, both count (defect/part for «für Bastler oder Ersatzteile»).
+* **Models**: Qwen3.5 2B and 4B Q4_K_M (Docker Hub `ai/qwen3.5`, Unsloth GGUFs), llama.cpp `llama-server` b10830 CPU
+  build, `-t 3` (cores − 1), `-c 8192`, `--parallel 1`.
+* **CPU and contention.** The first run (2B, old prompt) ran on the 4-vCPU Xeon (Sapphire Rapids) while another agent
+  ran an arm64 Docker build under QEMU. The container then restarted on a **4-vCPU Xeon @ 2.8 GHz (Cascade Lake
+  class: AVX-512 VNNI, no AMX)**. There, prompt processing was ~4× slower (2B: 31–34 tok/s vs 124). Every later run
+  shared it with another agent's pytest + Chromium (load 3.5–4.5 on 4 cores). Treat the speeds as pessimistic T0
+  numbers. The quality numbers don't depend on speed.
+* **Metrics**:
+  * JSON = items matched by index, after the engine's retries;
+  * product = every gold model token is in the product or its parts;
+  * grounded = `pricing/ai_key.grounded` accepts the product (single) or at least one part (bundle/pc/lot);
+  * *promoted* = `worth_a_look` is true. "Empty history" uses a lookup that knows no prices. "History says deal"
+    prices every grounded name at 2.5 × the ad's price, so for traps it is the worst case;
+  * scam = the model's `scam`/`fake` tag, the code's red flags, or either;
+  * neighbour mix-up = a name that is not in the ad but is grounded in another ad of the same call.
 
-| metric | result |
-|---|---|
-| ads / calls | 16 / 4 (final batch size 4) |
-| valid JSON items (matched by index) | **16/16** (100 %), script fallback 0 |
-| kind correct | 69 % |
-| product / model tokens correct | 94 % |
-| gems identified **and grounded** | 7/8 |
-| gems with interest ≥ 6 | 7/8 |
-| traps with interest ≤ 4 | 5/6 |
-| risky ads flagged (risk tag or wanted/defect/box/swap kind) | 1/4 |
-| wall time, s/ad (1 contended thread) | 304.4 s, **19.02 s/ad** |
+| metric | 2B, old prompt | **2B, new prompt** | 4B, old prompt | **4B, new prompt** (35-ad half) | 2B new prompt, same 35 |
+|---|---|---|---|---|---|
+| ads answered (valid JSON, matched by `i`) | 70/70 | 70/70 | **0/70: batch 10 timed out** | 35/35 | 35/35 |
+| script fallback | 0 | 0 | – | 0 | 0 |
+| calls (short answers) | 23 (2) | 21 (2) | 1 (timeout) | 10 (1 timeout, 0 short) | – |
+| kind | 77 % | **89 %** | – | **89 %** | 83 % |
+| kind class (promotable vs blocked) | 83 % | 91 % | – | 94 % | 91 % |
+| product (59 / 29 ads with a model) | 90 % | **97 %** | – | **100 %** | 97 % |
+| grounded (items that name something) | 84 % | 94 % | – | 91 % | 94 % |
+| gems identified and grounded | 19/23 | **23/23** | – | 10/10 | 10/10 |
+| gems promoted, empty history | 16/23 | **22/23** | – | 10/10 | 10/10 |
+| gems promoted, history says deal | 16/23 | **23/23** | – | 10/10 | 10/10 |
+| traps promoted, history says deal | 1/25 (S24 «Sicher bezahlen» scam) | 2/25 (Xbox charging station; PC without GPU) | – | **0/15** | 1/15 |
+| scam: model tag | 0/6 | 3/6 | – | **4/4** | 2/4 |
+| scam: code red flags | 5/6 | 5/6 | – | 3/4 | 3/4 |
+| scam: either | 5/6 | **6/6** | – | 4/4 | 4/4 |
+| false scam tags | 0/64 | 0/64 | – | 0/31 | 0/31 |
+| neighbour mix-ups | 1/70 | 2/70 | – | 1/35 (a ThinkPad got the other ThinkPad's i5-8350U) | 0/35 |
+| Russian reason | 86 % | 87 % | – | 97 % | – |
+| output tokens / ad | 68 | 74 | – | 74 | – |
+| generation / prompt speed | 10.8 / 124 tok/s (SPR) | 7.6 / 34 tok/s | 4.0 tok/s | 3.5 / 14 tok/s | – |
+| **wall s/ad** (contended) | **7.0** (SPR) | **12.4** | > 18 | **30.9 (25.8 without the one timeout)** | – |
 
-Per ad (K = kind ok, M = model ok, G = product grounded in the ad text):
+The previous smoke test (2026-09-29: 16 of the 40 ads, batch 8, the older prompt, 1 contended thread) measured kind
+69 %, product 94 %, 19 s/ad.
 
-| | title | kind | product | contents | s | risks | reason |
-|---|---|---|---|---|---|---|---|
-| KMG | Alter Rechner vom Dachboden | pc | Intel Core i5-9600K | RTX 3070, 16GB RAM | 9 |  | старый ПК, RTX 3070, i5 9600k |
-| ··· | Iphne 13 128gb blau | acc | Apple iPad Air 5 64GB |  | 6 |  | iPad Air 5 с опечаткой в названии |
-| KMG | Playstaion 5 mit Laufwerk | bundle | PlayStation 5 Disc |  | 0 |  | игра на PS5 |
-| KMG | Grafikkarte von Nvidia | part | NVIDIA GeForce RTX 3070 Ti |  | 6 |  | GeForce RTX 3070 Ti |
-| KMG | Kiste Technik aus Haushaltsauflösung | bundle | Sony WH-1000XM4 | GoPro Hero 11 Black, Ladekabel | 6 |  | Sony WH-1000XM4 с GoPro |
-| ·MG | Spielzeug Drohne | acc | DJI Mini 3 |  | 6 |  | дрона DJI Mini 3 |
-| ·MG | Tablet Apple | acc | Apple iPad Air 5 64GB |  | 6 |  | iPad Air 5 с опечаткой в названии |
-| KMG | Gaming PC günstig | pc | Intel Core i7-8700K | GTX 1080 Ti 11GB, 32GB RAM, 1TB SSD | 9 |  | i7 8700K, GTX 1080 Ti, 32GB RAM |
-| KM· | Gaming PC ohne Grafikkarte | pc | Gaming PC ohne Grafikkarte |  | 9 |  | PC без видеокарты, i5, 16GB RAM, 650W |
-| KM· | Suche alten PC mit Grafikkarte | wanted | PC mit RTX 3080 |  | 0 |  | старый ПК с видеокартой |
-| KMG | iPhone 14 Pro iCloud gesperrt | defect | Apple iPhone 14 Pro |  | 0 | locked | iCloud заблокирован |
-| ·MG | Konvolut defekte Handys | bundle | iPhone 12 |  | 0 |  | конволут с поломанным экраном |
-| ·MG | Airpods Pro 2 original | acc | AirPods Pro 2 |  | 0 |  | наушники с пробным периодом |
-| KMG | Hülle für iPhone 13 | acc | Silikon Hülle iPhone 13 |  | 3 |  | чехол для iPhone 13 из силикона |
-| KMG | iPhone 13 128GB Mitternacht | single | Apple iPhone 13 128GB |  | 6 |  | iPhone 13 с опечаткой в названии |
-| KMG | Nintendo Switch Lite Türkis | single | Nintendo Switch Lite |  | 0 |  | Switch Lite с зарядкой и чехлом |
+**What went wrong with the old prompt (2B), and the fixes.**
 
-Reading it:
+1. **Kind by keyword, not by meaning (kind 77 %).** Examples:
+   * a device sold «mit Ladegerät und Hülle» or «mit Rechnung» became `acc` (Switch Lite, Galaxy S23, iPad Air,
+     RAM kit);
+   * a graphics card, a laptop and even a Dyson became `pc`, in a batch after the PCs;
+   * «Zellentausch» became `swap`; the attic Leica became `wanted`; the Makita tool estate became `other`;
+   * «Grafikkarte von Nvidia (RTX 3070 Ti)» became `part`.
 
-* **The format holds on a 2B model.** All 16 answers were valid JSON matched by index, with no script fallback. The
-  first call (8 ads, 588 output tokens, 168 s) went over the time cap, so the engine cut the batch to 4 and re-asked
-  for the one missing item. Output was 1104 tokens for 16 ads (**~69 tokens/ad**). llama.cpp reuses the cached system
-  prompt, so after the first call the prompts were only 137–357 tokens.
-* **What it finds is the script's blind spot.** Both PCs were read as `pc` with the GPU in the parts (RTX 3070 in
-  «Alter Rechner vom Dachboden», GTX 1080 Ti in «Gaming PC günstig»). It also found:
-  * the unnamed «Grafikkarte von Nvidia» (RTX 3070 Ti);
-  * the «Kiste Technik» contents (Sony WH-1000XM4 + GoPro Hero 11);
-  * the «Playstaion» typo.
-* **Its mistakes are the ones grounding is for.** The 2B model mixed up two neighbouring ads in one batch: «Iphne 13
-  128gb blau» came back as "Apple iPad Air 5 64GB", the next ad's product, and «Tablet Apple» got the iPhone ad's
-  reason. The product is not in the iPhone ad's text, so it is ungrounded, and that ad simply takes the script path.
-  «Gaming PC ohne Grafikkarte» got interest 9. Still:
-  * its product is negated («ohne»), so it is ungrounded;
-  * it has no parts, so it is not usable.
-  
-  So the scout does not promote it; the script and the photo check decide as before.
-* **Kinds and risk tags are weak at 2B** (kind 69 %; only the iCloud lock was tagged). The WhatsApp-only €40 AirPods
-  and the broken-phones lot were not tagged, but got interest 0, so they rank last. The existing scam/defect rules
-  still apply to every ad, because the scout never overrules them. This matches the model research: 4B is much
-  better on kind (87 %) and scam (100 %), and is the pick when the home server can afford ~15 s/ad.
-* **Speed** here, 19 s/ad on one contended thread, is a worst case. On a free 4-core CPU the research measured ≈ 6
-  s/ad for 2B, i.e. ~600 ads/hour, which is what `max_per_hour` 600 assumes.
+   `acc`, `part`, `wanted` and `other` are blocked kinds, so **5 of 23 gems were lost to the kind alone.**
+   *Fix (`prompts_triage.py`)*: each kind now says what it means, not just trigger words:
+   * sale also covers "a graphics card, a laptop, or a device mit Hülle/Ladegerät";
+   * acc = "only an accessory, no device"; part = "a spare part of a device (Display, Akku, Mainboard)";
+   * pc = "a whole desktop computer or server (list GPU, CPU, RAM in c)";
+   * swap = "wants another item instead of money"; box adds «Karton leer, ohne Inhalt»; other = "furniture,
+     clothes, toys, bikes, prams (not electronics, not tools)".
+
+   The trigger words the tests pin are unchanged.
+2. **The 2B never set a risk tag for a scam (0/6).** The worked example had `x:[]` for every ad. The code's red flags
+   caught 5/6. The «Sicher bezahlen: send me the link, give me your phone number» S24 slipped through both and was
+   **the one trap that would have been promoted**. *Fix*: a fourth example ad, a prepayment/WhatsApp scam
+   tagged `x:["scam"]`, and a longer scam list in `x`. The model now tags 3/6, including that S24, so model + code
+   catch **6/6**, with no false scam tags.
+3. **4B at the automatic batch size could not answer at all.** Batch 10 on this CPU is 1,715 prompt tokens plus
+   ~600 output tokens at ~4 tok/s, so the call hit the 180 s timeout. The engine treated the timeout like "server
+   down", overflowed the whole pass, and would have started at batch 10 again the next pass, because no speed was
+   ever measured. On a T0 box that is a permanent failure. *Fix (`triage.py`)*: a **read timeout** (server up, too
+   slow) keeps the speed it showed as `sec_per_ad`, halves the batch (down to `min_batch`) and goes on. A connect
+   error or an HTTP error still stops the run as before. In the new-prompt runs the first call timed out once
+   (180 s lost). The 4B then ran at batch 5, and the time cap `min(120 s, 0.6 × timeout)` brought it to 4.
+
+Results of the fixes on the 2B (same 70 ads, same engine): kind 77 → 89 %, product 90 → 97 %, grounded 84 → 94 %,
+**gems promoted 16 → 22–23 of 23**, scam caught (model + code) 5 → 6 of 6. The cost is ~9 % more output tokens: the
+2B now also lists extras of single items in `c`. Caveat: the fixes were tuned on this test set, so expect somewhat
+less on new ads.
+
+**Still open (outside the scout's prompt/parser; recommended):**
+
+* **Short answers.** In 2 of ~21 calls the 2B closed the array after 1 of 4–5 items. The engine retried correctly,
+  but the <70 % rule halved the batch to 2 for several calls (21–23 calls instead of 14). A per-call schema with
+  `minItems = maxItems = n` would force every item; the llama.cpp grammar supports it, and a server that rejects it
+  falls back to `json_object`. The test `test_engine_batches_and_tags_items` pins `schemas[0] is TRIAGE_SCHEMA` and
+  would need a small change.
+* **«Sicher bezahlen» phishing across sentences.** `pricing/text.py` only matches «Sicher bezahlen» + link inside
+  one sentence, and «im Ausland bin» (verb last) is missed. The S24 ad has neither in one sentence, so
+  `code_red_flags` is empty. Let the rule span the next sentence, and add "(da|weil) ich … im Ausland (bin|lebe)".
+  Today only the model's new scam tag stops it.
+* **Grounding misses aliases**: "Sony PlayStation 5 Digital Edition" is not grounded in «PS5 Digital Edition», although
+  identity.py maps both to `playstation|5|digital`. Accept a product when a non-negated clause of the ad has the same
+  identity key.
+* **Residual 2B trap promotions**, both stopped later:
+  * «Xbox Series X Controller Ladestation … Controller nicht dabei» read as the controller. The vision `accessory`
+    veto stops it.
+  * The PC without a GPU now lists «i5, 16GB RAM, 650W». It is only priced if an `ai:i5` history exists, and the
+    lower-bound sum stays far below the price.
+* **Interest is flat** on the 2B (almost always 6); it only breaks ties, as designed.
+
+**Vision path (2B + mmproj, the app's `AIEvaluator` through `make_llm(ai)`).** Both photos (the iCloud activation-lock
+screen and the MSI RTX 3060 label) came back as «Не удалось разобрать ответ модели». llama-server turns Qwen3.5's
+thinking **on** by default. The stage-C client doesn't send `enable_thinking=false` (only the scout's client does),
+so the model spent all of `ai.max_tokens` (700) on reasoning (2,400–2,550 characters) and returned empty content.
+Each photo took 128–185 s on this CPU (prompt 17 tok/s: ~750 image tokens). The model itself reads both images
+correctly when thinking is off (`AI_MODELS.md` §4.3: 13/15). **Recommendation:** send the scout's
+thinking-off `extra_body` for the vision endpoint too, or add an `ai.thinking` switch (default off).
+
+**Verdict: is the 2B good enough for a weak server?**
+
+* **Qwen3.5 2B with the new prompt is good enough as a reader for a weak server.** It gives 100 % JSON, 97 %
+  product, all 23 gems grounded and promotable, and 6/6 scams caught together with the code's red flags. Its kinds
+  (89 %) and its own scam tags (3/6) are weaker, but the blocked-kind and red-flag rules back them up. Speed on
+  this contended 4-core box was 12.4 s/ad (7.0 on the Sapphire Rapids VM), i.e. ~150–250 ads/hour at
+  `pass_share` 0.5. That is fine for one or two category scans. A typical 4–6-scan setup needs `mode: auto` to
+  fall back to "candidates" at peak.
+* **Qwen3.5 4B is better wherever judgement matters.** On the same 35 ads: kind 89 vs 83 %, product 100 vs 97 %,
+  scam tags 4/4 vs 2/4, no trap promoted, Russian reasons 97 %, no short answers. But it ran at ~26 s/ad here
+  (gen 3.5 tok/s, prompt 14 tok/s), ~70 ads/hour at 50 %. That is too slow to read every ad on a 4-core T0 box;
+  it suits T1 (8 cores, ~2.5× faster) or "candidates" mode. On a 4-core CPU its automatic batch of 10 exceeds the
+  default 180 s timeout. With the timeout fix the engine recovers after one lost call. Set
+  `ai.scout.max_batch: 5` there to skip even that. The catalog's T0 speed for the 4B (15.5 s/ad) holds only on an
+  idle machine.
+* **Recommendation:** keep the 2B as the T0 default, with the code's red flags as the scam backstop. Use the 4B on
+  T1 or better. Fix the vision path's thinking before relying on a Qwen3.5 vision model through llama.cpp.
 
 ## 15. Open issues / next steps
 

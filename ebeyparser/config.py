@@ -128,6 +128,13 @@ class PricingConfig(BaseModel):
 
 
 AIProvider = Literal["ollama", "openai", "anthropic"]
+# A free cloud endpoint (docs/design/CLOUD_AI.md): "" = a local server (LM Studio / Ollama / llama.cpp),
+# the default. The cloud ones are OpenAI-compatible (provider "openai"); their key lives in .env
+# (OPENROUTER_API_KEY / NVIDIA_API_KEY / OMNIROUTE_API_KEY / CLOUD_API_KEY), never in config.yaml.
+CloudKind = Literal["", "openrouter", "nvidia", "omniroute", "custom"]
+# The model's reasoning ("thinking"): "auto" = off for the photo check and the scout (answers in
+# seconds instead of minutes, all max_tokens go to the JSON), the model's default elsewhere.
+ThinkingMode = Literal["auto", "off", "on"]
 
 
 class LLMSettings(BaseModel):
@@ -144,6 +151,26 @@ class LLMSettings(BaseModel):
     temperature: float = 0.2  # ignored for Claude
     max_tokens: int = 700  # cap on the model's answer (a looping 7B model otherwise runs to the timeout)
     image_max_side: int = 1024  # photos are downscaled to this many px (needs Pillow; otherwise sent as is)
+    thinking: ThinkingMode = "auto"
+    # free cloud AI (docs/design/CLOUD_AI.md); "" keeps the local behaviour
+    cloud: CloudKind = ""
+    rpm: int = 0  # requests per minute; 0 = auto (the provider preset or the key's own limits)
+    daily_limit: int = 0  # requests per UTC day; 0 = auto (OpenRouter: 50, 1000 once $10 of credits were bought)
+
+
+class FallbackConfig(BaseModel):
+    """A local model that takes over while the cloud is limited (free quota used up, 429s) or
+    down. Empty / disabled = the usual "AI down" paths (the scout falls back to the script, photo
+    checks wait in the vision queue)."""
+
+    enabled: bool = False
+    provider: Literal["ollama", "openai"] = "openai"
+    base_url: str = ""
+    model: str = ""
+
+    @property
+    def usable(self) -> bool:
+        return self.enabled and bool(self.base_url.strip()) and bool(self.model.strip())
 
 
 class SecondOpinionConfig(LLMSettings):
@@ -196,6 +223,8 @@ class ScoutConfig(LLMSettings):
     pc_discount: float = 0.25  # parting out a PC: more work, lower price
     min_priced_share: float = 0.5  # share of a bundle's model-numbered parts that must have a market price
     learn_from_feedback: bool = True  # hidden / bought / sold deals become hints in the prompt
+    # the scout's local stand-in while its cloud endpoint is limited; empty = ai.fallback's server
+    fallback: FallbackConfig = Field(default_factory=FallbackConfig)
 
 
 class AIConfig(LLMSettings):
@@ -207,6 +236,11 @@ class AIConfig(LLMSettings):
     vision_wait_minutes: float = 45.0
     second_opinion: SecondOpinionConfig = Field(default_factory=SecondOpinionConfig)
     scout: ScoutConfig = Field(default_factory=ScoutConfig)
+    # «Облако + компьютер про запас»: the local model for photos while the cloud is limited or down
+    fallback: FallbackConfig = Field(default_factory=FallbackConfig)
+    # eBay's API license forbids passing its content to third parties / AI training: eBay ads never
+    # go to a cloud endpoint unless this is switched on (they use the fallback or the script path)
+    cloud_send_ebay: bool = False
 
 
 class EbayConfig(BaseModel):

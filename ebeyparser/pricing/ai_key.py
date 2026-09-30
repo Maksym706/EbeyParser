@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass
 from functools import lru_cache
 
-from .identity import ProductKey, _tokens, product_category, product_key
+from .identity import ProductKey, _tokens, classify_kind, product_category, product_key
 from .text import _BRANDS, _COLORS, _FILLER, normalize
 
 AI_KEY_PREFIX = "ai:"
@@ -257,13 +257,19 @@ def grounded(product: str, text: str) -> bool:
     clauses = _clauses(text)
     if not clauses:
         return False
-    models = [t for t in ptoks if any(c.isdigit() for c in t) and not _ATTR_RE.fullmatch(t)]
-    words = [t for t in ptoks if not any(c.isdigit() for c in t) and t not in _GENERIC_FAMILY
-             and not _ATTR_RE.fullmatch(t) and t not in _VARIANT_WORDS]
     if not all(_present(v, clauses) for v in ptoks if v in _VARIANT_WORDS):
         return False  # "Pro", "Ti", "OLED" the ad doesn't say
     if any(_capacity_conflict(c, ptoks, clauses) for c in ptoks if _CAPACITY_RE.fullmatch(c)):
         return False  # the ad states another storage size for this product
+    if _grounded_by_words(ptoks, clauses):
+        return True
+    return _grounded_by_identity(name, text)
+
+
+def _grounded_by_words(ptoks: list[str], clauses: list[tuple[str, ...]]) -> bool:
+    models = [t for t in ptoks if any(c.isdigit() for c in t) and not _ATTR_RE.fullmatch(t)]
+    words = [t for t in ptoks if not any(c.isdigit() for c in t) and t not in _GENERIC_FAMILY
+             and not _ATTR_RE.fullmatch(t) and t not in _VARIANT_WORDS]
     if models:
         strong = [t for t in models if not _weak_model(t)]
         if not all(_present(tok, clauses) for tok in strong or models):
@@ -274,3 +280,28 @@ def grounded(product: str, text: str) -> bool:
     if not words:
         return False
     return _present(max(words, key=len), clauses)
+
+
+_CLAUSE_NEGATIONS = (_NEG_BEFORE - {"gegen"}) | _NEG_AFTER | _WANT_WORDS
+
+
+def _grounded_by_identity(name: str, text: str) -> bool:
+    """"Sony PlayStation 5 Digital Edition" for an ad that says «PS5 digital»: identity.py knows
+    the aliases. Only a clause that names the same product (line, model and edition) as the same
+    kind of thing ("PS5 Controller" is an accessory) and negates nothing counts."""
+    want = product_key(name)
+    if want is None:
+        return False
+    kind = classify_kind(name)
+    for part in _CLAUSE_RE.split(text or ""):
+        toks = _tokens(part)
+        if not toks or _CLAUSE_NEGATIONS.intersection(toks):
+            continue
+        got = product_key(part)
+        if got is None or got.coarse_key() != want.coarse_key():
+            continue
+        if want.capacity and got.capacity and got.capacity != want.capacity:
+            continue
+        if classify_kind(part) in (kind, "bundle" if kind == "item" else kind):  # "PS5 mit 2 Controllern"
+            return True
+    return False

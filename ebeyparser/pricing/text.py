@@ -524,6 +524,9 @@ _RULES: tuple[_Rule, ...] = (
             r"(?:nur|ausschliesslich) (?:per |ueber |via |auf |mit )?"
             r"(?:whatsapp|whats app|telegram|sms|e mail|email|mail)",
             r"(?:bin|wohne|lebe|arbeite|zurzeit|derzeit|momentan|aktuell|beruflich) " + _GAP2 + r"im ausland",
+            # "da ich im Ausland bin", "weil ich gerade im Ausland lebe", "ich befinde mich im Ausland"
+            r"(?:da|weil|denn|ich|wir) (?:ich |wir )?" + _GAP2 + r"im ausland (?:bin|sind|lebe|leben|wohne|arbeite)",
+            r"befinde (?:mich )?" + _GAP2 + r"im ausland",
             r"(?:versand|versende|verschicke) (?:nur )?(?:ins|aus dem|vom) ausland",
             r"(?:ueberweisung|zahlung|bezahlung) " + _GAP2 + r"(?:vorab|im voraus|vorraus)",
             r"(?:vorab|im voraus) (?:per )?(?:ueberweis\w*|bezahl\w*|zahl\w*)",
@@ -534,6 +537,10 @@ _RULES: tuple[_Rule, ...] = (
             r"(?:link\w*|whatsapp|whats app|telegram|formular\w*|(?:deine|ihre|your) (?:e mail|email|mail)\w*) "
             r"(?:[^\s.!?]+ ){0,10}sicher bezahlen",
             r"(?:zahlungs|bezahl|kauf|sicherheits)link\w*",
+            # the same trick split over two sentences: "… 'Sicher bezahlen'. Bitte mir den Link schicken"
+            r"sicher bezahlen (?:[^\s.!?]+ ){0,6}[.!?] (?:[^\s.!?]+ ){0,6}"
+            r"(?:link\w* (?:[^\s.!?]+ ){0,3}(?:schick\w*|send\w*|zukommen)|(?:schick\w*|send\w*) (?:[^\s.!?]+ ){0,4}"
+            r"link\w*|handynummer|telefonnummer|(?:deine|ihre|your) (?:e mail|email|mail|nummer|handynummer)\w*)",
         ],
     ),
     _rule(
