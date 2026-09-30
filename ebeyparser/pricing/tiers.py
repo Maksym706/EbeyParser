@@ -58,3 +58,43 @@ def deal_tier(ev: Evaluation | None, cfg: Any = None) -> str:
     if ev.verdict == "maybe":
         return TIER_MAYBE
     return TIER_SKIP
+
+
+TIERS = (TIER_SUPER, TIER_DEAL, TIER_UNCHECKED, TIER_MAYBE, TIER_SKIP)
+
+
+def _super_sql(cfg: Any) -> tuple[str, list[Any]]:
+    """is_super() as an SQL condition on the evaluations row `e` (JSON in e.data); "0" when off."""
+    if cfg is None or not getattr(cfg, "enabled", False):
+        return "0", []
+    markets = sorted(_REAL_MARKET)
+    return (
+        "(e.verdict = 'buy'"
+        " AND json_extract(e.data, '$.action') IN ('buy', 'haggle')"
+        " AND json_extract(e.data, '$.ai_checked') = 1"
+        " AND COALESCE(json_extract(e.data, '$.no_alert'), 0) = 0"
+        " AND COALESCE(json_array_length(json_extract(e.data, '$.red_flags')), 0) = 0"
+        f" AND json_extract(e.data, '$.estimate.source') IN ({','.join('?' * len(markets))})"
+        " AND json_extract(e.data, '$.expected_profit') >= ?"
+        " AND json_extract(e.data, '$.roi') >= ?"
+        " AND e.score >= ?)",
+        [*markets, float(cfg.min_profit), float(cfg.min_roi), float(cfg.min_score)],
+    )
+
+
+def tier_sql(tier: str, cfg: Any = None) -> tuple[str, list[Any]]:
+    """deal_tier(ev, cfg) == tier as an SQL condition on `e` (db.find_deals: the feed's tier
+    filter and counts). The same rules as deal_tier() / is_super(); no evaluation matches none."""
+    would_buy = "(COALESCE(json_extract(e.data, '$.would_buy'), 0) = 1)"
+    if tier == TIER_SUPER:
+        return _super_sql(cfg)
+    if tier == TIER_DEAL:
+        cond, params = _super_sql(cfg)
+        return f"(e.verdict = 'buy' AND (CASE WHEN {cond} THEN 1 ELSE 0 END) = 0)", params
+    if tier == TIER_UNCHECKED:
+        return f"(e.verdict != 'buy' AND {would_buy})", []
+    if tier == TIER_MAYBE:
+        return f"(e.verdict = 'maybe' AND NOT {would_buy})", []
+    if tier == TIER_SKIP:
+        return f"(e.verdict NOT IN ('buy', 'maybe') AND NOT {would_buy})", []
+    raise ValueError(f"unknown tier {tier!r}; expected one of {TIERS}")

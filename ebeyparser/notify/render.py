@@ -71,22 +71,30 @@ def _group(n: int) -> str:
     return f"{n:,}".replace(",", ".")  # German thousands separator
 
 
-def format_money(value: float | None) -> str:
+def format_money(value: float | None, *, russian: bool = False) -> str:
     """German-style euro amount: 1234.5 -> "1.235 €", 7.5 -> "7,50 €", None -> "—".
+    russian=True: the web app's format (lib/format.js money()): "1 235 €" with non-breaking
+    spaces and "−" for negatives (format_money_ru).
 
     Whole numbers and amounts >= 100 € are shown without cents."""
     d = _to_decimal(value)
     if d is None:
         return "—"
+    sep, space, minus = (" ", " ", "−") if russian else (".", " ", "-")
     cents = d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     if abs(cents) >= 100 or cents == cents.to_integral_value():
         q = d.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-        body = _group(abs(int(q)))
+        body = _group(abs(int(q))).replace(".", sep)
     else:
         q = cents
         whole, frac = f"{abs(q):.2f}".split(".")
-        body = f"{_group(int(whole))},{frac}"
-    return f"{'-' if q < 0 else ''}{body} €"
+        body = f"{_group(int(whole)).replace('.', sep)},{frac}"
+    return f"{minus if q < 0 else ''}{body}{space}€"
+
+
+def format_money_ru(value: float | None) -> str:
+    """Russian money for API texts the web app shows as is: 1065 -> "1 065 €" (non-breaking spaces)."""
+    return format_money(value, russian=True)
 
 
 def format_percent(value: float | None) -> str:

@@ -69,6 +69,35 @@ def test_screen_styles_use_tokens() -> None:
     assert hexes <= {"#fff"}, hexes
 
 
+def _coarse_rules(css: str) -> str:
+    """The bodies of every `@media (pointer: coarse…)` block (touch devices only)."""
+    out = []
+    for m in re.finditer(r"@media [^{]*\(pointer: coarse\)[^{]*\{", css):
+        depth, i = 1, m.end()
+        while depth and i < len(css):
+            depth += {"{": 1, "}": -1}.get(css[i], 0)
+            i += 1
+        out.append(css[m.end():i])
+    return "\n".join(out)
+
+
+def test_small_controls_get_44px_on_touch_only() -> None:
+    """Touch targets that were under 44 px on tablets / phones: the settings side menu (38), the run-errors
+    count in the Состояние table (26 wide), the composer's «сегодня / завтра / в выходные» (28). The
+    desktop sizes stay; only coarse pointers get the bigger (or extended) targets."""
+    settings = (SPA_DIR / "css" / "settings.css").read_text(encoding="utf-8")
+    screens = (SPA_DIR / "css" / "screens.css").read_text(encoding="utf-8")
+    assert re.search(r"\.settings-nav__link \{[^}]*min-height: 38px", settings)  # desktop density kept
+    assert re.search(r"\.settings-nav__link \{\s*min-height: 44px;", _coarse_rules(settings))
+    touch = _coarse_rules(screens)
+    assert re.search(r"\.mini-seg button,\s*\.addon \{[^}]*height: 44px", touch)
+    assert re.search(r"\.mini-seg button \{[^}]*height: 28px", screens)
+    assert re.search(r"\.addon \{[^}]*height: 28px", screens)
+    # the table pill stays compact; its ::after reaches 44 × 44 (32 + 2 × 6 wide, 28 + 2 × 8 tall)
+    assert re.search(r"\.rtable \.runerr \{[^}]*min-width: 32px;[^}]*min-height: 28px", touch)
+    assert re.search(r"\.rtable \.runerr::after \{[^}]*inset: -8px -6px", touch)
+
+
 NODE_SCRIPT = r"""
 const dm = await import(process.argv[2] + "/features/deal-model.js");
 const m = await import(process.argv[2] + "/features/messages.js");

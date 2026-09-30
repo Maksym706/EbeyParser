@@ -3,6 +3,7 @@ ready Russian *_label / *_ru texts, like the rest of the API."""
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ...projects import knowledge as kb
@@ -467,9 +468,35 @@ def project_card(project: Project, state: ProjectState, *, searches: int = 0,
     }
 
 
+_URL_RE = re.compile(r"https?://\S+")
+_LEAD_SYMBOLS_RE = re.compile(r"^[^\w«(~]+")  # emoji, ⚠, • before the text
+_DE_THOUSANDS_RE = re.compile(r"(\d)\.(?=\d{3}(?!\d))")
+
+
+def legacy_alert_fields(text: str) -> dict[str, str]:
+    """title_ru / detail_ru / url of an alert stored before they existed, from its Telegram text:
+    the first line is the news, the rest is plain detail; links, emoji and German numbers go."""
+    lines: list[str] = []
+    url = ""
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("Сборка: "):  # the build's own link
+            continue
+        url = url or next(iter(_URL_RE.findall(line)), "")
+        line = _LEAD_SYMBOLS_RE.sub("", _URL_RE.sub("", line)).strip().rstrip(" —-·").strip()
+        line = _DE_THOUSANDS_RE.sub("\\1\u00a0", line).replace(" €", "\u00a0€")
+        if line:
+            lines.append(line)
+    return {"title_ru": lines[0] if lines else "", "detail_ru": " · ".join(lines[1:]), "url": url}
+
+
 def alert_view(a: AlertRecord) -> dict[str, Any]:
+    """`text` is the Telegram message (kept as it was sent); title_ru / detail_ru / url are for the app."""
+    fields = {"title_ru": a.title_ru, "detail_ru": a.detail_ru, "url": a.url}
+    if not a.title_ru:
+        fields = legacy_alert_fields(a.text)
     return {"kind": a.kind, "kind_label": ALERT_KIND_LABELS.get(a.kind, a.kind), "ad_id": a.ad_id, "slot": a.slot,
-            "price": rnd(a.price), "total": rnd(a.total), "text": a.text, "delivered": a.delivered,
+            "price": rnd(a.price), "total": rnd(a.total), "text": a.text, **fields, "delivered": a.delivered,
             "delivered_label": "Отправлено" if a.delivered else "Только в приложении",
             "sent_at": iso(a.sent_at), "sent_at_label": when_label(a.sent_at), "deal_path": f"/deal/{a.ad_id}"}
 

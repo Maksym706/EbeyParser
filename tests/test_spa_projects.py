@@ -71,7 +71,21 @@ def test_every_server_event_has_a_listener() -> None:
     assert known
     names = set(re.findall(r'"([a-z_]+)"', known.group(1)))
     assert set(EVENT_TYPES) <= names, set(EVENT_TYPES) - names
-    assert "project_updated" in names
+    assert {"project_updated", "project_deleted"} <= names
+
+
+def test_ui_relies_on_the_server_fixes() -> None:
+    """project_deleted (no project_updated for a deleted build), the undo of «Купил» that restores the deal
+    on the server, and the alerts' own title_ru / detail_ru instead of cutting the Telegram text."""
+    live = _read(JS / "features" / "projects-live.js")
+    page = _read(JS / "screens" / "projects" / "project.js")
+    track = _read(JS / "features" / "projects-track.js")
+    assert 'onEvent("project_deleted", onDeleted)' in live and "gone.has(id)" in live
+    assert 'onEvent("project_deleted"' in page and "deleting.current" in page  # our own DELETE: no «Сборку удалили»
+    assert 'reason === "deleted"' not in live + page
+    assert "api.patch(`/deals" not in track and "projectsApi.unbought(p.id, slot.key)" in track
+    assert "a.title_ru" in track and "a.detail_ru" in track and "alertLine" not in track
+    assert "a.title_ru" in live
 
 
 def test_stylesheet_linked_served_and_tokens_only(client: TestClient) -> None:

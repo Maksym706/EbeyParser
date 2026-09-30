@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse, Response
 
 from ...models import utcnow
+from ...pricing.tiers import TIERS
 from ...timefmt import local_tz, to_local
 from .context import ApiContext, get_ctx, parse_since
 from .errors import ApiError, validation_error
@@ -48,6 +49,7 @@ VERDICTS = ("buy", "maybe", "skip", "none")
 ACTIONS = ("buy", "haggle", "bid", "watch", "skip")
 GOOD_ACTIONS = ["buy", "haggle", "bid"]
 SORTS = ("best", "score", "fresh", "newest", "profit", "price", "roi", "distance", "ending", "updated")
+FOUND_BY = ("script", "ai_scout")
 
 
 # ------------------------------------------------------------------ filters
@@ -143,6 +145,17 @@ def deal_filters(ctx: ApiContext, params: Any) -> tuple[dict[str, Any], str]:
     ai_checked = _bool(params.get("ai_checked"))
     if ai_checked is not None:
         filters["ai_checked"] = ai_checked
+    tiers = _csv(params.get("tier"))
+    if any(t not in TIERS for t in tiers):
+        errors["tier"] = ", ".join(TIERS)
+    elif tiers:  # the card's `tier`: judged in SQL with the same rules (notifications.super_deals)
+        filters["tiers"] = tiers
+        filters["super_rules"] = ctx.config.notifications.super_deals
+    found_by = _csv(params.get("found_by"))
+    if any(f not in FOUND_BY for f in found_by):
+        errors["found_by"] = " или ".join(FOUND_BY)
+    elif found_by:
+        filters["found_by"] = found_by
     since_raw = params.get("since")
     if since_raw:
         since = parse_since(since_raw)
@@ -210,13 +223,16 @@ def _facets(ctx: ApiContext, filters: dict[str, Any]) -> dict[str, Any]:
         "near_10km": count(max_km=10.0),
         "shipping": count(shipping=True),
         "hidden": count(statuses=["ignored"]),
+        "tier": {"super": count(tiers=["super"], super_rules=ctx.config.notifications.super_deals)},
+        "found_by": {"ai_scout": count(found_by=["ai_scout"])},
     }
 
 
 # -------------------------------------------------------------------- feed
 @router.get("/deals", response_model=DealsPage, responses=ERRORS,
             summary="Лента: фильтры verdict/action/actionable/purpose/source/search/status/q/min_score/min_profit/"
-                    "min_price/max_price/max_km/shipping/no_flags/unseen/ai_checked/since; sort best|fresh|profit|price|roi|"
+                    "min_price/max_price/max_km/shipping/no_flags/unseen/ai_checked/tier/found_by/since; "
+                    "sort best|fresh|profit|price|roi|"
                     "distance|ending|updated; limit+offset | page | cursor; facets=1")
 async def deals_list(request: Request, ctx: ApiContext = Depends(get_ctx)) -> dict[str, Any]:
     params = request.query_params

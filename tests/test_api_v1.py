@@ -28,7 +28,7 @@ from api_v1_helpers import (
 )
 from ebeyparser.config import AppConfig, SearchConfig, load_config
 from ebeyparser.db import Database
-from ebeyparser.models import Comparable, Evaluation, Listing, utcnow
+from ebeyparser.models import Comparable, Evaluation, Listing, PriceEstimate, utcnow
 from ebeyparser.web.app import create_app
 from ebeyparser.scraper.categories import merge_categories, parse_category_links
 
@@ -438,6 +438,83 @@ def test_deals_feed_filters_sort_and_pages(api) -> None:
     assert bad.status_code == 422
     assert set(bad.json()["error"]["fields"]) == {"verdict", "sort", "max_km", "since"}
     assert c.get("/api/v1/deals", params={"cursor": "!!"}).status_code == 422
+
+
+def _tier_cases(db: Database) -> None:
+    """Evaluations on the edges of «🔥 Супер-находка» (notifications.super_deals: profit ≥ 120,
+    ROI ≥ 0.8, score ≥ 85, photos checked, a real market, no warning) and of the other tiers."""
+    base: dict[str, object] = dict(verdict="buy", action="buy", ai_checked=True, expected_profit=300.0, roi=1.2,
+                                   score=92.0, stage="full", found_by="script")
+    cases: dict[str, dict[str, object]] = {
+        "4000000001": {},  # super
+        "4000000002": {"action": "haggle", "found_by": "ai_scout"},  # super, found by the scout
+        "4000000003": {"roi": None},  # a buy without ROI: deal
+        "4000000004": {"ai_checked": None},  # photos not checked: deal
+        "4000000005": {"red_flags": ["Предоплата"]},
+        "4000000006": {"no_alert": True},
+        "4000000007": {"score": 84.9},
+        "4000000008": {"expected_profit": 119.0},
+        "4000000009": {"source": "ai"},  # market price only from the AI
+        "4000000010": {"verdict": "maybe", "action": "watch", "would_buy": True, "ai_checked": False},  # unchecked
+        "4000000011": {"verdict": "maybe", "action": "haggle", "found_by": "ai_scout"},
+        "4000000012": {"verdict": "skip", "action": "skip", "found_by": ""},  # evaluated before the scout: script
+    }
+    for ad_id, over in cases.items():
+        fields = {**base, **over}
+        source = fields.pop("source", "history")
+        db.upsert_listing(Listing(ad_id=ad_id, url=f"https://www.kleinanzeigen.de/s-anzeige/x/{ad_id}-1-2",
+                                  title=f"Tier case {ad_id}", price=250.0, search_name="Tiers"))
+        db.save_evaluation(Evaluation(ad_id=ad_id, buy_price=250.0, estimate=PriceEstimate(
+            market_price=600.0, sample_size=8, source=source), **fields))  # type: ignore[arg-type]
+
+
+def test_deals_tier_and_found_by_filters_match_the_cards(api) -> None:
+    """tier / found_by are judged in SQL with the same rules as the cards' own `tier` / `found_by`:
+    exact totals (the feed's «Супер» chip) and facet counts."""
+    c, app, config, db, *_ = api
+    _tier_cases(db)
+    everything = {"verdict": "all", "status": "any", "limit": 200}
+    cards = c.get("/api/v1/deals", params=everything).json()["items"]
+
+    def page(**params: object) -> tuple[set[str], int]:
+        r = c.get("/api/v1/deals", params={**everything, **params})
+        assert r.status_code == 200, r.text
+        return {d["id"] for d in r.json()["items"]}, r.json()["total"]
+
+    for tier in ("super", "deal", "unchecked", "maybe", "skip"):
+        want = {d["id"] for d in cards if d["tier"] == tier}
+        assert page(tier=tier) == (want, len(want)), tier
+    supers, _ = page(tier="super")
+    assert {"4000000001", "4000000002"} <= supers
+    assert not supers & {f"40000000{n:02d}" for n in range(3, 13)}
+    assert {f"40000000{n:02d}" for n in range(3, 10)} <= page(tier="deal")[0]
+    assert "4000000010" in page(tier="unchecked")[0] and "4000000011" in page(tier="maybe")[0]
+    both = page(tier="super,unchecked")[0]
+    assert both == supers | page(tier="unchecked")[0]
+    for who in ("ai_scout", "script"):
+        want = {d["id"] for d in cards if d["found_by"] == who}
+        assert page(found_by=who) == (want, len(want)), who
+    assert {"4000000002", "4000000011"} <= page(found_by="ai_scout")[0]
+    assert "4000000012" in page(found_by="script")[0]
+
+    # the feed's defaults (buy + maybe): the facet counts what the chip would show, with the other filters
+    feed = c.get("/api/v1/deals", params={"facets": 1}).json()
+    assert feed["facets"]["tier"]["super"] == c.get("/api/v1/deals", params={"tier": "super"}).json()["total"] >= 2
+    assert feed["facets"]["found_by"]["ai_scout"] == c.get("/api/v1/deals", params={"found_by": "ai_scout"}).json()["total"]
+    haggle = c.get("/api/v1/deals", params={"facets": 1, "action": "haggle"}).json()["facets"]
+    assert haggle["tier"]["super"] == c.get("/api/v1/deals", params={"tier": "super", "action": "haggle"}).json()["total"]
+    assert "4000000002" in {d["id"] for d in c.get("/api/v1/deals", params={"tier": "super", "action": "haggle"}).json()["items"]}
+
+    # the thresholds are the settings of the moment
+    config.notifications.super_deals.min_score = 93
+    assert "4000000001" not in page(tier="super")[0]
+    assert "4000000001" in page(tier="deal")[0]
+    config.notifications.super_deals.enabled = False
+    assert page(tier="super") == (set(), 0)
+    assert page(tier="deal")[1] == len([d for d in cards if d["verdict"] == "buy"])
+
+    bad = c.get("/api/v1/deals", params={"tier": "great", "found_by": "robot"})
+    assert bad.status_code == 422 and set(bad.json()["error"]["fields"]) == {"tier", "found_by"}
 
 
 def test_deal_detail(api) -> None:

@@ -4362,6 +4362,24 @@ a.comps__row:hover {
   .strip__actions .btn--sm {
     min-width: 44px;
   }
+  /* the run-errors count in the table (tablet): a compact pill, the ::after makes it 44 × 44 */
+  .rtable .runerr {
+    position: relative;
+    justify-content: center;
+    min-width: 32px;
+    min-height: 28px;
+  }
+  .rtable .runerr::after {
+    content: "";
+    position: absolute;
+    inset: -8px -6px;
+  }
+  /* composer «сегодня / завтра / в выходные» and its add-on chips */
+  .mini-seg button,
+  .addon {
+    height: 44px;
+    padding: 0 12px;
+  }
 }
 @media (pointer: coarse) {
   .tag--link {

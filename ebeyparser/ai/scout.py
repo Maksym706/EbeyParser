@@ -356,12 +356,10 @@ def status_view(*, enabled: bool, mode_setting: str, provider: str, base_url: st
         sec, expected = float(expected_sec_per_ad), True
         per_hour = 3600.0 * max(0.05, pass_share) / sec
         capacity = int(min(max_per_hour, per_hour) if max_per_hour > 0 else per_hour)
-    if sec:
-        speed = f"≈ {sec:.1f} с на объявление"
+    if sec:  # Russian decimal comma; an estimate is flagged by speed_expected (the app's «оценка» mark)
+        speed = f"≈ {sec:.1f} с на объявление".replace(".", ",")
         if capacity:
             speed += f", до {capacity} {_words(int(capacity), 'объявления', 'объявлений', 'объявлений')} в час"
-        if expected:
-            speed = "Ожидается " + speed + " (пока не измерено)"
     return {
         "enabled": enabled,
         "state": state,

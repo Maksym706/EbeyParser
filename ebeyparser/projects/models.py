@@ -55,6 +55,9 @@ class Purchase(BaseModel):
     option: str | None = None
     note: str = ""
     at: datetime = Field(default_factory=utcnow)
+    # the deal's own state before this purchase moved it to «Купил» ({status, bought_price, bought_at});
+    # undoing the purchase puts it back. None: no ad, or recorded before this existed («Новое» then)
+    deal_before: dict[str, Any] | None = None
 
 
 class PlanSlot(BaseModel):
@@ -117,7 +120,11 @@ class AlertRecord(BaseModel):
     slot: str = ""
     price: float | None = None
     total: float | None = None
-    text: str = ""
+    text: str = ""  # the Telegram message (several lines, emoji, links, German numbers)
+    # the same for the app (tracker.alert_fields): one line / plain text / the ad's link; "" on old rows
+    title_ru: str = ""
+    detail_ru: str = ""
+    url: str = ""
     delivered: bool = False
     sent_at: datetime = Field(default_factory=utcnow)
 

@@ -482,11 +482,70 @@ def alert_text(state: ProjectState, drafts: list[AlertDraft], *, project_url: st
 
 
 def toast_text(state: ProjectState, drafts: list[AlertDraft]) -> str:
+    """One line with the build name (Russian number format), e.g. for a toast."""
     project = state.project
     first = drafts[0]
     if first.kind == "budget_fit" and len(drafts) == 1:
-        return f"Сборка «{project.name}» укладывается в бюджет: {_money(state.totals['best_total'])}"
-    return f"Сборка «{project.name}»: {offer_title(first.offer)} за {_money(first.offer.unit_cost)} — ниже цели"
+        return f"Сборка «{project.name}» укладывается в бюджет: {_money_ru(state.totals['best_total'])}"
+    return f"Сборка «{project.name}»: {offer_title(first.offer)} за {_money_ru(first.offer.unit_cost)} — ниже цели"
+
+
+def _money_ru(value: float | None) -> str:
+    from ..notify.render import format_money_ru
+
+    return format_money_ru(value)
+
+
+def _cap(text: str) -> str:
+    return text[:1].upper() + text[1:]
+
+
+def alert_fields(state: ProjectState, drafts: list[AlertDraft], *, project_url: str | None = None) -> dict[str, str]:
+    """The same news as alert_text() for API consumers (the web app shows them as they are):
+    title_ru — one line; detail_ru — plain text, no links, no emoji; url — the ad; project_url —
+    the build. Money in the Russian format («1 065 €»); alert_text() stays the Telegram message."""
+    project = state.project
+    t = state.totals
+    slot_drafts = [d for d in drafts if d.kind == "slot_target"]
+    fit = next((d for d in drafts if d.kind == "budget_fit"), None)
+    details: list[str] = []
+    if len(slot_drafts) > 1:
+        n = len(slot_drafts)
+        title = f"{n} {_plural(n, 'предложение', 'предложения', 'предложений')} ниже цели"
+        details += [f"{offer_title(d.offer)} за {_money_ru(d.offer.unit_cost)} (цель {_money_ru(d.target)})"
+                    for d in slot_drafts[:3]]
+        if n > 3:
+            details.append(f"и ещё {n - 3}")
+        first = slot_drafts[0].offer
+    elif slot_drafts:
+        d = slot_drafts[0]
+        ss = state.slots[d.slot]
+        first = o = d.offer
+        title = f"{offer_title(o)} за {_money_ru(o.unit_cost)}"
+        if d.alternative:
+            title += f" вместо {ss.rs.part.label if ss.rs.part else ss.rs.slot.label}"
+        title += f" — ниже цели {_money_ru(d.target)}"
+        market = ss.price.typical if not d.alternative else None
+        if market and market > o.unit_cost:
+            details.append(f"рынок ~{_money_ru(market)}, экономия ~{_money_ru(market - o.unit_cost)}")
+        details += [f["text_ru"] for f in o.flags if f["level"] == "warn"][:2]
+        if o.listing.distance_km is not None:
+            details.append(f"{round(o.listing.distance_km)} км от тебя"
+                           + (f", {o.listing.location}" if o.listing.location else ""))
+    else:
+        assert fit is not None
+        first = fit.offer
+        title = f"Сборка укладывается в бюджет: {_money_ru(t['best_total'])} из {_money_ru(project.budget)}"
+        details.append(f"новое предложение: {offer_title(first)} за {_money_ru(first.unit_cost)}")
+    if fit is not None and slot_drafts:
+        details.append(f"вся сборка сейчас {_money_ru(t['best_total'])} из {_money_ru(project.budget)}"
+                       " — укладываешься в бюджет")
+    elif fit is None and project.budget:
+        details.append(f"вся сборка сейчас ~{_money_ru(t['estimated_total'])} из {_money_ru(project.budget)}"
+                       + ("" if t["best_complete"] else " (часть деталей — по рынку)"))
+    details.append(f"собрано {t['slots_done']} из {t['slots_total']}")
+    return {"title_ru": title, "detail_ru": " · ".join(_cap(x.strip()) for x in details if x.strip()),
+            "url": first.listing.url or "", "project_url": project_url or ""}
 
 
 def monitor_covers(config: Any, db: Any, ad_id: str, evaluation: Evaluation | None) -> bool:
@@ -719,10 +778,12 @@ class ProjectAlerter:
                 return 0
         url = self._project_url(project.id) if self._project_url else None
         text = alert_text(state, drafts, project_url=url)
+        fields = alert_fields(state, drafts, project_url=url)
         claimed = []
         for d in drafts:
             record = AlertRecord(project_id=project.id, ad_id=d.offer.ad_id, kind=d.kind, slot=d.slot,  # type: ignore[arg-type]
-                                 price=d.offer.unit_cost, total=state.totals.get("best_total"), text=text)
+                                 price=d.offer.unit_cost, total=state.totals.get("best_total"), text=text,
+                                 title_ru=fields["title_ru"], detail_ru=fields["detail_ru"], url=fields["url"])
             if self.store.claim_alert(record):
                 claimed.append(record)
         if not claimed:
@@ -739,7 +800,8 @@ class ProjectAlerter:
             self.store.save(project)
         self.sent.append(text)
         self._announce(project, "alert", state, alert={"kinds": sorted({d.kind for d in drafts}),
-                                                       "text_ru": toast_text(state, drafts),
+                                                       "text_ru": toast_text(state, drafts), **fields,
+                                                       "project_name": project.name,
                                                        "delivered": delivered > 0,
                                                        "ad_id": drafts[0].offer.ad_id})
         return len(claimed)
@@ -747,9 +809,12 @@ class ProjectAlerter:
     def _record_covered(self, state: ProjectState, drafts: list[AlertDraft]) -> None:
         project = state.project
         for d in drafts:
+            fields = alert_fields(state, [d])
             record = AlertRecord(project_id=project.id, ad_id=d.offer.ad_id, kind=d.kind, slot=d.slot,  # type: ignore[arg-type]
                                  price=d.offer.unit_cost, total=state.totals.get("best_total"),
-                                 text=context_line(state, d.offer) + " (в уведомлении о сделке)", delivered=True)
+                                 text=context_line(state, d.offer) + " (в уведомлении о сделке)", delivered=True,
+                                 title_ru=fields["title_ru"], url=fields["url"],
+                                 detail_ru=" · ".join(x for x in (fields["detail_ru"], "Пришло в уведомлении о сделке") if x))
             self.store.claim_alert(record)
         if any(d.kind == "budget_fit" for d in drafts) and not project.fits_alerted:
             project.fits_alerted = True
@@ -785,7 +850,8 @@ class ProjectAlerter:
 
 
 __all__ = [
-    "AlertDraft", "Offer", "ProjectAlerter", "ProjectState", "SlotState", "alert_candidates", "alert_text",
+    "AlertDraft", "Offer", "ProjectAlerter", "ProjectState", "SlotState", "alert_candidates", "alert_fields",
+    "alert_text",
     "budget_ratio", "collect_offers", "context_line", "find_offer", "monitor_covers", "option_target", "price_trend",
     "project_state", "rank_gpu_offers", "round_price", "spent_total", "stretch_label", "toast_text", "total_with",
     "totals",

@@ -135,24 +135,26 @@ export default function ProjectPage({ id, slotKey, query = {} }) {
   useEffect(() => {
     load();
   }, [id]);
-  // live: refetch on the build's own events; a deletion elsewhere closes the page
+  // live: refetch on the build's own events; a deletion elsewhere closes the page. The server
+  // sends no project_updated for a build being deleted; `deleting` still covers our own DELETE,
+  // whose project_deleted may arrive before its answer.
   useEffect(() => {
     let t = null;
     const later = () => {
       clearTimeout(t);
-      t = setTimeout(() => load(), 1000);
+      t = setTimeout(() => !deleting.current && load(), 1000);
     };
     const offs = [
       onEvent("project_updated", (d) => {
-        if (!d || String(d.id) !== String(id)) return;
-        if (d.reason === "deleted") {
-          if (deleting.current) return;
-          forgetView(id);
-          toast.info("Сборку удалили");
-          navigate("/projects", { replace: true });
-          return;
-        }
+        if (!d || String(d.id) !== String(id) || deleting.current) return;
         if (["offer", "run", "alert", "bought", "updated", "tracking"].includes(d.reason)) later();
+      }),
+      onEvent("project_deleted", (d) => {
+        if (!d || String(d.id) !== String(id) || deleting.current) return;
+        clearTimeout(t);
+        forgetView(id);
+        toast.info("Сборку удалили");
+        navigate("/projects", { replace: true });
       }),
       onEvent("connected", later),
     ];

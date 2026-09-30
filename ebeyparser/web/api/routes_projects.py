@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
+from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query
@@ -34,7 +35,7 @@ from ...projects.tracker import HAGGLE_ROOM, ProjectAlerter, ProjectState, optio
 from ...scraper.categories import WISHLIST_EXCLUDE_KEYWORDS
 from .context import ApiContext, get_ctx
 from .errors import ApiError, validation_error
-from .presenters import search_ids
+from .presenters import API_STATUSES, STATUS_LABELS, search_ids
 from .project_views import offer_view, plan_view, project_card, project_view, templates_payload
 from .schemas import ERRORS, ApiModel
 
@@ -141,15 +142,30 @@ def _card(ctx: ApiContext, project: Project, state: ProjectState | None = None) 
                         alerts=store.alert_counts().get(project.id, (0, None)))
 
 
+def _deleting(ctx: ApiContext) -> set[int]:
+    """Ids of builds whose DELETE is running right now (their late updates are dropped)."""
+    ids = getattr(ctx, "projects_deleting", None)
+    if ids is None:
+        ids = ctx.projects_deleting = set()  # type: ignore[attr-defined]
+    return ids
+
+
 def publish(ctx: ApiContext, project: Project | None, reason: str, **extra: Any) -> None:
-    data: dict[str, Any] = {"id": project.id if project else extra.pop("id", None), "reason": reason, **extra}
-    if project is not None and reason != "deleted":
+    """project_updated for a build that still exists. Never for one being deleted or already gone
+    (an alert check that was running when it was deleted): its DELETE sends project_deleted, and a
+    later project_updated would bring the card back in the UI."""
+    pid = project.id if project else extra.pop("id", None)
+    if pid is not None and (pid in _deleting(ctx) or not store_of(ctx).exists(pid)):
+        log.debug("project_updated (%s) of deleted build %s dropped", reason, pid)
+        return
+    data: dict[str, Any] = {"id": pid, "reason": reason, **extra}
+    state = data.pop("state", None)
+    if project is not None:
         try:
-            data["card"] = _card(ctx, project, extra.pop("state", None) if "state" in extra else None)
+            data["card"] = _card(ctx, project, state)
         except Exception:  # noqa: BLE001 - an event must never fail a request
             log.exception("project card for event failed")
             data["card"] = None
-    data.pop("state", None)
     ctx.hub.publish("project_updated", data)
 
 
@@ -616,15 +632,20 @@ async def projects_delete(project_id: int, keep_searches: bool = Query(False),
     names = {link.search_name for link in store.searches(project.id)}
     removed: list[str] = []
     warning = ""
-    if names and not keep_searches:
-        if ctx.config_path is not None and ctx.config_writable():
-            removed = [s.name for s in ctx.config.searches if s.name in names]
-            if removed:
-                ctx.save_searches([s for s in ctx.config.searches if s.name not in names], reason="project")
-        else:
-            warning = "Поиски сборки остались: настройки сейчас нельзя менять — удали их в «Поисках»"
-    store.delete(project.id)
-    publish(ctx, None, "deleted", id=project.id)
+    deleting = _deleting(ctx)
+    deleting.add(project.id)  # no project_updated for it from here on (see publish)
+    try:
+        if names and not keep_searches:
+            if ctx.config_path is not None and ctx.config_writable():
+                removed = [s.name for s in ctx.config.searches if s.name in names]
+                if removed:
+                    ctx.save_searches([s for s in ctx.config.searches if s.name not in names], reason="project")
+            else:
+                warning = "Поиски сборки остались: настройки сейчас нельзя менять — удали их в «Поисках»"
+        store.delete(project.id)
+    finally:
+        deleting.discard(project.id)
+    ctx.hub.publish("project_deleted", {"id": project.id, "name": project.name, "searches_removed": len(removed)})
     message = f"Сборка «{project.name}» удалена" + (f", поисков убрано: {len(removed)}" if removed else "")
     return {"deleted": project.id, "searches_removed": removed, "message_ru": message, "warning_ru": warning}
 
@@ -693,22 +714,16 @@ async def projects_bought(project_id: int, slot_key: str, body: BoughtIn,
         slot.chosen = body.option
         apply_dependents(project, keep={slot_key}, ideal=False)
         rs = resolve(project)[slot_key]
+    found = ctx.db.get_deal_extras(body.ad_id) if body.ad_id else None
     slot.purchases.append(Purchase(price=body.price, qty=qty, ad_id=body.ad_id or None, option=slot.chosen,
-                                   note=body.note.strip()))
+                                   note=body.note.strip(), deal_before=_deal_snapshot(found)))
     if sum(p.qty for p in slot.purchases) >= rs.qty:
         slot.status = "bought"
     deal_note = ""
-    if body.ad_id:
-        found = ctx.db.get_deal_extras(body.ad_id)
-        if found is not None:
-            ctx.db.update_deal_state(body.ad_id, status="bought", bought_price=body.price, bought_at=utcnow())
-            from .routes_deals import publish_update
-
-            try:
-                publish_update(ctx, body.ad_id)
-            except Exception:  # noqa: BLE001
-                log.exception("deal_updated after purchase failed")
-            deal_note = " Сделка отмечена как «Купил» в «Моих сделках»."
+    if body.ad_id and found is not None:
+        ctx.db.update_deal_state(body.ad_id, status="bought", bought_price=body.price, bought_at=utcnow())
+        _deal_changed(ctx, body.ad_id)
+        deal_note = " Сделка отмечена как «Купил» в «Моих сделках»."
     store = store_of(ctx)
     r = resolve(project)
     if all(rr.need_qty == 0 for rr in r.values()):
@@ -751,17 +766,66 @@ async def projects_unbought(project_id: int, slot_key: str, ctx: ApiContext = De
         raise ApiError(404, "not_found", "Такой части в сборке нет")
     if not slot.purchases:
         raise ApiError(409, "conflict", "Эта часть не отмечена купленной")
-    slot.purchases.pop()
+    purchase = slot.purchases.pop()
     slot.status = "open"
     if project.status == "done":
         project.status = "tracking" if store_of(ctx).searches(project.id) else "draft"
+    deal_status = _restore_deal(ctx, project, purchase)
     store = store_of(ctx)
     if project.status == "tracking" and store.searches(project.id) and ctx.config_path is not None \
             and ctx.config_writable():
         sync_searches(ctx, project)
     store.save(project)
     publish(ctx, project, "updated", slot=slot_key)
-    return {"project": _view(ctx, project), "message_ru": "Покупка отменена — снова ищу эту часть"}
+    message = "Покупка отменена — снова ищу эту часть."
+    if deal_status == "new":
+        message += " Сделка больше не в «Купил»."
+    elif deal_status and deal_status != "bought":
+        message += f" Сделка вернулась в «{STATUS_LABELS.get(deal_status, deal_status)}»."
+    return {"project": _view(ctx, project), "message_ru": message, "deal_status": deal_status}
+
+
+def _deal_snapshot(found: tuple[Any, dict[str, Any]] | None) -> dict[str, Any] | None:
+    """The deal's pipeline state before a purchase moves it to «Купил» (undo restores it)."""
+    if found is None:
+        return None
+    deal, extras = found
+    bought_at = extras.get("bought_at")
+    return {"status": deal.status or "new", "bought_price": extras.get("bought_price"),
+            "bought_at": bought_at.isoformat() if bought_at else None}
+
+
+def _restore_deal(ctx: ApiContext, project: Project, purchase: Purchase) -> str | None:
+    """Undo of a purchase made through an ad: the deal leaves «Купил» for the status it had before
+    (or «Новое» when that is unknown), so the offer is back in the build. Left alone when the user
+    moved the deal since (e.g. to «Продал») or another purchase of the build still uses the ad.
+    Returns the deal's status afterwards (None: no deal was touched)."""
+    ad_id = purchase.ad_id
+    if not ad_id or any(p.ad_id == ad_id for s in project.slots for p in s.purchases):
+        return None
+    found = ctx.db.get_deal_extras(ad_id)
+    if found is None or found[0].status != "bought":
+        return None
+    before = purchase.deal_before or {}
+    status, bought_price, bought_at = "new", None, None
+    if before.get("status") in API_STATUSES:
+        status, bought_price = before["status"], before.get("bought_price")
+        try:
+            bought_at = datetime.fromisoformat(before["bought_at"]) if before.get("bought_at") else None
+        except (TypeError, ValueError):
+            bought_at = None
+    ctx.db.update_deal_state(ad_id, status=status, bought_price=bought_price, bought_at=bought_at)
+    _deal_changed(ctx, ad_id)
+    return status
+
+
+def _deal_changed(ctx: ApiContext, ad_id: str) -> None:
+    from .routes_deals import publish_update
+
+    try:
+        publish_update(ctx, ad_id)
+    except Exception:  # noqa: BLE001 - the purchase itself is done; the live update is a courtesy
+        log.exception("deal_updated after a purchase change failed")
 
 
 @router.get("/projects/{project_id}/offers", responses=ERRORS,

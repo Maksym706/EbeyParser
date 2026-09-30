@@ -150,8 +150,9 @@ api.url("/backup", { include_secrets: 1 })     // for <a href download>
 
 - Server events: `ready`, `run_started`, `run_finished`, `deal_found {ad_id, verdict, action, score, card}`,
   `deal_updated {ad_id, card}`, `health_alert`, `settings_changed`, `searches_changed`, `monitor_paused`,
-  `monitor_resumed`, `job_finished`, `project_updated {id, reason, card, alert?}` («Сборки»: toasts and the nav badge
-  live in `features/projects-live.js`).
+  `monitor_resumed`, `job_finished`, `project_updated {id, reason, card, alert?}` and `project_deleted {id, name}`
+  («Сборки»: toasts and the nav badge live in `features/projects-live.js`; a deleted build gets no
+  `project_updated` after its `project_deleted`).
 - Local pseudo-event: `connected`.
 - `onEvent("*", ({ type, data }) => …)` receives every event.
 - `main.js` already shows the "Новая выгодная находка" toast and bumps `newDeals`.

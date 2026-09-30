@@ -170,7 +170,7 @@ async def test_scout_refuses_a_model_under_2b_and_shows_the_expected_speed():
     ok = cfg(ai={"scout": {"enabled": True, "base_url": "http://nas:8080/v1", "model": "qwen3.5:2b-q4_K_M"}})
     monitor, _, _, _ = build(ok, [], verdict=PC_AI)
     status = monitor.scout_status()  # not measured yet: the model research's speed (a remote box: T0)
-    assert status["speed_expected"] and status["speed_ru"].startswith("Ожидается ≈ 6.0 с на объявление")
+    assert status["speed_expected"] and status["speed_ru"].startswith("≈ 6,0 с на объявление")
 
 
 async def test_scout_down_is_the_old_pipeline():

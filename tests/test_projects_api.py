@@ -5,6 +5,8 @@ No network: the LLM answers through httpx.MockTransport."""
 from __future__ import annotations
 
 import json
+import re
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +15,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api_v1_helpers import LOCAL, clean_environ, events_of, make_app, restore_environ
+from ebeyparser.db import Database
 from ebeyparser.models import Listing
+from ebeyparser.notify.render import format_money, format_money_ru
+from ebeyparser.projects.store import ProjectStore
+from ebeyparser.web.api import routes_projects
 from ebeyparser.web.api.events import EVENT_TYPES
+from ebeyparser.web.api.project_views import alert_view
 
 GOAL = "Сервер для локальных LLM, чтобы тянул 70B в Q4, бюджет 1500 €"
 
@@ -292,6 +299,16 @@ def test_deal_found_alert_bought_and_offers(api) -> None:
     assert f"/projects/{pid}" in text
     alert_events = [e for e in events_of(app, "project_updated") if e.data["reason"] == "alert"]
     assert alert_events and alert_events[-1].data["alert"]["text_ru"].endswith("ниже цели")
+    # the same news for the app: one clean line, plain detail, the links apart, Russian numbers
+    alert = alert_events[-1].data["alert"]
+    for key in ("title_ru", "detail_ru"):
+        assert alert[key] and "\n" not in alert[key] and "http" not in alert[key], key
+        assert not re.search(r"[\U0001F300-\U0001FAFF⚠]", alert[key]) and not re.search(r"\d\.\d{3}", alert[key]), key
+    assert "MI50" in alert["title_ru"] and "ниже цели" in alert["title_ru"]
+    assert f"{gpu_target - 30:.0f} €" in alert["title_ru"]
+    assert "из 1 500 €" in alert["detail_ru"] and "км от тебя" in alert["detail_ru"]
+    assert alert["url"] == "https://www.kleinanzeigen.de/s-anzeige/x/9001"
+    assert alert["project_url"].endswith(f"/projects/{pid}") and alert["project_name"]
     monitor._emit("deal_found", {"ad_id": "9001"})
     assert len(notifier.texts) == 1  # once per ad
     monitor._emit("run_finished", {})  # the sweep sends nothing new either
@@ -305,6 +322,9 @@ def test_deal_found_alert_bought_and_offers(api) -> None:
     alt = next(a for a in gpu["alternatives"] if a["option"] == "tesla_p40x2")
     assert alt["best"]["ad_id"] == "9003"
     assert view["alerts_list"][0]["kind"] == "slot_target" and view["alerts_list"][0]["delivered"]
+    stored = view["alerts_list"][0]
+    assert {k: stored[k] for k in ("title_ru", "detail_ru", "url")} == {k: alert[k] for k in ("title_ru", "detail_ru", "url")}
+    assert "\n" in stored["text"] and "https://www.kleinanzeigen.de" in stored["text"]  # the Telegram message as sent
     assert view["gpu_ranking"] and view["gpu_ranking"][0]["value_score"] is not None
     assert view["headline_ru"].startswith("Ниже цели")
 
@@ -368,7 +388,9 @@ def test_budget_fit_alert_after_pass(api) -> None:
     assert fit, notifier.texts
     card = c.get(f"/api/v1/projects/{pid}").json()
     assert card["fits_budget"] is True and card["best_complete"]
-    assert any(a["kind"] == "budget_fit" for a in card["alerts_list"])
+    fit_alert = next(a for a in card["alerts_list"] if a["kind"] == "budget_fit")
+    assert fit_alert["title_ru"] and fit_alert["url"].startswith("https://www.kleinanzeigen.de/")
+    assert "http" not in fit_alert["detail_ru"] and "бюджет" in fit_alert["title_ru"] + fit_alert["detail_ru"]
     count = len(notifier.texts)
     monitor._emit("run_finished", {"run_id": 2})
     assert len(notifier.texts) == count  # the fit is news only once
@@ -382,11 +404,140 @@ def test_delete_removes_project_searches(api) -> None:
     r = c.delete(f"/api/v1/projects/{pid}")
     assert r.status_code == 200 and len(r.json()["searches_removed"]) == 10 and config.searches == []
     assert c.get(f"/api/v1/projects/{pid}").status_code == 404
-    assert any(e.data["reason"] == "deleted" for e in events_of(app, "project_updated"))
+    gone = [e for e in events_of(app, "project_deleted") if e.data["id"] == pid]
+    assert len(gone) == 1 and gone[0].data["searches_removed"] == 10 and gone[0].data["name"]
+    assert "project_deleted" in EVENT_TYPES
+    assert not [e for e in events_of(app, "project_updated") if e.data.get("reason") == "deleted"]
     pid2 = create_project(c)["id"]
     track(c, pid2)
     r = c.delete(f"/api/v1/projects/{pid2}", params={"keep_searches": True})
     assert r.json()["searches_removed"] == [] and len(config.searches) == 10
+
+
+def test_no_project_updated_for_a_build_being_deleted(api, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An update that races with DELETE (an offer check publishing while the searches are removed, an
+    alert check that finishes after the build is gone): the only event about the build from then on is
+    its project_deleted — a late project_updated would bring the card back in the UI."""
+    c, app, config, db, monitor, notifier = api
+    pid = create_project(c)["id"]
+    track(c, pid)
+    ctx = app.state.api
+    stale = ProjectStore(db).get(pid)
+    save = ctx.save_searches
+
+    def save_and_race(*args: Any, **kwargs: Any) -> None:
+        save(*args, **kwargs)
+        routes_projects.publish(ctx, stale, "offer", ad_id="1")  # the build is still in the database here
+
+    monkeypatch.setattr(ctx, "save_searches", save_and_race)
+    last = ctx.hub.last_id
+    assert c.delete(f"/api/v1/projects/{pid}").status_code == 200
+    ctx.project_alerts._announce(stale, "run")  # a sweep that started before the deletion
+    about = [e for e in ctx.hub.since(last) if e.data.get("id") == pid]
+    assert [e.type for e in about] == ["project_deleted"]
+    assert not ctx.projects_deleting  # nothing left marked
+
+
+def _gpu_picked(view: dict[str, Any]) -> list[str]:
+    return [o["ad_id"] for o in next(s for s in view["slots"] if s["key"] == "gpu")["picked"]]
+
+
+def test_unbought_puts_the_deal_back(api) -> None:
+    """Undo of «Купил» made through an ad: in the same request the deal leaves «Купил» for the status
+    it had before (or «Новое» when that is unknown), so the offer is in the build again."""
+    c, app, config, db, monitor, notifier = api
+    pid = create_project(c)["id"]
+    project = track(c, pid)["project"]
+    mi50 = next(n for n in linked(project, "gpu") if "MI50" in n)
+    target = next(s for s in project["slots"] if s["key"] == "gpu")["target_unit"]
+    _add_ad(db, "9101", "AMD Instinct MI50 32GB HBM2", target - 20, mi50)
+    _add_ad(db, "9102", "AMD Instinct MI50 32GB", target - 10, mi50)
+    assert c.patch("/api/v1/deals/9101", json={"status": "starred"}).status_code == 200
+    assert "9101" in _gpu_picked(c.get(f"/api/v1/projects/{pid}").json())
+    hub = app.state.api.hub
+
+    def buy(ad_id: str | None, price: float = 150.0) -> dict[str, Any]:
+        r = c.post(f"/api/v1/projects/{pid}/slots/gpu/bought", json={"price": price, "ad_id": ad_id, "qty": 1})
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def undo() -> dict[str, Any]:
+        r = c.delete(f"/api/v1/projects/{pid}/slots/gpu/bought")
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    bought = buy("9101", target - 20)
+    assert c.get("/api/v1/deals/9101").json()["status"] == "bought" and "9101" not in _gpu_picked(bought["project"])
+    last = hub.last_id
+    back = undo()
+    assert back["deal_status"] == "starred" and "вернулась в «Избранное»" in back["message_ru"]
+    deal = c.get("/api/v1/deals/9101").json()
+    assert deal["status"] == "starred" and deal["bought_price"] is None and deal["bought_at"] is None
+    assert "9101" in _gpu_picked(back["project"])  # no second call needed: the offer is back in the build
+    assert any(e.type == "deal_updated" and e.data["ad_id"] == "9101" and e.data["card"]["status"] == "starred"
+               for e in hub.since(last))
+
+    # a purchase recorded before the deal's own state was kept: «Новое»
+    buy("9101")
+    store = ProjectStore(db)
+    saved = store.get(pid)
+    assert saved is not None and saved.slot("gpu").purchases[-1].deal_before == {  # type: ignore[union-attr]
+        "status": "starred", "bought_price": None, "bought_at": None}
+    saved.slot("gpu").purchases[-1].deal_before = None  # type: ignore[union-attr]
+    store.save(saved)
+    back = undo()
+    assert back["deal_status"] == "new" and "больше не в «Купил»" in back["message_ru"]
+    assert c.get("/api/v1/deals/9101").json()["status"] == "new"
+
+    # it was already «Купил» in «Мои сделки» (own price): it stays there with that price
+    assert c.patch("/api/v1/deals/9102", json={"status": "bought", "bought_price": 111}).status_code == 200
+    buy("9102", 150)
+    assert c.get("/api/v1/deals/9102").json()["bought_price"] == 150
+    back = undo()
+    deal = c.get("/api/v1/deals/9102").json()
+    assert back["deal_status"] == "bought" and deal["status"] == "bought" and deal["bought_price"] == 111
+    assert "Сделка" not in back["message_ru"]
+
+    # moved on since (sold): the undo of the build leaves the deal alone; no ad: no deal is touched
+    buy("9101")
+    assert c.patch("/api/v1/deals/9101", json={"status": "sold", "sold_price": 400}).status_code == 200
+    assert undo()["deal_status"] is None and c.get("/api/v1/deals/9101").json()["status"] == "sold"
+    buy(None, 100)
+    assert undo()["deal_status"] is None
+
+
+def test_alert_texts_for_the_app_and_old_alerts(tmp_path: Path) -> None:
+    """title_ru / detail_ru / url of alerts stored before they existed come from the Telegram text
+    (the migration adds the column); money in the web app's Russian format."""
+    assert format_money_ru(1065) == "1 065 €" and format_money(1065) == "1.065 €"
+    assert format_money_ru(7.5) == "7,50 €" and format_money_ru(-35) == "−35 €" and format_money_ru(None) == "—"
+    old = ("🧩 Сборка «LLM-сервер»: AMD Instinct MI50 32 ГБ за 175 €\n"
+           "Ниже твоей цели 205 € · рынок ~1.065 € (экономия ~890 €)\n"
+           "⚠ Пассивная карта: нужен свой вентилятор (~25 €)\n"
+           "8 км от тебя · 10115 Mitte\n"
+           "https://www.kleinanzeigen.de/s-anzeige/x/9001\n"
+           "Вся сборка сейчас: ~1.240 € из 1.500 €\n"
+           "Собрано 0 из 8\n"
+           "Сборка: http://localhost:8000/projects/1")
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE project_alerts (project_id INTEGER NOT NULL, ad_id TEXT NOT NULL, kind TEXT NOT NULL,"
+                 " slot TEXT NOT NULL DEFAULT '', price REAL, total REAL, text TEXT NOT NULL DEFAULT '',"
+                 " delivered INTEGER NOT NULL DEFAULT 0, sent_at TEXT NOT NULL, PRIMARY KEY (project_id, ad_id, kind))")
+    conn.execute("INSERT INTO project_alerts VALUES (1, '9001', 'slot_target', 'gpu', 175, NULL, ?, 1,"
+                 " '2026-09-01T10:00:00+00:00')", (old,))
+    conn.commit()
+    conn.close()
+    stored = ProjectStore(Database(path)).alerts(1)
+    assert len(stored) == 1 and stored[0].title_ru == ""
+    view = alert_view(stored[0])
+    assert view["text"] == old
+    assert view["title_ru"] == "Сборка «LLM-сервер»: AMD Instinct MI50 32 ГБ за 175 €"
+    assert view["url"] == "https://www.kleinanzeigen.de/s-anzeige/x/9001"
+    detail = view["detail_ru"]
+    assert detail.startswith("Ниже твоей цели 205 €") and "~1 065 €" in detail and "1 500 €" in detail
+    assert "http" not in detail and "localhost" not in detail and "⚠" not in detail and "\n" not in detail
+    assert detail.endswith("Собрано 0 из 8")
 
 
 def test_track_nothing_open_and_rename_read_only(api) -> None:

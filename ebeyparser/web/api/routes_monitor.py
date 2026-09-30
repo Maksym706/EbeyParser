@@ -366,7 +366,8 @@ async def runs(limit: int = Query(30, ge=1, le=500), ctx: ApiContext = Depends(g
 
 @router.get("/events", summary="Server-Sent Events (text/event-stream): run_started, run_progress, run_finished, "
                                "deal_found, health_alert, settings_changed, searches_changed, deal_updated, "
-                               "monitor_paused, monitor_resumed, job_progress, job_finished")
+                               "monitor_paused, monitor_resumed, job_progress, job_finished, project_updated, "
+                               "project_deleted")
 async def events(
     request: Request,
     last_event_id: int | None = Query(None, ge=0),

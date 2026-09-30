@@ -234,14 +234,8 @@ export default function FeedScreen({ query = {} }) {
 
   // items actually shown (hidden ones stay in memory for «Отменить»)
   const showHidden = f.st === "ignored";
+  // «Супер» is a server filter (tier=super); the check here only drops a card that stopped being super live
   const items = feed.items.filter((d) => (showHidden ? d.status === "ignored" : d.status !== "ignored") && (!f.sup || d.tier === "super"));
-  // «Супер» filters on this side (no tier filter in the API): the count is what is loaded so far
-  const shownTotal = f.sup ? items.length : feed.total;
-  const moreSuper = f.sup && !feed.done;
-  useEffect(() => {
-    // few super finds on the loaded pages: fetch further pages by themselves (up to ~10 pages)
-    if (f.sup && !feed.done && !feed.more && !feed.loading && items.length < 6 && feed.items.length < 300) feed.loadMore();
-  }, [f.sup, feed.done, feed.more, feed.loading, items.length, feed.items.length]);
 
   // ---------------------------------------------------------------- live updates
   const unseenLive = useRef(0);
@@ -421,7 +415,7 @@ export default function FeedScreen({ query = {} }) {
         ? html`<${Skel} />`
         : !feed.done
           ? html`<${Button} variant="secondary" icon="chevron-down" onClick=${() => feed.loadMore()}>Показать ещё<//>`
-          : items.length > 6 && html`<span class="muted small">Это всё${shownTotal != null ? ` · ${shownTotal} ${plural(shownTotal, "находка", "находки", "находок")}` : ""}</span>`}
+          : items.length > 6 && html`<span class="muted small">Это всё${feed.total != null ? ` · ${feed.total} ${plural(feed.total, "находка", "находки", "находок")}` : ""}</span>`}
     </div>`;
   }
 
@@ -433,7 +427,7 @@ export default function FeedScreen({ query = {} }) {
       <${FilterBar} f=${f} set=${set} view=${view} setView=${setView} total=${feed.total} reset=${reset} facets=${feed.facets} search=${search} />
       ${(filtered || feed.total != null) &&
       html`<div class="feed-count">
-        ${shownTotal != null && html`<span class="num">${shownTotal}${moreSuper ? "+" : ""} ${plural(shownTotal, "находка", "находки", "находок")}</span>`}
+        ${feed.total != null && html`<span class="num">${feed.total} ${plural(feed.total, "находка", "находки", "находок")}</span>`}
         ${q && html`<span class="tag">«${q}» <button type="button" aria-label="Убрать поиск" onClick=${() => setQuery({ q: null })}><${Icon} name="x" size=${12} /></button></span>`}
         ${f.search &&
         html`<span class="tag"><${Icon} name="radar" size=${12} />${f.search} <button type="button" aria-label="Показать все поиски" onClick=${() => set({ search: "" })}><${Icon} name="x" size=${12} /></button></span>`}

@@ -14,6 +14,7 @@ from .models import AlertRecord, Plan, PlanOption, PlanSlot, Project, Purchase, 
 _PROJECT_DATA = ("requirements", "location", "radius_km", "ai", "notes", "tracking_since", "fits_alerted")
 _SLOT_DATA = ("label", "kind", "when", "per_gpu", "hint", "note", "purchases")
 _OPTION_DATA = ("label", "query", "why", "source", "target_by")
+_ALERT_DATA = ("title_ru", "detail_ru", "url")
 
 
 def _ts(dt: datetime) -> str:
@@ -75,6 +76,9 @@ class ProjectStore:
     def get(self, project_id: int) -> Project | None:
         rows = self._rows("SELECT * FROM projects WHERE id = ?", (int(project_id),))
         return self._load(rows[0]) if rows else None
+
+    def exists(self, project_id: int) -> bool:
+        return bool(self._rows("SELECT 1 FROM projects WHERE id = ?", (int(project_id),)))
 
     def list_projects(self, *, status: str | None = None) -> list[Project]:
         sql, params = "SELECT * FROM projects", []
@@ -189,19 +193,23 @@ class ProjectStore:
         return rows[0]["search_name"] if rows else None
 
     # ------------------------------------------------------------------ alerts
+    @staticmethod
+    def _alert_data(alert: AlertRecord) -> str:
+        return json.dumps({k: getattr(alert, k) for k in _ALERT_DATA}, ensure_ascii=False)
+
     def claim_alert(self, alert: AlertRecord) -> bool:
         """Record an alert before sending it; False when it was already recorded (sent before)."""
         cur = self._write(
-            "INSERT OR IGNORE INTO project_alerts (project_id, ad_id, kind, slot, price, total, text, delivered, sent_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO project_alerts (project_id, ad_id, kind, slot, price, total, text, delivered, sent_at,"
+            " data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (alert.project_id, alert.ad_id, alert.kind, alert.slot, alert.price, alert.total, alert.text,
-             int(alert.delivered), _ts(alert.sent_at)))
+             int(alert.delivered), _ts(alert.sent_at), self._alert_data(alert)))
         return cur.rowcount > 0
 
     def set_alert(self, alert: AlertRecord) -> None:
-        self._write("UPDATE project_alerts SET text = ?, delivered = ?, total = ? WHERE project_id = ? AND ad_id = ?"
-                    " AND kind = ?", (alert.text, int(alert.delivered), alert.total, alert.project_id, alert.ad_id,
-                                      alert.kind))
+        self._write("UPDATE project_alerts SET text = ?, delivered = ?, total = ?, data = ? WHERE project_id = ?"
+                    " AND ad_id = ? AND kind = ?", (alert.text, int(alert.delivered), alert.total,
+                                                    self._alert_data(alert), alert.project_id, alert.ad_id, alert.kind))
 
     def drop_alert(self, project_id: int, ad_id: str, kind: str) -> None:
         self._write("DELETE FROM project_alerts WHERE project_id = ? AND ad_id = ? AND kind = ?",
@@ -214,9 +222,17 @@ class ProjectStore:
     def alerts(self, project_id: int, limit: int = 20) -> list[AlertRecord]:
         rows = self._rows("SELECT * FROM project_alerts WHERE project_id = ? ORDER BY sent_at DESC LIMIT ?",
                           (project_id, max(1, int(limit))))
-        return [AlertRecord(project_id=r["project_id"], ad_id=r["ad_id"], kind=r["kind"], slot=r["slot"],
-                            price=r["price"], total=r["total"], text=r["text"], delivered=bool(r["delivered"]),
-                            sent_at=datetime.fromisoformat(r["sent_at"])) for r in rows]
+        out = []
+        for r in rows:
+            try:
+                data = json.loads(r["data"] or "{}")
+            except (IndexError, KeyError, ValueError):
+                data = {}
+            out.append(AlertRecord(project_id=r["project_id"], ad_id=r["ad_id"], kind=r["kind"], slot=r["slot"],
+                                   price=r["price"], total=r["total"], text=r["text"], delivered=bool(r["delivered"]),
+                                   sent_at=datetime.fromisoformat(r["sent_at"]),
+                                   **{k: str(data[k]) for k in _ALERT_DATA if isinstance(data, dict) and data.get(k)}))
+        return out
 
     def alert_counts(self) -> dict[int, tuple[int, datetime | None]]:
         rows = self._rows("SELECT project_id, COUNT(*) AS n, MAX(sent_at) AS last FROM project_alerts GROUP BY project_id")

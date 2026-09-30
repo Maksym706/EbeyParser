@@ -283,14 +283,16 @@ def test_status_view_texts():
             "mode": "candidates", "batch_size": 8}
     on = scout.status_view(enabled=True, snap=snap, **{**common, "vision_waiting": 2})
     assert on["state"] == "behind" and on["text_ru"] == "Успевает смотреть 90 из 120 новых объявлений в час"
-    assert on["speed_ru"] == "≈ 5.0 с на объявление, до 360 объявлений в час" and on["mode"] == "candidates"
+    assert on["speed_ru"] == "≈ 5,0 с на объявление, до 360 объявлений в час" and on["mode"] == "candidates"
     assert on["vision_queue"]["waiting"] == 2 and "2" in on["vision_queue"]["text_ru"]
     assert not on["speed_expected"] and not on["too_small"]
-    # not measured yet: the model research's speed for this model
+    # not measured yet: the model research's speed for this model — the same clean words (Russian decimal
+    # comma), the estimate is flagged by speed_expected (the app's «оценка» mark), not wrapped into the text
     fresh = scout.status_view(enabled=True, snap={}, expected_sec_per_ad=6.0, pass_share=0.5, max_per_hour=600,
                               **common)
-    assert fresh["speed_expected"] and fresh["speed_ru"] == (
-        "Ожидается ≈ 6.0 с на объявление, до 300 объявлений в час (пока не измерено)")
+    assert fresh["speed_expected"] and fresh["speed_ru"] == "≈ 6,0 с на объявление, до 300 объявлений в час"
+    measured = scout.status_view(enabled=True, snap={**snap, "sec_per_ad": 5.24}, **common)
+    assert measured["speed_ru"].startswith("≈ 5,2 с на объявление") and not measured["speed_expected"]
     small = scout.status_view(enabled=True, snap={}, too_small=True, **{**common, "model": "qwen3.5:0.8b"})
     assert small["state"] == "too_small" and "слишком маленькая" in small["text_ru"] and "qwen3.5:0.8b" in small["text_ru"]
     assert small["speed_ru"] == ""

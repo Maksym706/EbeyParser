@@ -1,6 +1,7 @@
 // «Сборки» live layer (spec §7): the `project_updated` server event keeps the list cards fresh,
-// shows the alert toast («Сборка «LLM-сервер»: MI50 за 175 € — ниже цели» → «Открыть») and keeps
-// the «Сборки» nav badge = tracking builds with an offer below target (`headline_ru`).
+// shows the alert toast («MI50 32 ГБ за 175 € — ниже цели 205 €» / «Сборка «LLM-сервер»» → «Открыть»)
+// and keeps the «Сборки» nav badge = tracking builds with an offer below target (`headline_ru`);
+// `project_deleted` drops the card.
 // Imported once by the shell; screens subscribe to the same event for their own refetch.
 import { onEvent } from "../lib/events.js";
 import { appStore } from "../lib/store.js";
@@ -35,15 +36,23 @@ export function refreshProjects() {
   return loading;
 }
 
+// deleted builds (ids are never reused): an update that was already on its way must not bring the card back
+const gone = new Set();
+
+function onDeleted(data) {
+  if (!data || data.id == null) return;
+  const id = Number(data.id);
+  gone.add(id);
+  forgetView(id);
+  const cards = projectsStore.get().cards;
+  if (cards) applyCards(cards.filter((c) => c.id !== id));
+}
+
 function onUpdate(data) {
   if (!data || data.id == null) return;
   const id = Number(data.id);
+  if (gone.has(id)) return;
   const cards = projectsStore.get().cards;
-  if (data.reason === "deleted") {
-    forgetView(id);
-    if (cards) applyCards(cards.filter((c) => c.id !== id));
-    return;
-  }
   if (data.card && cards) {
     const has = cards.some((c) => c.id === id);
     applyCards(has ? cards.map((c) => (c.id === id ? data.card : c)) : [data.card, ...cards]);
@@ -51,12 +60,15 @@ function onUpdate(data) {
     refreshProjects();
   }
   if (data.reason === "alert" && data.alert) {
+    const a = data.alert;
     const here = routeStore.get().path === `/projects/${id}`;
+    const name = (data.card && data.card.name) || a.project_name;
+    const local = a.delivered === false ? "Уведомление только здесь — Telegram не настроен" : "";
     toast({
       kind: "success",
       icon: "boxes",
-      title: ru(data.alert.text_ru) || "Сборка: предложение ниже цели",
-      message: data.alert.delivered === false ? "Уведомление только здесь — Telegram не настроен" : "",
+      title: a.title_ru || ru(a.text_ru) || "Сборка: предложение ниже цели",
+      message: name ? `Сборка «${name}»${local ? `. ${local}` : ""}` : local,
       action: here ? null : { label: "Открыть", href: `/projects/${id}` },
       duration: 8000,
     });
@@ -69,6 +81,7 @@ export function startProjectsLive() {
   if (started) return;
   started = true;
   onEvent("project_updated", onUpdate);
+  onEvent("project_deleted", onDeleted);
   onEvent("connected", () => refreshProjects());
   // the badge from the first moment (SSE may connect later or not at all)
   const app = appStore.get().app;

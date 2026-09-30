@@ -65,8 +65,11 @@ def test_files_and_wiring() -> None:
 def test_feed_super_chip() -> None:
     filters = _read(JS / "screens" / "feed" / "filters.js")
     assert re.search(r'key: "sup", label: "Супер"', filters)
-    assert 'p.verdict = "buy"' in filters  # the API has no tier filter: narrow server-side to «Покупай»
-    assert 'd.tier === "super"' in _read(JS / "screens" / "feed.js")  # …and keep only super finds
+    assert 'p.tier = "super"' in filters and 'p.verdict = "buy"' not in filters  # the server's tier filter
+    assert "fc.tier && fc.tier.super" in filters  # the chip's exact count (facets)
+    feed = _read(JS / "screens" / "feed.js")
+    assert "moreSuper" not in feed and "feed.items.length < 300" not in feed  # no client-side paging for it
+    assert 'd.tier === "super"' in feed  # only drops a card that stopped being super live
 
 
 def test_stylesheet_linked_served_and_tokens_only(client: TestClient) -> None:
@@ -158,8 +161,8 @@ const s = await import(process.argv[2] + "/features/scout.js");
 const { ICONS } = await import(process.argv[2] + "/ui/icons.js");
 console.log(JSON.stringify({
   speed: [
-    s.scoutSpeed({ speed_ru: "≈ 5.2 с на объявление, до 340 объявлений в час" }),
-    s.scoutSpeed({ speed_ru: "Ожидается ≈ 6.0 с на объявление, до 300 объявлений в час (пока не измерено)", speed_expected: true }),
+    s.scoutSpeed({ speed_ru: "≈ 5,2 с на объявление, до 340 объявлений в час" }),
+    s.scoutSpeed({ speed_ru: "≈ 6,0 с на объявление, до 300 объявлений в час", speed_expected: true }),
     s.scoutSpeed({ speed_ru: "" }), s.scoutSpeed(null),
   ],
   flags: [s.foundByScout({ found_by: "ai_scout" }), s.foundByScout({ found_by: "rules" }), s.foundByScout(null),
@@ -179,8 +182,9 @@ def test_scout_helpers_under_node(tmp_path: Path) -> None:
     run = subprocess.run(["node", str(script), JS.as_posix(), hooks.as_uri()], capture_output=True, text=True, timeout=60)
     assert run.returncode == 0, run.stderr
     out = json.loads(run.stdout)
-    assert out["speed"][0] == "≈ 5,2 с на объявление, до 340 объявлений в час"  # Russian decimal comma
-    assert out["speed"][1] == "≈ 6,0 с на объявление, до 300 объявлений в час"  # «оценка» is a separate mark
+    # the server words it (Russian decimal comma); an estimate is only flagged: «оценка» is a separate mark
+    assert out["speed"][0] == "≈ 5,2 с на объявление, до 340 объявлений в час"
+    assert out["speed"][1] == "≈ 6,0 с на объявление, до 300 объявлений в час"
     assert out["speed"][2:] == ["", ""]
     assert out["flags"] == [True, False, False, True, False]
     assert out["states"] == ["profit", "haggle", "danger", "haggle", "neutral", "neutral", "neutral"]

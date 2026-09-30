@@ -26,6 +26,7 @@ from .models import (
     utcnow,
 )
 from .pricing.text import history_anchor_words, normalize, price_point_words
+from .pricing.tiers import tier_sql
 from .timefmt import date_label
 
 log = logging.getLogger(__name__)
@@ -1211,7 +1212,13 @@ class Database:
         actionable: bool = False,
         since: datetime | None = None,
         ad_ids: list[str] | None = None,
+        tiers: list[str] | None = None,
+        super_rules: Any = None,
+        found_by: list[str] | None = None,
     ) -> tuple[str, list[Any]]:
+        """`tiers`: pricing.tiers.deal_tier() values (super | deal | unchecked | maybe | skip), judged
+        with `super_rules` (notifications.super_deals); `found_by`: script | ai_scout (an evaluation
+        from before the scout counts as "script")."""
         where: list[str] = []
         params: list[Any] = []
 
@@ -1279,6 +1286,17 @@ class Database:
         if ai_checked is not None:
             where.append("json_extract(e.data, '$.ai_checked') = ?")
             params.append(1 if ai_checked else 0)
+        if tiers:
+            parts = []
+            for tier in dict.fromkeys(tiers):
+                cond, cond_params = tier_sql(tier, super_rules)
+                parts.append(cond)
+                params.extend(cond_params)
+            where.append("(" + " OR ".join(parts) + ")")
+        if found_by:
+            where.append("(e.ad_id IS NOT NULL AND COALESCE(NULLIF(json_extract(e.data, '$.found_by'), ''), 'script')"
+                         f" IN ({','.join('?' * len(found_by))}))")
+            params.extend(found_by)
         if since is not None:
             where.append("l.first_seen >= ?")
             params.append(_ts(since))
@@ -1483,6 +1501,9 @@ class Database:
         """Tables of ebeyparser.projects (CREATE IF NOT EXISTS: safe on any old database; the
         queries live in ebeyparser/projects/store.py)."""
         self._conn.executescript(PROJECTS_SCHEMA)
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(project_alerts)")}
+        if "data" not in cols:  # title_ru / detail_ru / url of an alert (added later)
+            self._conn.execute("ALTER TABLE project_alerts ADD COLUMN data TEXT NOT NULL DEFAULT '{}'")
 
 
 # Build projects («Сборки»): a plan of slots with alternatives, the searches that track them, and
@@ -1545,6 +1566,7 @@ CREATE TABLE IF NOT EXISTS project_alerts (
     text         TEXT NOT NULL DEFAULT '',
     delivered    INTEGER NOT NULL DEFAULT 0,
     sent_at      TEXT NOT NULL,
+    data         TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY (project_id, ad_id, kind)
 );
 """

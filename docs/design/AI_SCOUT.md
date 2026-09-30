@@ -98,7 +98,8 @@ the status says «Модель … слишком маленькая для ра
   (generation order = reasoning order).
 * **No prices anywhere.** `interest 0..10` is "is this a resellable, valuable thing?" General knowledge ("an RTX 3080
   is valuable") is fine; a euro number is not asked for.
-* **One worked example** with three ads (old PC with RTX 3070, typo'd iPhone, wanted ad) in the system prompt. The
+* **One worked example** with four ads (old PC with RTX 3070, typo'd iPhone, wanted ad, a prepayment/WhatsApp scam
+  tagged `x:["scam"]`; added 2026-09-30, see §14.2) in the system prompt. The
   system prompt is identical for every call, so llama.cpp / Ollama / LM Studio keep it in the prompt cache, and after
   the first call it costs nothing.
 * **Input per ad** (`ad_block`): `[i] Titel | Preis (VB / zu verschenken / Auktion) | Kategorie | eBay | Text` (≤ 320
@@ -137,6 +138,7 @@ risk tags (scam, defect, locked, fake, missing, reserved, rent); `s` interest; `
 | missing / duplicate / out-of-range / shifted `i` | the item is dropped (never guessed). A shifted index gives an item whose product isn't in that ad's text, so grounding rejects it |
 | ads missing from the answer | retried in halves, then singly (2 levels); still failing → `script_item` (identity's reading, `source="script"`, never promotes) |
 | server down / refused (`LLMError`) | the run stops, the rest is overflow (script path), one health alert «Нейросеть-разведчик не отвечает…» per 6 h |
+| server up but too slow: the call hits `timeout_seconds` (read timeout) | the batch is halved (down to `min_batch`), the speed it showed is kept as `sec_per_ad`, the run goes on; only at `min_batch` does it count as "down" (2026-09-30: the 4B at batch 10 timed out on a 4-core CPU, §14.2) |
 
 **Adaptive batch** (start and maximum by model size, see above; minimum 2): halves when < 70 % of a batch parses,
 grows by 2 after 3 full successes. It is
@@ -424,8 +426,9 @@ Frontend (for the SPA team, `ebeyparser/web/app/**`):
 off and on. The scout's model is simulated as JSON text through the real engine, at three qualities, with simulated
 GPU/CPU speed. See §14.1.
 
-**Real LLM smoke test**: Qwen3.5-2B Q4_K_M on this 4-core sandbox CPU via llama.cpp `llama-server`
-(OpenAI-compatible) on 16 of 40 realistic German ads. See §14.2.
+**Real LLM smoke test** (2026-09-30): Qwen3.5 2B and 4B Q4_K_M on the 4-vCPU sandbox CPU via llama.cpp
+`llama-server` (OpenAI-compatible), the real Monitor-built scout (auto batch size), 70 gold-labelled German ads.
+See §14.2.
 
 ### 14.1 Benchmark results
 

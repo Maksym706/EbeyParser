@@ -43,6 +43,12 @@
   transition: background-color var(--d-fast) var(--ease-standard), color var(--d-fast) var(--ease-standard);
 }
 
+@media (pointer: coarse) {
+  .settings-nav__link {
+    min-height: 44px;
+  }
+}
+
 .settings-nav__link:hover {
   background: var(--hover);
   color: var(--text);

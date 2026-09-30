@@ -2032,6 +2032,13 @@
   color: var(--text-2);
   font-size: var(--fs-body-sm);
   line-height: var(--lh-body-sm);
+  overflow-wrap: anywhere;
+}
+.pj-alert__detail {
+  color: var(--text-3);
+  font-size: var(--fs-caption);
+  line-height: var(--lh-caption);
+  overflow-wrap: anywhere;
 }
 .pj-alert__foot {
   display: flex;

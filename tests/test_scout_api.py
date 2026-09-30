@@ -5,6 +5,7 @@ the scout / super-deal / daily-top settings (ranges, secret key, URL check). No 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import httpx
@@ -106,6 +107,18 @@ def test_scout_in_health_and_monitor(client) -> None:
     scout = c.get("/api/v1/health", params={"ai": False}).json()["scout"]
     assert scout["enabled"] is False and scout["state"] == "off" and "выключен" in scout["text_ru"]
     assert c.get("/api/v1/monitor").json()["scout"]["vision_queue"]["waiting"] == 0
+
+
+def test_scout_speed_is_plain_russian_in_monitor_and_health(client) -> None:
+    """speed_ru has a Russian decimal comma and no «Ожидается … (пока не измерено)» wrapper: an
+    estimate is flagged by speed_expected (the app shows its «оценка» mark next to the line)."""
+    c, _, _ = client
+    r = c.patch("/api/v1/settings", json={"ai": {"scout": {"enabled": True, "base_url": SCOUT_URL,
+                                                            "model": "qwen3.5:2b-q4_K_M"}}})
+    assert r.status_code == 200, r.text
+    for scout in (c.get("/api/v1/monitor").json()["scout"], c.get("/api/v1/health", params={"ai": False}).json()["scout"]):
+        assert scout["speed_expected"] is True, scout
+        assert re.fullmatch(r"≈ \d+,\d с на объявление, до \d+ объявлени[йя] в час", scout["speed_ru"]), scout["speed_ru"]
 
 
 def test_scout_settings(client) -> None:

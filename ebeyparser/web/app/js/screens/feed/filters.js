@@ -74,9 +74,7 @@ export function moreCount(f) {
 export function toParams(f, q) {
   const p = { sort: f.sort || "best" };
   if (f.act) p.action = f.act;
-  // «Супер» (AI scout tiers): the API has no tier filter — a super find is always a «Покупай»,
-  // the feed keeps only `tier === "super"` of these (feed.js)
-  if (f.sup) p.verdict = "buy";
+  if (f.sup) p.tier = "super"; // the card's `tier`, judged on the server (exact total and facet count)
   if (f.personal) p.purpose = "personal";
   if (f.near) p.max_km = 10;
   if (f.ship) p.shipping = 1;
@@ -139,8 +137,9 @@ export function FilterBar({ f, set, view, setView, total, reset, facets, search 
     if (!fc) return null;
     if (key === "") return fc.verdict && fc.verdict.good;
     if (["buy", "haggle", "bid"].includes(key)) return fc.action && fc.action[key];
-    return { personal: fc.purpose && fc.purpose.personal, near: fc.near_10km, ship: fc.shipping, noflags: fc.no_flags, unseen: fc.unseen }[key];
+    return { sup: fc.tier && fc.tier.super, personal: fc.purpose && fc.purpose.personal, near: fc.near_10km, ship: fc.shipping, noflags: fc.no_flags, unseen: fc.unseen }[key];
   };
+  const counted = ["sup", "unseen"]; // toggle chips that show how many they would leave
   return html`<div class="fbar">
     <div class="fbar__chips" role="toolbar" aria-label="Фильтры">
       ${ACTION_CHIPS.map(
@@ -154,7 +153,7 @@ export function FilterBar({ f, set, view, setView, total, reset, facets, search 
       )}
       <span class="fbar__sep" aria-hidden="true"></span>
       ${TOGGLE_CHIPS.map(
-        (c) => html`<${FChip} on=${f[c.key]} icon=${c.icon} tip=${c.tip} count=${!f[c.key] && c.key === "unseen" ? countOf(c.key) : null} onClick=${() => set({ [c.key]: !f[c.key] })}>${c.label}<//>`,
+        (c) => html`<${FChip} on=${f[c.key]} icon=${c.icon} tip=${c.tip} count=${!f[c.key] && counted.includes(c.key) ? countOf(c.key) : null} onClick=${() => set({ [c.key]: !f[c.key] })}>${c.label}<//>`,
       )}
       <button type="button" class=${cx("fchip fchip--more", extra > 0 && "is-on")} onClick=${() => setMore(true)}>
         <${Icon} name="sliders-horizontal" size=${14} /><span>Ещё</span>${extra > 0 && html`<span class="fchip__count num">${extra}</span>`}

@@ -26,12 +26,10 @@ const clean = (t) =>
     .replace(/(\d)\.(?=\d{3}(?!\d))/g, "$1 ")
     .trim();
 
-/** «≈ 6,0 с на объявление, до 300 объявлений в час» — «Ожидается … (пока не измерено)» becomes a separate «оценка» mark. */
+/** «≈ 6,0 с на объявление, до 300 объявлений в час» as the server words it; an estimate
+ * (`speed_expected`) gets the separate «оценка» mark next to it. */
 export function scoutSpeed(s) {
-  if (!s || !s.speed_ru) return "";
-  let t = clean(s.speed_ru).replace(/(\d)\.(\d)(?=\s*с(?:[\s,.;)]|$))/g, "$1,$2");
-  if (s.speed_expected) t = t.replace(/^Ожидается\s+/, "").replace(/\s*\(пока не измерено\)\s*$/, "");
-  return t;
+  return s && s.speed_ru ? clean(s.speed_ru) : "";
 }
 
 // ------------------------------------------------------------------ deal marks

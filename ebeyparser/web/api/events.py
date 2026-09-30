@@ -12,7 +12,11 @@ Event types (the SSE `event:` field; `data:` is JSON):
   deal_updated     {"ad_id", "card": DealCard} (+ the deal_found keys when the monitor re-checked it, e.g. the
                    vision model came back online and checked the photos)
   project_updated  {"id", "reason", "card": ProjectCard | null, "ad_id"?, "alert"?} («Сборки»: a build changed,
-                   got a better offer or sent an alert; reason: created|updated|tracking|bought|offer|run|alert|deleted)
+                   got a better offer or sent an alert; reason: created|updated|tracking|bought|offer|run|alert).
+                   "alert": {"kinds", "title_ru" (one line), "detail_ru" (plain, no links), "url" (the ad),
+                   "project_url", "text_ru" (toast line with the build name), "delivered", "ad_id"}.
+                   Never sent for a build that is being / was deleted
+  project_deleted  {"id", "name", "searches_removed"} (a build was deleted; it gets no project_updated after this)
   monitor_paused / monitor_resumed   {"paused": bool}
   job_progress     {"id", "kind", "stage", "text_ru", "ad_id"} (a step of a running job)
   job_finished     a Job (see jobs.py)
@@ -45,7 +49,7 @@ RETRY_MS = 3000
 EVENT_TYPES = (
     "ready", "run_started", "run_finished", "deal_found", "health_alert", "settings_changed",
     "searches_changed", "deal_updated", "monitor_paused", "monitor_resumed", "job_progress", "job_finished",
-    "run_progress", "project_updated",
+    "run_progress", "project_updated", "project_deleted",
 )
 
 

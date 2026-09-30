@@ -339,15 +339,9 @@ export function BoughtDialog({ open, p, slot, offer, onClose, onView }) {
           label: "Отменить",
           onClick: async () => {
             try {
+              // the server also takes the deal out of «Купил» (back to its status before the purchase)
               const back = await projectsApi.unbought(p.id, slot.key);
-              let view = back && back.project;
-              // the purchase moved the deal to «Купил»; the undo of the build does not move it back
-              // (API gap) — put the deal where it was, so the offer shows up in the build again
-              if (offer && offer.ad_id) {
-                const prev = offer.status && offer.status !== "bought" ? offer.status : "new";
-                await api.patch(`/deals/${encodeURIComponent(offer.ad_id)}`, { status: prev }).catch(() => null);
-                view = (await projectsApi.get(p.id).catch(() => null)) || view;
-              }
+              const view = back && back.project;
               if (view) {
                 cacheView(view);
                 onView(view);
@@ -617,26 +611,18 @@ export function AlertsList({ p, onDeal }) {
               ${a.price != null && html`<span class="num">${money(a.price)}</span>`}
               <span class="muted">${a.sent_at_label}</span>
             </div>
-            <p class="pj-alert__text">${alertLine(a.text)}</p>
+            <p class="pj-alert__text">${a.title_ru || a.kind_label}</p>
+            ${a.detail_ru && html`<p class="pj-alert__detail">${a.detail_ru}</p>`}
             <div class="pj-alert__foot">
               <span class=${cx("pj-alert__delivered", !a.delivered && "muted")}><${Icon} name=${a.delivered ? "send" : "smartphone"} size=${12} />${a.delivered_label}</span>
               ${!a.delivered && !channel && html`<a href="/settings/notifications" class="linkish">Настроить Telegram</a>`}
-              ${a.ad_id && html`<button type="button" class="linkish" onClick=${() => onDeal({ ad_id: a.ad_id, title: a.text })}>Открыть сделку</button>`}
+              ${a.ad_id && html`<button type="button" class="linkish" onClick=${() => onDeal({ ad_id: a.ad_id, title: a.title_ru })}>Открыть сделку</button>`}
             </div>
           </div>
         </li>`,
       )}
     </ul>
   </section>`;
-}
-
-/** A stored alert is the whole Telegram message (several lines, links): the first line is the news. */
-function alertLine(text) {
-  const first = String(text || "")
-    .split(/\n/)
-    .map((l) => l.trim())
-    .find(Boolean);
-  return ru((first || "").replace(/https?:\/\/\S+/g, "").replace(/\s{2,}/g, " "));
 }
 
 // ================================================================== side sheets
@@ -726,7 +712,7 @@ export function DeleteDialog({ open, p, onClose, onDeleted, onStart }) {
         loading=${busy}
         onClick=${async () => {
           setBusy(true);
-          onStart && onStart(true); // the `deleted` event may arrive before the answer
+          onStart && onStart(true); // `project_deleted` may arrive before the answer
           try {
             const res = await projectsApi.remove(p.id, keep);
             onDeleted(res);
