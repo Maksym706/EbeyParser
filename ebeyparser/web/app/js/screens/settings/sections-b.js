@@ -36,6 +36,7 @@ import {
 import { TelegramConnect } from "../../setup/telegram.js";
 import { EmailConnect, EbayConnect } from "../../setup/mail-ebay.js";
 import { Group } from "./form.js";
+import { AlertTiersGroups } from "./scout.js";
 
 // ============================================================ 4. Уведомления
 function ChannelCard({ icon, title, connected, detail, children }) {
@@ -136,6 +137,8 @@ export function NotificationsSection({ form }) {
         ${(id) => html`<${Toggle} id=${id} checked=${n.unchecked_deals} onChange=${(v) => form.set("notifications.unchecked_deals", v)} />`}
       <//>
     <//>
+
+    <${AlertTiersGroups} form=${form} />
 
     <${Group} title="Служебные сообщения" icon="heart-pulse">
       <${SettingRow} kind="switch" label="Сообщать о проблемах" help="Нейросеть упала, сайт заблокировал, парсинг сломался">

@@ -9,6 +9,7 @@ export const LAST_KEY = "ebp.feed.filters.v1";
 
 export const DEFAULTS = {
   act: "",
+  sup: false,
   personal: false,
   near: false,
   ship: false,
@@ -25,7 +26,7 @@ export const DEFAULTS = {
   since: "",
 };
 
-const BOOL = ["personal", "near", "ship", "noflags", "unseen"];
+const BOOL = ["sup", "personal", "near", "ship", "noflags", "unseen"];
 const NUM = ["pmin", "pmax", "profit", "score"];
 const URL_KEYS = { act: "f", noflags: "nf", source: "src" };
 
@@ -73,6 +74,9 @@ export function moreCount(f) {
 export function toParams(f, q) {
   const p = { sort: f.sort || "best" };
   if (f.act) p.action = f.act;
+  // «Супер» (AI scout tiers): the API has no tier filter — a super find is always a «Покупай»,
+  // the feed keeps only `tier === "super"` of these (feed.js)
+  if (f.sup) p.verdict = "buy";
   if (f.personal) p.purpose = "personal";
   if (f.near) p.max_km = 10;
   if (f.ship) p.shipping = 1;
@@ -100,6 +104,7 @@ const ACTION_CHIPS = [
   { key: "bid", label: "Аукционы", icon: "gavel" },
 ];
 const TOGGLE_CHIPS = [
+  { key: "sup", label: "Супер", icon: "flame", tip: "Только супер-находки: большая прибыль, надёжная цена рынка, фото проверены нейросетью" },
   { key: "personal", label: "Для себя", icon: "piggy-bank" },
   { key: "near", label: "Рядом ≤ 10 км", icon: "map-pin" },
   { key: "ship", label: "С доставкой", icon: "truck" },

@@ -41,6 +41,7 @@ import { PriceChart, normalizeHistory, marketCaption } from "./price-chart.js";
 import { Composer } from "./composer.js";
 import { Popover, Menu } from "./popover.js";
 import { Countdown } from "./deal-card.js";
+import { FoundByBadge, SuperMark, ScoutNote } from "./scout.js";
 import { copyText, quickMessage } from "./messages.js";
 
 const reducedMotion = () => window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -119,6 +120,7 @@ export function DealView({ id, initial, mode = "page", onClose, onPrev, onNext, 
         html`<div class="callout tone-haggle"><${Icon} name="triangle-alert" size=${18} /><div><b>Фото не проверены нейросетью</b> — посмотри сам внимательно.</div></div>`}
         <${Gallery} images=${images} title=${deal.title} stock=${stock} />
         <${TitleBlock} deal=${deal} menu=${mode === "drawer" ? html`<${Menu} items=${overflowItems(deal, reload)} />` : null} />
+        <${ScoutNote} deal=${deal} />
       </div>
 
       <div class="dv__col dv__col--main">
@@ -274,6 +276,8 @@ function TitleBlock({ deal, menu }) {
       ${posted && html`<span class="muted">опубликовано ${posted}</span>`}
     </div>
     <div class="dv-title__chips">
+      <${SuperMark} deal=${deal} />
+      <${FoundByBadge} deal=${deal} variant="tag" />
       <span class="tag">${sourceLabel(deal)}</span>
       ${deal.search_name &&
       html`<a class="tag tag--link" href=${`/?search=${encodeURIComponent(deal.search_name)}`}><${Icon} name="radar" size=${12} />${deal.search_name}</a>`}
@@ -796,7 +800,7 @@ function WhyScore({ deal }) {
     </button>
     ${open &&
     html`<ul class="why">
-        ${reasons.map((r) => html`<li>${r}</li>`)}
+        ${reasons.map((r) => html`<li>${String(r).replace(/^\u{1F50E}\s*/u, "")}</li>`)}
       </ul>
       ${ev.stage_label && html`<p class="muted small">Глубина проверки: ${ev.stage_label}${ev.evaluated_at ? ` · ${ago(ev.evaluated_at)}` : ""}</p>`}`}
   </section>`;

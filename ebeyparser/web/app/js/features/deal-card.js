@@ -8,6 +8,7 @@ import "./icons-extra.js";
 import { decide, explainFlags, isSeen, isAuction, shortAge, ageMinutes, distanceText, secondsLeft, countdown } from "./deal-model.js";
 import { toggleStar, hideDeal, unhideDeal, writeToSeller } from "./deal-actions.js";
 import { openAd } from "./messages.js";
+import { FoundByBadge, SuperMark, isSuper } from "./scout.js";
 
 /** Re-render every `ms` while the element is on screen (auction countdowns). */
 export function useVisibleTick(ref, ms, enabled = true) {
@@ -147,7 +148,7 @@ export function DealCard({ deal, now, onOpen, selected = false, glow = false }) 
   const href = `/deal/${encodeURIComponent(deal.id)}`;
   const place = distanceText(deal);
   return html`<article
-    class=${cx("dcard", `tone-${d.tone}`, selected && "is-selected", glow && "is-new", deal.status === "ignored" && "is-hidden", d.kind === "skip" && "is-skip")}
+    class=${cx("dcard", `tone-${d.tone}`, selected && "is-selected", glow && "is-new", deal.status === "ignored" && "is-hidden", d.kind === "skip" && "is-skip", isSuper(deal) && "is-super")}
     data-deal=${deal.id}
   >
     <div class="dcard__media">
@@ -172,6 +173,7 @@ export function DealCard({ deal, now, onOpen, selected = false, glow = false }) 
       <div class="dcard__br"><${Freshness} deal=${deal} now=${now} /></div>
     </div>
     <div class="dcard__body">
+      <${SuperMark} deal=${deal} class="dcard__super" />
       <h3 class="dcard__title">
         ${unseen && html`<span class="unseen-dot" aria-label="Новое"></span>`}
         <a class="dcard__link" href=${href} onClick=${(e) => onOpen && onOpen(deal, e)}>${deal.title}</a>
@@ -185,6 +187,7 @@ export function DealCard({ deal, now, onOpen, selected = false, glow = false }) 
       <div class="dcard__signals">
         ${place && html`<span class="sig"><${Icon} name="map-pin" size=${14} />${place}</span>`}
         <${AiSignal} deal=${deal} />
+        <${FoundByBadge} deal=${deal} />
       </div>
       <${FlagChip} deal=${deal} />
     </div>
@@ -200,7 +203,7 @@ export function DealRow({ deal, now, onOpen, selected = false, glow = false }) {
   const place = distanceText(deal);
   const age = shortAge(deal.first_seen, now);
   return html`<article
-    class=${cx("drow", `tone-${d.tone}`, selected && "is-selected", glow && "is-new", deal.status === "ignored" && "is-hidden", d.kind === "skip" && "is-skip")}
+    class=${cx("drow", `tone-${d.tone}`, selected && "is-selected", glow && "is-new", deal.status === "ignored" && "is-hidden", d.kind === "skip" && "is-skip", isSuper(deal) && "is-super")}
     data-deal=${deal.id}
   >
     <div class="drow__media">
@@ -208,6 +211,7 @@ export function DealRow({ deal, now, onOpen, selected = false, glow = false }) {
       <span class="drow__dot" title=${d.verb}></span>
     </div>
     <div class="drow__body">
+      <${SuperMark} deal=${deal} class="drow__super" />
       <h3 class="drow__title">
         ${unseen && html`<span class="unseen-dot" aria-label="Новое"></span>`}
         <a class="dcard__link" href=${href} onClick=${(e) => onOpen && onOpen(deal, e)}>${deal.title}</a>
@@ -223,6 +227,7 @@ export function DealRow({ deal, now, onOpen, selected = false, glow = false }) {
         ${place && html`<span class="sig"><${Icon} name="map-pin" size=${13} />${place}</span>`}
         ${age && html`<span class="sig"><${Icon} name="clock" size=${13} />${age}</span>`}
         <${AiSignal} deal=${deal} />
+        <${FoundByBadge} deal=${deal} />
       </div>
       <${FlagChip} deal=${deal} />
     </div>

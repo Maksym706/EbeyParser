@@ -67,6 +67,15 @@ export function AiTestResult({ result, error }) {
   </div>`;
 }
 
+/** The model the guides name: the server's recommended preset (POST /ai/detect `gpu_presets`). */
+function recommendedModel(data) {
+  const presets = (data && data.gpu_presets) || [];
+  const p = presets.find((x) => x.recommended) || presets[0];
+  if (p) return { name: p.model_ru, id: p.lmstudio };
+  const s = data && data.suggested && data.suggested.model;
+  return s ? { name: s, id: s } : null;
+}
+
 /** "на процессоре 1–3 минуты" → "На процессоре 1–3 минуты." */
 const sentence = (t) => {
   const s = String(t || "").trim();
@@ -188,6 +197,7 @@ export function AiConnect({ save = true, onDone, current, onChoice }) {
     </div>`;
   }
 
+  const rec = recommendedModel(data);
   if (variant === "no_vision") {
     const srv = data.servers[0];
     return html`<div class="ai-card ai-card--amber">
@@ -198,7 +208,9 @@ export function AiConnect({ save = true, onDone, current, onChoice }) {
       <${Steps}
         items=${[
           { title: "Открой вкладку Discover", body: "В LM Studio слева — значок лупы.", art: ART.discover },
-          { title: html`Найди <code>Qwen2.5-VL-7B-Instruct</code>`, body: html`<${CopyButton} text="Qwen2.5-VL-7B-Instruct" label="Скопировать название" />` },
+          rec
+            ? { title: html`Найди <code>${rec.id}</code>`, body: html`<${CopyButton} text=${rec.id} label="Скопировать название" />` }
+            : { title: "Найди модель, которая понимает фото", body: "В описании модели должно быть Vision." },
           { title: "Загрузи её с Context Length 8192", body: "Кнопка Load → в настройках модели поставь Context Length 8192.", art: ART.server },
         ]}
       />
@@ -236,7 +248,7 @@ export function AiConnect({ save = true, onDone, current, onChoice }) {
           <${Steps}
             items=${[
               { title: html`Скачай LM Studio — это бесплатно`, body: html`<${ExternalLink} href=${LINKS.lmStudio}>lmstudio.ai<//>` },
-              { title: html`Во вкладке Discover скачай <b>Qwen2.5-VL-7B</b>`, body: "Модель, которая понимает фото и немецкий текст." },
+              { title: html`Во вкладке Discover скачай <b>${rec ? rec.name : "модель, которая понимает фото"}</b>`, body: "Модель, которая понимает фото и немецкий текст." },
               { title: "Developer → Start Server" },
             ]}
           />
@@ -252,7 +264,7 @@ export function AiConnect({ save = true, onDone, current, onChoice }) {
     <${Steps}
       items=${[
         { title: html`Скачай LM Studio — это бесплатно`, body: html`<${ExternalLink} href=${LINKS.lmStudio}>lmstudio.ai<//>`, art: ART.download },
-        { title: html`Во вкладке Discover скачай <b>${chosen ? chosen.model_ru : "Qwen2.5-VL-7B"}</b>`, body: chosen ? sentence(chosen.note_ru) : "Модель, которая понимает фото и немецкий текст.", art: ART.discover },
+        { title: html`Во вкладке Discover скачай <b>${chosen ? chosen.model_ru : rec ? rec.name : "модель, которая понимает фото"}</b>`, body: chosen ? sentence(chosen.note_ru) : "Модель, которая понимает фото и немецкий текст.", art: ART.discover },
         { title: "Developer → Start Server", body: "И включи автозапуск сервера, чтобы проверка работала после перезагрузки.", art: ART.server },
       ]}
     />

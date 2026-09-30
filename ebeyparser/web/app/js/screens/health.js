@@ -12,6 +12,7 @@ import { refreshMonitor, monitorAction, cooldownOf, normalize } from "../shell/m
 import "../features/icons-extra.js";
 import { setBadge } from "../features/badges.js";
 import { LogsView } from "./health/logs.js";
+import { scoutState } from "../features/scout.js";
 
 const LEVEL_TONE = { ok: "profit", warn: "haggle", error: "danger" };
 /** Server text → { message, details }: Berlin times instead of ISO, no CLI / exception text. */
@@ -94,6 +95,7 @@ function Overview() {
       <${EbayTile} d=${d} />
       <${NotifyTile} d=${d} />
       <${QueueTile} d=${d} />
+      <${ScoutTile} d=${d} reload=${h.reload} />
     </div>
     <${Runs} runs=${d.runs || []} />
     <p class="heartbeat">
@@ -176,8 +178,8 @@ function TopBanner({ d, reload, now }) {
   </section>`;
 }
 
-function Tile({ icon, title, tone = "neutral", state, children, actions, tip }) {
-  return html`<section class="htile">
+function Tile({ icon, title, tone = "neutral", state, children, actions, tip, wide = false }) {
+  return html`<section class=${cx("htile", wide && "htile--wide")}>
     <header class="htile__head">
       <span class=${cx("htile__icon", `tone-${tone}`)}><${Icon} name=${icon} size=${20} /></span>
       <div class="htile__titles">
@@ -399,6 +401,62 @@ function QueueTile({ d }) {
     <div class="hmetric"><span>Не успел за 24 ч</span><b class=${cx("num", b.expired_24h > 0 && "t-amber")}>${number(b.expired_24h || 0)}</b></div>
     ${st.db_bytes != null && html`<div class="hmetric"><span>База данных</span><b>${bytes(st.db_bytes)}${st.free_bytes != null ? ` · свободно ${bytes(st.free_bytes)}` : ""}</b></div>`}
     ${d.uptime_seconds != null && html`<div class="hmetric"><span>Программа работает</span><b>${span(d.uptime_seconds)}</b></div>`}
+  <//>`;
+}
+
+async function testScout(reload) {
+  const id = toast({ kind: "loading", title: "Разведчик читает 4 объявления-примера… (до пары минут на слабом сервере)" });
+  try {
+    const r = await api.post("/ai/scout/test", {}, { timeout: 240000 });
+    const e = human(r.message_ru || r.error_ru || "Разведчик не ответил");
+    if (r.ok) toast({ id, kind: "success", title: e.message });
+    else toast({ id, kind: r.answered ? "warning" : "error", title: e.message, details: e.details, action: { label: "Настроить", href: "/settings/ai#scout" } });
+  } catch (err) {
+    toast({ id, kind: "error", title: err.message, details: err.details });
+  }
+  reload && reload();
+}
+
+/** «Разведчик» (AI scout, docs/design/AI_SCOUT.md §12): reads every new ad on the always-on server. */
+function ScoutTile({ d, reload }) {
+  const s = d.scout;
+  const [busy, setBusy] = useState(false);
+  if (!s) return null;
+  const st = scoutState(s);
+  const text = human(s.text_ru);
+  const q = s.vision_queue || {};
+  const problem = s.state === "down" || s.state === "too_small" || s.state === "behind";
+  return html`<${Tile}
+    icon="telescope"
+    title="Разведчик"
+    tone=${st.tone}
+    state=${st.label}
+    wide
+    tip="Маленькая нейросеть на сервере читает каждое новое объявление и находит то, что скрипт пропускает: опечатки, комплекты, старый ПК с дорогой видеокартой. Цены — только по истории объявлений."
+    actions=${html`${s.enabled &&
+      html`<${Button} size="sm" variant="secondary" icon="play" loading=${busy} onClick=${async () => {
+        setBusy(true);
+        await testScout(reload);
+        setBusy(false);
+      }}>Проверить<//>`}
+      <${Button} size="sm" variant=${s.enabled ? "ghost" : "secondary"} href=${s.state === "too_small" ? "/settings/ai#models" : "/settings/ai#scout"}>
+        ${!s.enabled ? "Включить" : s.state === "too_small" ? "Подобрать модель" : "Настроить"}
+      <//>`}
+  >
+    ${text.message && html`<p class=${cx("htile__lead", problem && `t-${st.tone === "danger" ? "red" : "amber"}`)}>${text.message}</p>`}
+    ${text.details && html`<${Details} text=${text.details} />`}
+    ${s.enabled &&
+    html`<div class="htile__grid">
+      <div class="hmetric"><span>Прочитал за час</span><b class="num">${number(s.read_last_hour || 0)}${s.seen_last_hour ? ` из ${number(s.seen_last_hour)}` : ""}</b></div>
+      <div class="hmetric"><span>Не успел за час</span><b class=${cx("num", s.overflow_last_hour > 0 && "t-amber")}>${number(s.overflow_last_hour || 0)}</b></div>
+      ${s.failed_last_hour > 0 && html`<div class="hmetric"><span>Не разобрал</span><b class="num t-amber">${number(s.failed_last_hour)}</b></div>`}
+      ${s.speed_ru &&
+      html`<div class="hmetric"><span>Скорость${s.speed_expected ? html` <span class="tag scout-est" title="Ещё не измерено — оценка по модели и железу">оценка</span>` : ""}</span><b>${human(s.speed_ru).message}</b></div>`}
+      ${s.mode_ru && html`<div class="hmetric"><span>Режим</span><b>${human(s.mode_ru).message}</b></div>`}
+      ${s.model && html`<div class="hmetric"><span>Модель</span><code class="mono">${s.model}</code></div>`}
+    </div>`}
+    ${q.waiting > 0 &&
+    html`<p class="htile__note"><${Icon} name="hourglass" size=${14} />Ждут проверки фото: <b class="num">${number(q.waiting)}</b>${q.text_ru ? html` — ${human(q.text_ru).message}` : ""}</p>`}
   <//>`;
 }
 

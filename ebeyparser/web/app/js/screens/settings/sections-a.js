@@ -8,6 +8,7 @@ import { LocationPicker, RadiusSlider } from "../../setup/where.js";
 import { StrategyCards, ExampleBox, DEFAULT_PRESETS, detectStrategy } from "../../setup/money.js";
 import { AiConnect } from "../../setup/ai.js";
 import { Group } from "./form.js";
+import { ScoutGroup, ModelsGroup } from "./scout.js";
 
 const INTERVALS = [10, 15, 20, 30, 45, 60, 90, 120];
 
@@ -247,6 +248,9 @@ export function AiSection({ form }) {
       <${AiConnect} save=${true} current=${{ model: ai.model, enabled: form.settings && form.settings.ai && form.settings.ai.enabled }} onDone=${() => form.reload()} />
     <//>
 
+    <${ScoutGroup} form=${form} />
+    <${ModelsGroup} form=${form} />
+
     <${Group} title="Как проверять" icon="sliders-horizontal">
       <${SettingRow} label="Фото на объявление" help="Больше фото — точнее, но медленнее">
         <${Segmented} value=${ai.max_images} onChange=${(v) => form.set("ai.max_images", v)} options=${[1, 2, 3, 4, 5].map((n) => ({ value: n, label: String(n) }))} label="Фото на объявление" block />
@@ -284,7 +288,7 @@ export function AiSection({ form }) {
           ${(id) => html`<${Input} id=${id} ...${form.bind("ai.base_url")} class="mono" placeholder="http://localhost:1234/v1" />`}
         <//>
         <${SettingRow} label="Модель" error=${form.err("ai.model")}>
-          ${(id) => html`<${Input} id=${id} ...${form.bind("ai.model")} class="mono" placeholder="qwen/qwen2.5-vl-7b" />`}
+          ${(id) => html`<${Input} id=${id} ...${form.bind("ai.model")} class="mono" placeholder="название модели из LM Studio или Ollama" />`}
         <//>
       <//>
     <//>

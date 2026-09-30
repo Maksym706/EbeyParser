@@ -3,6 +3,7 @@ import { html, useEffect, useState } from "../../lib/html.js";
 import { api } from "../../lib/api.js";
 import { Icon, TestResult } from "../../ui/index.js";
 import { AiConnect } from "../../setup/ai.js";
+import { ModelAdvice } from "../../features/scout.js";
 import { TelegramConnect } from "../../setup/telegram.js";
 import { EmailConnect, EbayConnect } from "../../setup/mail-ebay.js";
 import { updateDraft } from "./draft.js";
@@ -30,6 +31,15 @@ export function AiStep({ draft }) {
       onChoice=${(found) =>
         updateDraft((d) => (JSON.stringify(d.ai.found || null) === JSON.stringify(found || null) ? {} : { ai: { ...d.ai, found } }))}
     />
+    <details class="guide model-guide">
+      <summary>Какую модель поставить?</summary>
+      <div class="guide__body">
+        <${ModelAdvice}
+          onUsed=${(task, res) =>
+            task === "vision" && res && res.ai && updateDraft((d) => ({ ai: { ...d.ai, done: true, skipped: false, model: res.ai.model } }))}
+        />
+      </div>
+    </details>
   </div>`;
 }
 
