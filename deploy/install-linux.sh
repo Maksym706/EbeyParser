@@ -31,6 +31,7 @@ ask() {  # ask "question" -> 0 = yes
     case "${answer,,}" in д|да|y|yes|j|ja) return 0 ;; *) return 1 ;; esac
 }
 
+ORIG_ARGS=("$@")
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY=1 ;;
@@ -48,7 +49,7 @@ done
 if [ "$(id -u)" = 0 ]; then
     if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
         say "Запущено через sudo — продолжаю от пользователя $SUDO_USER (sudo спросит пароль, когда нужно)."
-        exec sudo -u "$SUDO_USER" -H bash "$0" "$@"
+        exec sudo -u "$SUDO_USER" -H bash "$0" "${ORIG_ARGS[@]}"
     fi
     die "Запусти от обычного пользователя, не от root: bash deploy/install-linux.sh (программа не должна работать от root)."
 fi
@@ -85,7 +86,7 @@ if [ -x "$VPY" ] && ! "$VPY" -c 'import sys' 2>/dev/null; then
     say "Окружение .venv повреждено — создаю заново."
     run rm -rf "$DIR/.venv"
 fi
-if [ ! -x "$VPY" ] || [ "$DRY" = 1 ] && [ ! -x "$VPY" ]; then
+if [ ! -x "$VPY" ]; then
     run "$PY" -m venv "$DIR/.venv"
 fi
 run "$VPY" -m pip install --quiet --upgrade pip
@@ -173,12 +174,11 @@ Nice=10"
             sudo systemctl daemon-reload
             sudo systemctl restart ollama
         fi
-        run "$VPY" -m ebeyparser server-models --pull --ollama "$OLLAMA_URL" --wait 60
-        if [ "$SERVICE_ON" = 1 ]; then
+        if [ "$SERVICE_ON" = 1 ]; then  # the service has EBEYPARSER_OLLAMA_URL: the scout switches itself on
+            run env EBEYPARSER_OLLAMA_URL="$OLLAMA_URL" "$VPY" -m ebeyparser server-models --pull --ollama "$OLLAMA_URL" --wait 60
             run sudo systemctl restart "$SERVICE"
-            say "✔ Разведчик включится сам (Настройки → Нейросеть покажет модель и скорость)."
         else
-            say "Включи разведчика в панели: Настройки → Нейросеть → Разведчик, адрес $OLLAMA_URL"
+            run "$VPY" -m ebeyparser server-models --pull --ollama "$OLLAMA_URL" --wait 60
         fi
     else
         say "Хорошо, без локальной нейросети."

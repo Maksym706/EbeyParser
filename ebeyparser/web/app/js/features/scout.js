@@ -26,6 +26,14 @@ const clean = (t) =>
     .replace(/(\d)\.(?=\d{3}(?!\d))/g, "$1 ")
     .trim();
 
+/** «≈ 6,0 с на объявление, до 300 объявлений в час» — «Ожидается … (пока не измерено)» becomes a separate «оценка» mark. */
+export function scoutSpeed(s) {
+  if (!s || !s.speed_ru) return "";
+  let t = clean(s.speed_ru).replace(/(\d)\.(\d)(?=\s*с\b)/g, "$1,$2");
+  if (s.speed_expected) t = t.replace(/^Ожидается\s+/, "").replace(/\s*\(пока не измерено\)\s*$/, "");
+  return t;
+}
+
 // ------------------------------------------------------------------ deal marks
 export const foundByScout = (deal) => Boolean(deal && deal.found_by === "ai_scout");
 export const isSuper = (deal) => Boolean(deal && deal.tier === "super");
@@ -90,7 +98,7 @@ export function ScoutLine({ scout, class: cls = "" }) {
     <span class="sdot"></span>
     <div>
       <div class="scout-line__text">${text}</div>
-      ${scout.speed_ru && html`<div class="scout-line__speed">${clean(scout.speed_ru)}</div>`}
+      ${scout.speed_ru && html`<div class="scout-line__speed">${scoutSpeed(scout)}${scout.speed_expected ? html` <span class="tag scout-est" title="Ещё не измерено — оценка по модели и железу">оценка</span>` : ""}</div>`}
     </div>
   </div>`;
 }

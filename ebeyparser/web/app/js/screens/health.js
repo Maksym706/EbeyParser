@@ -12,7 +12,7 @@ import { refreshMonitor, monitorAction, cooldownOf, normalize } from "../shell/m
 import "../features/icons-extra.js";
 import { setBadge } from "../features/badges.js";
 import { LogsView } from "./health/logs.js";
-import { scoutState } from "../features/scout.js";
+import { scoutState, scoutSpeed } from "../features/scout.js";
 
 const LEVEL_TONE = { ok: "profit", warn: "haggle", error: "danger" };
 /** Server text → { message, details }: Berlin times instead of ISO, no CLI / exception text. */
@@ -451,12 +451,12 @@ function ScoutTile({ d, reload }) {
       <div class="hmetric"><span>Не успел за час</span><b class=${cx("num", s.overflow_last_hour > 0 && "t-amber")}>${number(s.overflow_last_hour || 0)}</b></div>
       ${s.failed_last_hour > 0 && html`<div class="hmetric"><span>Не разобрал</span><b class="num t-amber">${number(s.failed_last_hour)}</b></div>`}
       ${s.speed_ru &&
-      html`<div class="hmetric"><span>Скорость${s.speed_expected ? html` <span class="tag scout-est" title="Ещё не измерено — оценка по модели и железу">оценка</span>` : ""}</span><b>${human(s.speed_ru).message}</b></div>`}
+      html`<div class="hmetric"><span>Скорость${s.speed_expected ? html` <span class="tag scout-est" title="Ещё не измерено — оценка по модели и железу">оценка</span>` : ""}</span><b>${scoutSpeed(s)}</b></div>`}
       ${s.mode_ru && html`<div class="hmetric"><span>Режим</span><b>${human(s.mode_ru).message}</b></div>`}
       ${s.model && html`<div class="hmetric"><span>Модель</span><code class="mono">${s.model}</code></div>`}
     </div>`}
     ${q.waiting > 0 &&
-    html`<p class="htile__note"><${Icon} name="hourglass" size=${14} />Ждут проверки фото: <b class="num">${number(q.waiting)}</b>${q.text_ru ? html` — ${human(q.text_ru).message}` : ""}</p>`}
+    html`<p class="htile__note"><${Icon} name="hourglass" size=${14} /><span>Ждут проверки фото: <b class="num">${number(q.waiting)}</b>${q.max_wait_minutes ? ` — жду ПК с нейросетью до ${Math.round(q.max_wait_minutes)} мин, потом пришлю с пометкой «фото не проверены»` : ""}</span></p>`}
   <//>`;
 }
 
