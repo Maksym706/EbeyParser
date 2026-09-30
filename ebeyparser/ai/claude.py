@@ -92,10 +92,18 @@ class ClaudeVision:
             await close()
 
 
-def make_llm(cfg: Any) -> Any:
-    """Build the right client for cfg.provider."""
+def make_llm(cfg: Any, *, purpose: str = "vision", fallback: Any = None, transport: Any = None,
+             extra_body: dict[str, Any] | None = None) -> Any:
+    """Build the right client for cfg.provider. `purpose`: vision | triage | planner | second_opinion
+    (what thinking="auto" means, whose share of a cloud quota a call uses). `fallback`: LLMSettings
+    of a local model that stands in while a cloud endpoint is limited or down (ai/cloud.py)."""
     if cfg.provider == "anthropic":
         return ClaudeVision(cfg)
     from .client import VisionLLM
 
-    return VisionLLM(cfg)
+    llm = VisionLLM(cfg, transport=transport, extra_body=extra_body, purpose=purpose)
+    if fallback is not None and llm.cloud:
+        from .cloud import CloudRouter
+
+        return CloudRouter(llm, VisionLLM(fallback, transport=transport, extra_body=extra_body, purpose=purpose))
+    return llm

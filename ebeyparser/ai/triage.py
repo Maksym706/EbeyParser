@@ -108,7 +108,12 @@ def expected_sec_per_ad(model_id: str, tier: str = "T0") -> float | None:
 
 
 def batch_for_model(model_id: str) -> tuple[int, int]:
-    """(first batch size, largest batch) for a model: 5/5 for ~2B, 8/10 for 3B, 10/16 for 4B+."""
+    """(first batch size, largest batch) for a model: 5/5 for ~2B, 8/10 for 3B, 10/16 for 4B+,
+    16/20 for big cloud models (Nemotron 3 Super / Lightning …, docs/design/CLOUD_AI.md)."""
+    from .cloud import CLOUD_BATCH, is_cloud_model
+
+    if is_cloud_model(model_id):
+        return CLOUD_BATCH
     size = model_params_b(model_id)
     if size is None:
         return DEFAULT_BATCH

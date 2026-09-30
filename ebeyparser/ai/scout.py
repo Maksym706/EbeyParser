@@ -290,17 +290,20 @@ def _clip(text: Any, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def feedback_hints(examples: dict[str, list[dict[str, Any]]], *, limit: int = HINTS_LIMIT) -> str:
+def feedback_hints(examples: dict[str, list[dict[str, Any]]], *, limit: int = HINTS_LIMIT,
+                   private: bool = False) -> str:
     """The user's feedback as a few prompt lines: hidden deals (+ reason) mean "not interested
-    in things like this", bought / sold ones "more like this". Capped at `limit` characters."""
+    in things like this", bought / sold ones "more like this". Capped at `limit` characters.
+    `private` (a cloud endpoint): only the ads' titles — not what the user paid or earned, not
+    the reasons they typed (docs/design/CLOUD_AI.md, privacy)."""
     lines: list[str] = []
     for row in examples.get("good", [])[:3]:
         bits = [f"bought {row['bought']:.0f} €" if row.get("bought") else "",
                 f"sold {row['sold']:.0f} €" if row.get("sold") else ""]
-        extra = ", ".join(b for b in bits if b)
+        extra = "" if private else ", ".join(b for b in bits if b)
         lines.append(f"- good buy: {_clip(row.get('title'), 60)}" + (f" ({extra})" if extra else ""))
     for row in examples.get("hidden", [])[:4]:
-        reason = _clip(row.get("reason"), 40)
+        reason = "" if private else _clip(row.get("reason"), 40)
         lines.append(f"- not interesting: {_clip(row.get('title'), 60)}" + (f" ({reason})" if reason else ""))
     if not lines:
         return ""
@@ -326,12 +329,19 @@ TOO_SMALL_RU = ("Модель {model} слишком маленькая для �
                 " Объявления смотрю обычным способом. Возьми Qwen3.5 2B или больше")
 
 
+CLOUD_LOW_RU = "читает только непонятные объявления — бережёт бесплатный лимит облака"
+
+
 def status_view(*, enabled: bool, mode_setting: str, provider: str, base_url: str, model: str, own_endpoint: bool,
                 snap: dict[str, Any], vision_waiting: int, vision_wait_minutes: float,
                 expected_sec_per_ad: float | None = None, pass_share: float = 0.5, max_per_hour: int = 0,
-                too_small: bool = False) -> dict[str, Any]:
+                too_small: bool = False, cloud: dict[str, Any] | None = None,
+                fallback: bool = False) -> dict[str, Any]:
     """Everything the Settings → Нейросеть and Состояние screens show about the scout.
-    `expected_sec_per_ad`: the model research's speed for this model (before it measured its own)."""
+    `expected_sec_per_ad`: the model research's speed for this model (before it measured its own).
+    `cloud`: the quota snapshot of a cloud endpoint (ai/cloud.py) — used up / paused shows as
+    state "quota" (not "down"), a low share as the «только непонятные» mode; `fallback`: a local
+    model stands in meanwhile."""
     seen = int(snap.get("seen_last_hour") or 0)
     read = int(snap.get("triaged_last_hour") or 0)
     capacity = snap.get("capacity_per_hour")
@@ -339,10 +349,16 @@ def status_view(*, enabled: bool, mode_setting: str, provider: str, base_url: st
     mode = snap.get("mode") or ("all" if mode_setting == "auto" else mode_setting)
     error, error_at, ok_at = snap.get("last_error") or "", snap.get("last_error_at"), snap.get("last_ok_at")
     down = bool(error) and (ok_at is None or (error_at or 0) > ok_at)
+    quota_hit = bool(cloud and cloud.get("limited"))
     if not enabled:
         state, text = "off", "Разведчик выключен — объявления отбираю по названию и истории цен"
     elif too_small:
         state, text = "too_small", TOO_SMALL_RU.format(model=model or "?")
+    elif quota_hit or (down and cloud and cloud.get("scout_low")):
+        state = "quota"
+        why = (cloud or {}).get("limited_ru") or "Бесплатный лимит облака на сегодня почти потрачен"
+        text = f"{why}. " + ("Пока читает запасная модель на компьютере" if fallback
+                             else "Пока смотрю объявления обычным способом")
     elif down:
         state, text = "down", "Разведчик не отвечает — пока смотрю объявления обычным способом"
     elif seen == 0 and read == 0:
@@ -367,7 +383,7 @@ def status_view(*, enabled: bool, mode_setting: str, provider: str, base_url: st
         "speed_ru": speed,
         "mode": mode,
         "mode_setting": mode_setting,
-        "mode_ru": MODE_RU.get(mode, ""),
+        "mode_ru": CLOUD_LOW_RU if cloud and cloud.get("scout_low") and mode == "candidates" else MODE_RU.get(mode, ""),
         "provider": provider,
         "base_url": base_url,
         "model": model,
@@ -381,6 +397,7 @@ def status_view(*, enabled: bool, mode_setting: str, provider: str, base_url: st
         "too_small": too_small,
         "capacity_per_hour": capacity,
         "batch_size": snap.get("batch_size") or None,
+        "cloud": cloud.get("provider") if cloud else "",
         "vision_queue": {
             "waiting": vision_waiting,
             "max_wait_minutes": vision_wait_minutes,

@@ -636,8 +636,14 @@ class AIEvaluator:
         imgs = [img for img in (images or []) if img][: max(0, self.cfg.max_images)]
         imgs = prepare_images(imgs, max_side=int(getattr(self.cfg, "image_max_side", None) or IMAGE_MAX_SIDE))
         comps = prompt_comparables(estimate, comparables)
+        shown = listing
+        if getattr(self.llm, "cloud", ""):
+            # a cloud model sees the ad only: no seller name / ratings, no postal code, no contacts
+            from .cloud import cloud_listing
+
+            shown = cloud_listing(listing)
         prompt = build_user_prompt(
-            listing,
+            shown,
             purpose=purpose,
             target_price=target_price,
             n_images=len(imgs),
@@ -647,6 +653,10 @@ class AIEvaluator:
             answer = await self.llm.chat_json(SYSTEM_PROMPT, prompt, imgs, VERDICT_SCHEMA)
         except LLMError as exc:
             log.warning("AI check failed for %s (%s): %s", listing.ad_id, self.cfg.model, exc)
+            message_ru = getattr(exc, "message_ru", "")
+            if message_ru:  # the cloud's free quota / the eBay rule: already plain Russian
+                return AIVerdict(verdict="maybe", confidence=0.0, reasoning=f"Нейросеть не проверила фото: {message_ru}",
+                                 model=self.cfg.model)
             return self._unavailable(str(exc))
         except Exception as exc:  # noqa: BLE001 - never let the model break a monitoring run
             log.exception("AI check crashed for %s", listing.ad_id)

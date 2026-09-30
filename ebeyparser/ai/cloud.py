@@ -733,12 +733,10 @@ def _iso(ts: float) -> str:
 
 
 def _hhmm(ts: float) -> str:
-    try:
-        from ..timefmt import clock_label  # type: ignore[attr-defined]
+    """«21:34» in the user's time zone (general.timezone)."""
+    from ..timefmt import hhmm
 
-        return clock_label(datetime.fromtimestamp(ts, timezone.utc))
-    except Exception:  # noqa: BLE001
-        return datetime.fromtimestamp(ts, timezone.utc).astimezone().strftime("%H:%M")
+    return hhmm(datetime.fromtimestamp(ts, timezone.utc))
 
 
 class QuotaRegistry:
@@ -788,6 +786,87 @@ _REGISTRY = QuotaRegistry()
 
 def registry() -> QuotaRegistry:
     return _REGISTRY
+
+
+# ---------------------------------------------------------------------------
+# Cloud first, the local model as a stand-in
+# ---------------------------------------------------------------------------
+
+
+class CloudRouter:
+    """ChatModel: the cloud endpoint while it may be called, the local fallback while it is limited
+    (daily quota, 429 pause), down, or the ad may not go to the cloud (eBay). Without an answer from
+    either the fallback's LLMError goes up (the caller's usual "AI down" path)."""
+
+    def __init__(self, primary: Any, fallback: Any):
+        self.primary = primary
+        self.fallback = fallback
+        self.last_limited: Exception | None = None
+
+    @property
+    def cfg(self) -> Any:
+        return self.primary.cfg
+
+    @property
+    def cloud(self) -> str:
+        return getattr(self.primary, "cloud", "")
+
+    @property
+    def quota(self) -> QuotaLimiter | None:
+        return getattr(self.primary, "quota", None)
+
+    @property
+    def purpose(self) -> str:
+        return getattr(self.primary, "purpose", "vision")
+
+    @property
+    def _extra_body(self) -> dict[str, Any]:
+        return getattr(self.primary, "_extra_body", {})
+
+    async def chat_json(self, system: str, user: str, images: list[bytes] | None = None,
+                        schema: dict | None = None) -> str:
+        self.last_limited = None
+        if not local_only_reason():
+            try:
+                return await self.primary.chat_json(system, user, images, schema)
+            except LLMError as exc:
+                log.info("Облако → запасная модель на компьютере: %s", exc)
+        if self.quota is not None:
+            self.quota.note_fallback()
+        with local_only(""):  # the fallback is local: the eBay rule does not apply to it
+            return await self.fallback.chat_json(system, user, images, schema)
+
+    async def health(self) -> dict[str, Any]:
+        info = dict(await self.primary.health())
+        try:
+            fb = await self.fallback.health()
+        except Exception as exc:  # noqa: BLE001
+            fb = {"ok": False, "error": str(exc)}
+        info["fallback"] = {"ok": bool(fb.get("ok")), "model": getattr(self.fallback.cfg, "model", ""),
+                            "base_url": getattr(self.fallback, "base_url", ""), "error": fb.get("error")}
+        return info
+
+    async def aclose(self) -> None:
+        for llm in (self.primary, self.fallback):
+            try:
+                await llm.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def fallback_settings(fb: Any, like: Any) -> Any:
+    """LLMSettings for a FallbackConfig, with the timeouts / images / tokens of `like`."""
+    from ..config import LLMSettings
+
+    if fb is None or not getattr(fb, "usable", False):
+        return None
+    return LLMSettings(provider=fb.provider, base_url=fb.base_url.strip(), model=fb.model.strip(),
+                       max_images=int(getattr(like, "max_images", 3) or 0),
+                       timeout_seconds=float(getattr(like, "timeout_seconds", 240.0) or 240.0),
+                       temperature=float(getattr(like, "temperature", 0.2) or 0.0),
+                       max_tokens=int(getattr(like, "max_tokens", 700) or 700),
+                       image_max_side=int(getattr(like, "image_max_side", 1024) or 1024),
+                       thinking=getattr(like, "thinking", "auto") or "auto")
 
 
 # ---------------------------------------------------------------------------
@@ -864,8 +943,9 @@ def parse_models(data: Any, kind: str = "") -> list[dict[str, Any]]:
             free = kind != "openrouter"  # the NVIDIA catalog / a gateway: no prices = free to try
         vision = ("image" in inputs) if inputs else looks_like_vision_model(mid)
         params = m.get("supported_parameters") if isinstance(m.get("supported_parameters"), list) else []
-        ctx = m.get("context_length") or (m.get("top_provider") or {}).get("context_length") \
-            if isinstance(m.get("top_provider"), dict) or m.get("context_length") else None
+        ctx = m.get("context_length")
+        if ctx is None and isinstance(m.get("top_provider"), dict):
+            ctx = m["top_provider"].get("context_length")
         out.append({"id": mid, "name": str(m.get("name") or mid)[:80], "free": bool(free), "vision": bool(vision),
                     "context": int(ctx) if isinstance(ctx, (int, float)) else None,
                     "reasoning": "reasoning" in params or "reasoning" in low or "think" in low,
@@ -1052,7 +1132,7 @@ def first_line(texts: Iterable[str]) -> str:
 
 __all__ = [
     "APP_TITLE", "CLOUD_BATCH", "CLOUD_KINDS", "CLOUD_TRIAGE_MAX_TOKENS", "CLOUD_VISION_MAX_TOKENS", "CloudLimited",
-    "CloudPreset", "EBAY_LOCAL_RU", "OPENROUTER_HEADERS", "PRESETS", "QuotaLimiter", "QuotaRegistry",
+    "CloudPreset", "CloudRouter", "fallback_settings", "EBAY_LOCAL_RU", "OPENROUTER_HEADERS", "PRESETS", "QuotaLimiter", "QuotaRegistry",
     "ThinkingControls", "ad_city", "cloud_kind", "cloud_listing", "demo_ads", "detect_cloud", "endpoint_id",
     "is_cloud_model", "key_env", "limits_text", "local_only", "local_only_reason", "mask_key", "parse_key_info",
     "parse_models", "parse_retry", "pick_models", "plan_budget", "preset", "redact_contacts", "registry",

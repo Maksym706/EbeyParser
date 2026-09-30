@@ -316,8 +316,14 @@ def budget_message(exc: BaseException) -> str:
 _MODEL_MISSING = ("не найдена", "not found", "нет модели", "не установлена", "не загружена")
 
 
-def ai_problem(provider: str, base_url: str, model: str, error: str, *, server_ok: bool | None) -> str:
+def ai_problem(provider: str, base_url: str, model: str, error: str, *, server_ok: bool | None,
+               cloud: str = "") -> str:
     """The one Russian explanation of a failed AI check (/health, the AI test, the tile)."""
+    from .ai.cloud import detect_cloud, preset
+
+    kind = cloud or detect_cloud(base_url)
+    if kind:
+        return _cloud_problem(kind, preset(kind).name if preset(kind) else "облако", model, error, server_ok)
     ollama = provider == "ollama" or "11434" in (base_url or "")
     low = (error or "").lower()
     if any(w in low for w in _MODEL_MISSING):
@@ -330,6 +336,27 @@ def ai_problem(provider: str, base_url: str, model: str, error: str, *, server_o
     if server_ok is False or not error or any(w in low for w in _NETWORK_WORDS) or "недоступна по адресу" in low:
         return OLLAMA_DOWN if ollama else LMSTUDIO_DOWN
     return humanize_text(error, "ai", host=base_url).message_ru
+
+
+def _cloud_problem(kind: str, name: str, model: str, error: str, server_ok: bool | None) -> str:
+    """A free cloud endpoint (docs/design/CLOUD_AI.md): the key, the model, the quota, the network."""
+    low = (error or "").lower()
+    text = " ".join(str(error or "").split())
+    if any(w in low for w in ("лимит", "подожд", "перегружен", "ebay", "берегу", "распределяет")):
+        return text  # CloudLimited: already plain Russian
+    if any(w in low for w in ("http 401", "http 403", "не подходит", "unauthorized", "invalid api key")):
+        return f"Ключ {name} не подходит — вставь его заново в настройках нейросети"
+    if "http 402" in low:
+        return f"{name} просит пополнить баланс — выбери бесплатную модель (с «:free») в настройках нейросети"
+    if any(w in low for w in _MODEL_MISSING) or "нет у" in low:
+        return f"Модели «{model}» нет у {name} — выбери другую в настройках нейросети"
+    if any(w in low for w in _TIMEOUT_WORDS) or "не ответило" in low:
+        return f"{name} не ответил вовремя — бесплатные модели иногда перегружены, попробую позже"
+    if kind == "omniroute" and (server_ok is False or any(w in low for w in _NETWORK_WORDS) or "не отвечает" in low):
+        return "OmniRoute не отвечает — запусти его на этом компьютере"
+    if server_ok is False or any(w in low for w in _NETWORK_WORDS) or "недоступно" in low:
+        return f"Нет связи с {name} — проверь интернет. Если он есть, сервис временно недоступен"
+    return humanize_text(error, "ai").message_ru if error else f"{name} не ответил"
 
 
 # ------------------------------------------------------------ stored texts
