@@ -55,10 +55,7 @@ pause
 exit /b 1
 
 :ready
-if not exist config.yaml (
-    .venv\Scripts\python.exe -m ebeyparser setup
-    if not exist config.yaml .venv\Scripts\python.exe -m ebeyparser init
-)
+rem Без config.yaml программа создаст его сама, а настройка пройдёт в браузере.
 
 :loop
 .venv\Scripts\python.exe -m ebeyparser run
