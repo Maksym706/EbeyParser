@@ -98,6 +98,34 @@ def test_small_controls_get_44px_on_touch_only() -> None:
     assert re.search(r"\.rtable \.runerr::after \{[^}]*inset: -8px -6px", touch)
 
 
+def test_compact_controls_get_invisible_44px_hit_areas_on_touch() -> None:
+    """The second sweep (every screen at 390 / 820, touch): the rail's logo (30) and «Демо-данные» (24),
+    the top search (36), the «Мои сделки» tile «?» (20), ChipInput's «×» (18) and suggestions (26), and
+    the «Сборки» phone rows whose compact 32 px links beat the shared 44 px .linkish rule. The look stays
+    compact where it should; an invisible pseudo-element makes the finger's target ≥ 44 × 44."""
+    css = {name: (SPA_DIR / "css" / f"{name}.css").read_text(encoding="utf-8") for name in ("shell", "screens", "projects")}
+    shell, screens, projects = (_coarse_rules(css[n]) for n in ("shell", "screens", "projects"))
+    # the rail: ::before (its ::after is the tooltip) centred, at least 44 × 44
+    assert re.search(r"\.sidebar__brand::before,\s*\.sidebar__demo::before \{[^}]*width: max\(100%, 44px\);"
+                     r"[^}]*height: max\(100%, 44px\)", shell)
+    assert re.search(r"\.topsearch \{\s*height: 44px;", shell)
+    assert re.search(r"\.sidebar\.is-collapsed \.sidebar__demo \{[^}]*width: 32px", css["shell"])  # compact look
+    # 20 px «?» + 2 × 12 = 44
+    assert re.search(r"\.tile__help::after \{[^}]*inset: -12px;", screens)
+    # «×»: 32 + 2 × 6 = 44; suggestions 34 (inside the border) + 2 × 5 = 44, 8 px apart
+    assert re.search(r"\.chipin__chip button \{[^}]*width: 32px;[^}]*height: 32px", screens)
+    assert re.search(r"\.chipin__chip button::after \{[^}]*inset: -6px;", screens)
+    assert re.search(r"\.chipin__add \{[^}]*height: 36px", screens)
+    assert re.search(r"\.chipin__add::after \{[^}]*inset: -5px -1px;", screens)  # 1 px border: padding box
+    assert re.search(r"\.chipin,\s*\.chipin__sugg \{\s*gap: 8px;", screens)
+    assert re.search(r"\.scard__name::after \{\s*z-index: 1;", screens)  # over the status badge under it
+    # «Сборки»: the phone rows keep 32 px links (overriding screens.css .linkish), the ::after keeps 44 px
+    assert re.search(r"\.pj-tslot__foot \.linkish \{\s*min-height: 32px;", css["projects"])
+    assert re.search(r"\.pj-hint__btn::after,[^{]*\.pj-screen \.linkish::after,[^{]*\{[^}]*"
+                     r"width: max\(100%, 44px\);[^}]*height: max\(100%, 44px\)", projects)
+    assert re.search(r"\.pj-tslot__foot \{\s*row-gap: 12px;", projects)  # 32 + 12 = 44: the areas never overlap
+
+
 NODE_SCRIPT = r"""
 const dm = await import(process.argv[2] + "/features/deal-model.js");
 const m = await import(process.argv[2] + "/features/messages.js");

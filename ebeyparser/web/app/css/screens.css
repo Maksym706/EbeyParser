@@ -4380,6 +4380,48 @@ a.comps__row:hover {
     height: 44px;
     padding: 0 12px;
   }
+  /* a search card's name: its hit area also lies over the status badge under it (not a control) */
+  .scard__name::after {
+    z-index: 1;
+  }
+  /* «Мои сделки» tile help «?» (20 px) */
+  .tile__help {
+    position: relative;
+  }
+  .tile__help::after {
+    content: "";
+    position: absolute;
+    inset: -12px;
+  }
+  /* word lists (ChipInput): the «×» grows to 32 px in a 36 px chip and its ::after reaches 44 × 44;
+     suggestions «+ defekt» are 36 px with a 44 px hit area; 8 px gaps keep the hit areas apart */
+  .chipin,
+  .chipin__sugg {
+    gap: 8px;
+  }
+  .chipin__chip {
+    height: 36px;
+    padding-right: 4px;
+  }
+  .chipin__chip button {
+    position: relative;
+    width: 32px;
+    height: 32px;
+  }
+  .chipin__chip button::after {
+    content: "";
+    position: absolute;
+    inset: -6px;
+  }
+  .chipin__add {
+    position: relative;
+    height: 36px;
+  }
+  .chipin__add::after {
+    content: "";
+    position: absolute;
+    inset: -5px -1px; /* from the padding box: 1 px border + 4 px */
+  }
 }
 @media (pointer: coarse) {
   .tag--link {

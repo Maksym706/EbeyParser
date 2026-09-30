@@ -873,4 +873,23 @@
     width: 44px;
     height: 44px;
   }
+  .topsearch {
+    height: 44px;
+  }
+  /* the logo (30 px) and «Демо-данные» (24 px) stay compact; an invisible ::before makes them 44 × 44
+     (::after is the rail's tooltip) */
+  .sidebar__brand,
+  .sidebar__demo {
+    position: relative;
+  }
+  .sidebar__brand::before,
+  .sidebar__demo::before {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: max(100%, 44px);
+    height: max(100%, 44px);
+    transform: translate(-50%, -50%);
+  }
 }

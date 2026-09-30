@@ -2415,6 +2415,8 @@
   .pj-tslot__foot > .grow {
     display: none;
   }
+  /* compact rows on phones (this beats the shared 44 px .linkish rule of screens.css); on touch the
+     ::after below keeps a 44 px hit area, and .pj-tslot__foot's row gap keeps those apart */
   .pj-tslot__foot .linkish {
     min-height: 32px;
   }
